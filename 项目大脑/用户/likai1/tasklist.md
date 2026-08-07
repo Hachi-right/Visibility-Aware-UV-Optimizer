@@ -13,4 +13,4 @@
 | 任务目录 | 任务名 | 摘要 | 状态 | 最近更新 |
 | --- | --- | --- | --- | --- |
 | `项目大脑/用户/likai1/tasks/2026-08-06-initialize-wps-group-users/` | 按 WPS IM 群初始化项目大脑用户 | 核对“见习机组整备舱”成员身份，将 `likai1` 设为 Leader，并初始化 6 个 canonical 用户目录。 | 已完成 | 2026-08-06 |
-| `项目大脑/用户/likai1/tasks/2026-08-07-initial-gitlab-publish/` | GitLab 首次发布 | 在 AIGC 群组创建 MB-AIGC，复核初始提交范围，普通推送到 main，并核对远端与本地哈希。 | 进行中 | 2026-08-07 |
+| `项目大脑/用户/likai1/tasks/2026-08-07-initial-gitlab-publish/` | GitLab 首次发布 | 在 AIGC 群组创建 MB-AIGC，复核初始提交范围，普通推送到 main，并核对远端与本地哈希。 | 已完成 | 2026-08-07 |

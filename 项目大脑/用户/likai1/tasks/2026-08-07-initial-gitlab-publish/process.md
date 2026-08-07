@@ -12,9 +12,9 @@
 
 ## 当前状态
 
-- GitLab Private 项目已创建，正在进行首次提交范围复核。
-- 本地分支已从未出生的 `master` 切换为 `main`，远端 `origin` 已绑定。
-- 尚未 commit、尚未 push。
+- GitLab Private 项目已创建，仓库内容已提交并推送到远端 `main`。
+- 本地分支已从未出生的 `master` 切换为 `main`，并跟踪 `origin/main`。
+- 首次远端回读已确认本地 `HEAD`、`origin/main` 与 `ls-remote` 哈希一致。
 
 ## 团队经验引用
 
@@ -68,3 +68,12 @@
 - 初始暂存范围：247 个文件，14,248 行新增，无二进制文件。
 - 首次提交后运行 `perfect-push` 预检，再使用普通 `git push -u origin main`。
 - 推送后重新 fetch 并核对本地 `HEAD`、`refs/remotes/origin/main` 与 `ls-remote` 哈希；禁止 force push。
+
+## 发布结果
+
+- 首次提交：`a710106584fc814936b43db615e5493df3799e77`（`chore: initialize project brain`）。
+- 首次推送使用普通 `git push --set-upstream origin main` 创建远端默认分支，没有使用 force push。
+- 推送后回读：本地 `HEAD`、`refs/remotes/origin/main`、`git ls-remote origin refs/heads/main` 均为 `a710106584fc814936b43db615e5493df3799e77`。
+- GitLab 网页登录态不等于 Git HTTPS 凭据；为首次创建默认分支临时创建了 Maintainer 项目令牌，仅授予 `write_repository`、到期日为 2026-08-08，完成最终推送后撤销。
+- 权限不足的 Developer 临时令牌未产生远端写入，已撤销；一次使用到已撤销旧令牌的尝试被 GitLab 403 拒绝，也未产生远端写入。
+- 收尾任务记录提交使用 `perfect-push` 完整快进检查；交付前再次 fetch，并核对最终三处哈希一致。
