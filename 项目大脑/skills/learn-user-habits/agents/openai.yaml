@@ -1,0 +1,4 @@
+interface:
+  display_name: "学习用户习惯"
+  short_description: "把用户明确指导和长期稳定协作偏好沉淀到私人软上下文"
+  default_prompt: "根据最近任务记录和用户明确指导，学习当前用户习惯并更新私人软上下文。"

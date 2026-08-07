@@ -1,0 +1,5 @@
+workstate.json
+.runtime/
+__pycache__/
+*.pyc
+node_modules/
