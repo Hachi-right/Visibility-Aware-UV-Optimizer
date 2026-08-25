@@ -1,79 +1,78 @@
-# 项目大脑 · 实习生模板
+# Visibility Aware UV Optimizer
 
-> 金山软件集团 AI 产品中心
-> 结构与原项目大脑完全一致，**已剥离全部业务内容与敏感信息**，仅保留协作框架。
+Blender 可见性分析与低碎片 UV 优化插件。
 
-## 这是什么
+当前发布版本：`0.5.2`
 
-「项目大脑」是一套 AI 协作知识管理系统：把规则、任务、经验、代码/资料地图分层落盘，让 agent 和人都能稳定接续工作。
+## 下载与安装
 
-本模板可用于：
+直接下载：
 
-- 实习生学习项目大脑的使用方式
-- 新项目冷启动时复制框架
-- 在不含业务机密的环境中演示协作流程
+- [Visibility_Aware_UV_Optimizer_0.5.2.zip](release/Visibility_Aware_UV_Optimizer_0.5.2.zip)
 
-## 目录结构
+在 Blender 中打开：
 
-```
-项目大脑-实习生模板/
-├── AGENTS.md              # Agent 冷启动入口
-├── workstate.json.example # 复制为 workstate.json 后填写 author
-├── docs/                  # 项目文档 stub（待填充）
-└── 项目大脑/              # 框架主体（与生产结构一致）
-    ├── 启动.md / 主流程.md / 主规则.md
-    ├── skills/            # 公共 skill（已移除项目专属 skill）
-    ├── 用户/              # 每位成员私有区（运行 init 脚本创建）
-    ├── 团队经验/          # 空库 + INDEX 框架
-    ├── 公理/              # 空库 + index 框架
-    ├── 代码地图/ / 资料地图/
-    └── ...
-```
+`Edit > Preferences > Add-ons > Install`
 
-## 快速开始
+选择 ZIP 后启用 `Visibility Aware UV Optimizer`。插件面板位于：
 
-### 1. 复制 workstate
+`3D Viewport > Sidebar(N) > UV Optimizer`
 
-```powershell
-Copy-Item workstate.json.example workstate.json
-# 编辑 workstate.json，将 author 改为你的账号名（拼音）
-```
+完整操作说明：
 
-### 2. 初始化用户区
+- [Visibility Aware UV Optimizer 使用教程](docs/Visibility_Aware_UV_Optimizer_使用教程.md)
+- [0.5.2 验证记录](docs/Visibility_Aware_UV_Optimizer_验证记录_0.5.2.md)
 
-```powershell
-python 项目大脑/skills/init-project-info-user/scripts/init_user.py --author "你的账号名"
-```
+## 0.5.2 核心规则
 
-### 3. 加载项目大脑
+- 红色 Hidden 面不再保留独立 UV 面积。
+- 所有红面 UV 环统一收拢为一个点。
+- 固定坐标为 UV 原点 `(0, 0)`。
+- 已删除 `Hidden UV Scale` 和 `Hidden Corner Size` 两个无效调节项。
+- 绿色和黄色 UV 不再为红面预留右上角区域。
 
-对 Cursor / Codex 说：
+## 推荐工作流
 
-```
-加载项目大脑 {你的账号名}
+1. 复制一份待处理模型作为备份。
+2. 选择参与遮挡分析的网格对象。
+3. 在 `Visibility` 中选择分析方式并执行 `Analyze Visibility`。
+4. 用热力图检查绿、黄、红面。
+5. 在编辑模式中用 `Important / Auto / Hidden` 修正特殊面。
+6. 将需要优化的对象设为活动对象。
+7. 执行 `Optimize Active Object UV`。
+8. 检查红面 UV 是否全部位于 `(0, 0)`，再检查可见区域接缝和拉伸。
+
+## 仓库结构
+
+```text
+addons/visibility_uv_optimizer/        插件源码
+release/                               Blender 安装包与校验值
+docs/                                  中文教程和验证记录
 ```
 
-### 4. 开启第一个任务
+## 兼容性与验证
 
+- 插件最低版本声明：Blender `3.3`
+- 完整运行验证：Blender `3.3.5`
+- Blender `5.1` 插件目录已同步验证文件一致性，但本次没有可用的 5.1
+  可执行程序进行运行时回归
+
+已通过：
+
+- Python 静态编译检查
+- 完整 Blender 插件回归
+- 红面 UV 原点回归
+- 方向探针数据测试
+- 方向探针 Blender 测试
+- Blender 用户插件目录安装测试
+
+## 安装包校验
+
+```text
+SHA-256  87717D9780C1206B21F08426AA61DE4078FAEBB7DEFAEE67BB21EC6A0C6286DD
 ```
-加载项目大脑 {你的账号名}，帮我开启一个新任务：熟悉项目大脑框架
-```
 
-## 与完整版的差异
+## 注意
 
-| 项 | 模板 | 完整版 |
-| --- | --- | --- |
-| 团队经验 entries | 空 | 100+ 条项目经验 |
-| 公理 entries | 空 | 13 条升维公理 |
-| 用户区 | 需自行 init | 各成员真实数据 |
-| 业务 docs | stub | 完整设计/会议/规范 |
-| songzhiao-advisor-lens 等专属 skill | 已移除 | 保留 |
-
-## 维护说明
-
-- 公共区修改权限默认归属 `tech-lead`（可在 `初始分工表.md` 中调整）
-- 真实项目接入时：更新 `初始分工表.md`、为成员 batch init、逐步沉淀团队经验
-
----
-
-生成时间：模板自动剥离脚本 · 来源结构与原项目大脑框架一致
+优化会重写活动 UV Map 和接缝标记。正式资产建议先复制对象或保存新版本，
+并在确认热力图分类后再执行 UV 优化。

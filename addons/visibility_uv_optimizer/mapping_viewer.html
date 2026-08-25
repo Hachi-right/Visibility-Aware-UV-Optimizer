@@ -1,0 +1,901 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>UV Mapping Viewer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101317;
+      --panel: #171b20;
+      --panel-2: #20252b;
+      --line: #353c44;
+      --text: #e8edf2;
+      --muted: #9aa6b2;
+      --accent: #ff6b2c;
+      --accent-soft: rgba(255, 107, 44, 0.28);
+      --focus: #7ec8ff;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font: 13px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    body {
+      display: grid;
+      grid-template-rows: auto auto minmax(0, 1fr) auto;
+    }
+
+    header {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-height: 48px;
+      padding: 8px 14px;
+      border-bottom: 1px solid var(--line);
+      background: #13171b;
+    }
+
+    h1 {
+      min-width: 0;
+      margin: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 15px;
+      font-weight: 650;
+    }
+
+    #summary {
+      margin-left: auto;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 44px;
+      padding: 6px 10px;
+      overflow-x: auto;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    button, select {
+      min-height: 30px;
+      border: 1px solid #424b55;
+      border-radius: 6px;
+      background: #262c33;
+      color: var(--text);
+      font: inherit;
+      letter-spacing: 0;
+    }
+
+    button {
+      padding: 4px 10px;
+      cursor: pointer;
+    }
+
+    button:hover, select:hover { border-color: #66727e; }
+    button:focus-visible, select:focus-visible, input:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 1px;
+    }
+
+    button.active {
+      border-color: var(--accent);
+      background: #3c2a23;
+      color: #fff4ef;
+    }
+
+    select { padding: 3px 28px 3px 9px; }
+
+    .segmented {
+      display: inline-flex;
+      flex: 0 0 auto;
+    }
+
+    .segmented button { border-radius: 0; }
+    .segmented button:first-child { border-radius: 6px 0 0 6px; }
+    .segmented button:last-child { border-radius: 0 6px 6px 0; }
+    .segmented button + button { margin-left: -1px; }
+
+    .divider {
+      width: 1px;
+      height: 24px;
+      flex: 0 0 auto;
+      background: var(--line);
+    }
+
+    .check {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+      color: var(--muted);
+      cursor: pointer;
+    }
+
+    .check input { accent-color: var(--accent); }
+
+    main {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(280px, 1fr) 4px minmax(280px, 1fr);
+      background: var(--line);
+    }
+
+    .pane {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      background: var(--bg);
+    }
+
+    .pane-title {
+      position: absolute;
+      z-index: 2;
+      top: 10px;
+      left: 12px;
+      padding: 4px 7px;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 4px;
+      background: rgba(15, 18, 22, 0.82);
+      color: var(--muted);
+      pointer-events: none;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+      outline: none;
+    }
+
+    #splitter { background: #353c44; }
+
+    footer {
+      min-width: 0;
+      min-height: 34px;
+      display: flex;
+      align-items: center;
+      padding: 6px 12px;
+      border-top: 1px solid var(--line);
+      background: #13171b;
+      color: var(--muted);
+    }
+
+    #status {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #webglError {
+      position: absolute;
+      inset: 0;
+      display: none;
+      place-items: center;
+      padding: 24px;
+      color: #ffc6ad;
+      text-align: center;
+      background: #12161a;
+    }
+
+    @media (max-width: 760px) {
+      body { grid-template-rows: auto auto minmax(0, 1fr) auto; }
+      header { min-height: 42px; }
+      #summary { display: none; }
+      main { grid-template-columns: 1fr; grid-template-rows: 1fr 4px 1fr; }
+      #splitter { min-height: 4px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 id="title">UV Mapping Viewer</h1>
+    <div id="summary"></div>
+  </header>
+
+  <div class="toolbar">
+    <div class="segmented" aria-label="Selection mode">
+      <button id="faceMode" class="active" type="button">Face</button>
+      <button id="islandMode" type="button">UV Island</button>
+    </div>
+    <select id="colorMode" aria-label="Surface colors">
+      <option value="neutral">Neutral</option>
+      <option value="visibility">Visibility</option>
+      <option value="material">Material</option>
+    </select>
+    <div class="divider"></div>
+    <button id="fitUv" type="button">Fit UV</button>
+    <button id="resetModel" type="button">Reset 3D</button>
+    <button id="focusSelection" type="button">Focus Selection</button>
+    <button id="clearSelection" type="button">Clear</button>
+    <label class="check"><input id="xraySelection" type="checkbox" checked> X-ray highlight</label>
+  </div>
+
+  <main>
+    <section class="pane">
+      <div class="pane-title">UV</div>
+      <canvas id="uvCanvas" tabindex="0"></canvas>
+    </section>
+    <div id="splitter"></div>
+    <section class="pane">
+      <div class="pane-title">3D Model</div>
+      <canvas id="modelCanvas" tabindex="0"></canvas>
+      <div id="webglError">WebGL is unavailable in this browser. The UV view remains usable.</div>
+    </section>
+  </main>
+
+  <footer><div id="status">No selection</div></footer>
+
+  <script id="vuvData" type="application/json">__VUV_EXPORT_DATA__</script>
+  <script>
+    "use strict";
+
+    const data = JSON.parse(document.getElementById("vuvData").textContent);
+    const faces = [];
+    data.objects.forEach((object, objectIndex) => {
+      object.faces.forEach(face => {
+        face.objectIndex = objectIndex;
+        face.objectName = object.name;
+        faces.push(face);
+      });
+    });
+
+    const stats = data.stats;
+    document.title = `${data.scene} - UV Mapping Viewer`;
+    document.getElementById("title").textContent = `${data.scene} - UV Mapping Viewer`;
+    document.getElementById("summary").textContent =
+      `${stats.objects} object${stats.objects === 1 ? "" : "s"}  |  ${stats.faces} faces  |  ${stats.islands} UV islands`;
+
+    const statusElement = document.getElementById("status");
+    const uvCanvas = document.getElementById("uvCanvas");
+    const uvContext = uvCanvas.getContext("2d");
+    const modelCanvas = document.getElementById("modelCanvas");
+    const colorModeElement = document.getElementById("colorMode");
+    const xrayElement = document.getElementById("xraySelection");
+    const threshold = Number.isFinite(data.visibility_high) ? data.visibility_high : 0.05;
+
+    let selectionMode = "face";
+    let selectedFaceIds = new Set();
+    let selectedFace = null;
+    let uvScale = 1;
+    let uvPanX = 0;
+    let uvPanY = 0;
+    let uvFitted = false;
+    let uvViewportWidth = 0;
+    let uvViewportHeight = 0;
+    let lastHitKey = "";
+    let lastHitX = 0;
+    let lastHitY = 0;
+    let hitCycle = 0;
+
+    const uvBounds = (() => {
+      let minU = 0;
+      let minV = 0;
+      let maxU = 1;
+      let maxV = 1;
+      faces.forEach(face => face.uvs.forEach(uv => {
+        minU = Math.min(minU, uv[0]);
+        minV = Math.min(minV, uv[1]);
+        maxU = Math.max(maxU, uv[0]);
+        maxV = Math.max(maxV, uv[1]);
+      }));
+      return { minU, minV, maxU, maxV };
+    })();
+
+    function cssSize(canvas) {
+      const rect = canvas.getBoundingClientRect();
+      return { width: Math.max(1, rect.width), height: Math.max(1, rect.height) };
+    }
+
+    function resizeCanvas2D() {
+      const size = cssSize(uvCanvas);
+      const previousWidth = uvViewportWidth;
+      const previousHeight = uvViewportHeight;
+      uvViewportWidth = size.width;
+      uvViewportHeight = size.height;
+      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      const width = Math.round(size.width * ratio);
+      const height = Math.round(size.height * ratio);
+      if (uvCanvas.width !== width || uvCanvas.height !== height) {
+        uvCanvas.width = width;
+        uvCanvas.height = height;
+      }
+      uvContext.setTransform(ratio, 0, 0, ratio, 0, 0);
+      if (!uvFitted) {
+        fitUv();
+      } else {
+        uvPanX += (size.width - previousWidth) * 0.5;
+        uvPanY += (size.height - previousHeight) * 0.5;
+        drawUv();
+      }
+    }
+
+    function fitUv() {
+      const size = cssSize(uvCanvas);
+      const spanU = Math.max(0.0001, uvBounds.maxU - uvBounds.minU);
+      const spanV = Math.max(0.0001, uvBounds.maxV - uvBounds.minV);
+      uvScale = Math.min(size.width / spanU, size.height / spanV) * 0.9;
+      const centerU = (uvBounds.minU + uvBounds.maxU) * 0.5;
+      const centerV = (uvBounds.minV + uvBounds.maxV) * 0.5;
+      uvPanX = size.width * 0.5 - centerU * uvScale;
+      uvPanY = size.height * 0.5 + centerV * uvScale;
+      uvFitted = true;
+      drawUv();
+    }
+
+    function uvToScreen(uv) {
+      return [uvPanX + uv[0] * uvScale, uvPanY - uv[1] * uvScale];
+    }
+
+    function screenToUv(x, y) {
+      return [(x - uvPanX) / uvScale, (uvPanY - y) / uvScale];
+    }
+
+    function visibilityColor(value, alpha) {
+      if (!Number.isFinite(value)) return `rgba(86,102,116,${alpha})`;
+      if (value <= 0) return `rgba(190,62,52,${alpha})`;
+      if (value >= threshold) return `rgba(68,174,97,${alpha})`;
+      return `rgba(218,174,56,${alpha})`;
+    }
+
+    function faceCssColor(face, alpha) {
+      const mode = colorModeElement.value;
+      if (mode === "visibility") return visibilityColor(face.visibility, alpha);
+      if (mode === "material") {
+        const color = face.material.map(value => Math.round(255 * value));
+        return `rgba(${color[0]},${color[1]},${color[2]},${alpha})`;
+      }
+      return `rgba(86,102,116,${alpha})`;
+    }
+
+    function traceUvFace(face) {
+      if (!face.uvs.length) return;
+      const first = uvToScreen(face.uvs[0]);
+      uvContext.moveTo(first[0], first[1]);
+      for (let index = 1; index < face.uvs.length; index += 1) {
+        const point = uvToScreen(face.uvs[index]);
+        uvContext.lineTo(point[0], point[1]);
+      }
+      uvContext.closePath();
+    }
+
+    function drawUv() {
+      const size = cssSize(uvCanvas);
+      uvContext.clearRect(0, 0, size.width, size.height);
+      uvContext.fillStyle = "#11151a";
+      uvContext.fillRect(0, 0, size.width, size.height);
+
+      uvContext.lineWidth = 1;
+      for (let step = 0; step <= 10; step += 1) {
+        const value = step / 10;
+        const verticalA = uvToScreen([value, 0]);
+        const verticalB = uvToScreen([value, 1]);
+        const horizontalA = uvToScreen([0, value]);
+        const horizontalB = uvToScreen([1, value]);
+        uvContext.strokeStyle = step === 0 || step === 10 ? "#59636d" : "#252b31";
+        uvContext.beginPath();
+        uvContext.moveTo(verticalA[0], verticalA[1]);
+        uvContext.lineTo(verticalB[0], verticalB[1]);
+        uvContext.moveTo(horizontalA[0], horizontalA[1]);
+        uvContext.lineTo(horizontalB[0], horizontalB[1]);
+        uvContext.stroke();
+      }
+
+      uvContext.lineJoin = "round";
+      faces.forEach(face => {
+        if (selectedFaceIds.has(face.id)) return;
+        uvContext.beginPath();
+        traceUvFace(face);
+        uvContext.fillStyle = faceCssColor(face, 0.48);
+        uvContext.fill();
+        uvContext.strokeStyle = "rgba(205,217,228,0.42)";
+        uvContext.lineWidth = 0.7;
+        uvContext.stroke();
+      });
+
+      faces.forEach(face => {
+        if (!selectedFaceIds.has(face.id)) return;
+        uvContext.beginPath();
+        traceUvFace(face);
+        uvContext.fillStyle = "rgba(255,107,44,0.78)";
+        uvContext.fill();
+        uvContext.strokeStyle = "#fff2eb";
+        uvContext.lineWidth = 1.6;
+        uvContext.stroke();
+      });
+    }
+
+    function pointInTriangle(point, first, second, third) {
+      const v0x = third[0] - first[0];
+      const v0y = third[1] - first[1];
+      const v1x = second[0] - first[0];
+      const v1y = second[1] - first[1];
+      const v2x = point[0] - first[0];
+      const v2y = point[1] - first[1];
+      const dot00 = v0x * v0x + v0y * v0y;
+      const dot01 = v0x * v1x + v0y * v1y;
+      const dot02 = v0x * v2x + v0y * v2y;
+      const dot11 = v1x * v1x + v1y * v1y;
+      const dot12 = v1x * v2x + v1y * v2y;
+      const denominator = dot00 * dot11 - dot01 * dot01;
+      if (Math.abs(denominator) < 1e-16) return false;
+      const inverse = 1 / denominator;
+      const u = (dot11 * dot02 - dot01 * dot12) * inverse;
+      const v = (dot00 * dot12 - dot01 * dot02) * inverse;
+      const epsilon = 1e-8;
+      return u >= -epsilon && v >= -epsilon && u + v <= 1 + epsilon;
+    }
+
+    function uvFaceArea(face) {
+      let area = 0;
+      face.triangles.forEach(triangle => {
+        const a = face.uvs[triangle[0]];
+        const b = face.uvs[triangle[1]];
+        const c = face.uvs[triangle[2]];
+        area += Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) * 0.5;
+      });
+      return area;
+    }
+
+    function hitUvFaces(point) {
+      return faces.filter(face => face.triangles.some(triangle =>
+        pointInTriangle(point, face.uvs[triangle[0]], face.uvs[triangle[1]], face.uvs[triangle[2]])))
+        .sort((first, second) => uvFaceArea(first) - uvFaceArea(second));
+    }
+
+    function clearSelection() {
+      selectedFaceIds = new Set();
+      selectedFace = null;
+      statusElement.textContent = "No selection";
+      updateSelectionGeometry();
+      drawUv();
+      requestModelRender();
+    }
+
+    function applySelection(face, hits, cycleIndex) {
+      selectedFace = face;
+      if (selectionMode === "island") {
+        selectedFaceIds = new Set(faces.filter(item => item.island === face.island).map(item => item.id));
+      } else {
+        selectedFaceIds = new Set([face.id]);
+      }
+
+      const visibility = Number.isFinite(face.visibility) ? face.visibility.toFixed(4) : "n/a";
+      const overlap = hits.length > 1 ? `  |  overlap ${cycleIndex + 1}/${hits.length}` : "";
+      statusElement.textContent =
+        `${face.objectName}  |  Face ${face.index}  |  UV Island ${face.island}  |  Visibility ${visibility}${overlap}`;
+      updateSelectionGeometry();
+      drawUv();
+      requestModelRender();
+    }
+
+    function pickUv(x, y) {
+      const hits = hitUvFaces(screenToUv(x, y));
+      if (!hits.length) {
+        clearSelection();
+        return;
+      }
+      const key = hits.map(face => face.id).join(",");
+      if (key === lastHitKey && Math.hypot(x - lastHitX, y - lastHitY) < 5) {
+        hitCycle = (hitCycle + 1) % hits.length;
+      } else {
+        hitCycle = 0;
+      }
+      lastHitKey = key;
+      lastHitX = x;
+      lastHitY = y;
+      applySelection(hits[hitCycle], hits, hitCycle);
+    }
+
+    let uvDrag = null;
+    uvCanvas.addEventListener("pointerdown", event => {
+      uvCanvas.setPointerCapture(event.pointerId);
+      uvDrag = { x: event.offsetX, y: event.offsetY, startX: event.offsetX, startY: event.offsetY, pan: event.button !== 0 };
+    });
+    uvCanvas.addEventListener("pointermove", event => {
+      if (!uvDrag || !uvDrag.pan) return;
+      uvPanX += event.offsetX - uvDrag.x;
+      uvPanY += event.offsetY - uvDrag.y;
+      uvDrag.x = event.offsetX;
+      uvDrag.y = event.offsetY;
+      drawUv();
+    });
+    uvCanvas.addEventListener("pointerup", event => {
+      if (!uvDrag) return;
+      const movement = Math.hypot(event.offsetX - uvDrag.startX, event.offsetY - uvDrag.startY);
+      if (!uvDrag.pan && movement < 4) pickUv(event.offsetX, event.offsetY);
+      uvDrag = null;
+    });
+    uvCanvas.addEventListener("pointercancel", () => { uvDrag = null; });
+    uvCanvas.addEventListener("contextmenu", event => event.preventDefault());
+    uvCanvas.addEventListener("wheel", event => {
+      event.preventDefault();
+      const point = screenToUv(event.offsetX, event.offsetY);
+      const factor = Math.exp(-event.deltaY * 0.0012);
+      uvScale = Math.max(10, Math.min(uvScale * factor, 200000));
+      uvPanX = event.offsetX - point[0] * uvScale;
+      uvPanY = event.offsetY + point[1] * uvScale;
+      drawUv();
+    }, { passive: false });
+
+    document.getElementById("faceMode").addEventListener("click", () => setSelectionMode("face"));
+    document.getElementById("islandMode").addEventListener("click", () => setSelectionMode("island"));
+    function setSelectionMode(mode) {
+      selectionMode = mode;
+      document.getElementById("faceMode").classList.toggle("active", mode === "face");
+      document.getElementById("islandMode").classList.toggle("active", mode === "island");
+      if (selectedFace) applySelection(selectedFace, [selectedFace], 0);
+    }
+
+    document.getElementById("fitUv").addEventListener("click", fitUv);
+    document.getElementById("clearSelection").addEventListener("click", clearSelection);
+    colorModeElement.addEventListener("change", () => {
+      updateBaseColors();
+      drawUv();
+      requestModelRender();
+    });
+    xrayElement.addEventListener("change", requestModelRender);
+
+    function subtract(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
+    function cross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
+    function dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+    function normalize(value) {
+      const length = Math.hypot(value[0], value[1], value[2]) || 1;
+      return [value[0] / length, value[1] / length, value[2] / length];
+    }
+
+    function perspective(fieldOfView, aspect, near, far) {
+      const f = 1 / Math.tan(fieldOfView * 0.5);
+      const inverse = 1 / (near - far);
+      return [f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * inverse, -1, 0, 0, 2 * far * near * inverse, 0];
+    }
+
+    function lookAt(eye, center, up) {
+      const z = normalize(subtract(eye, center));
+      const x = normalize(cross(up, z));
+      const y = cross(z, x);
+      return [
+        x[0], y[0], z[0], 0,
+        x[1], y[1], z[1], 0,
+        x[2], y[2], z[2], 0,
+        -dot(x, eye), -dot(y, eye), -dot(z, eye), 1,
+      ];
+    }
+
+    function multiplyMatrix(a, b) {
+      const output = new Array(16);
+      for (let column = 0; column < 4; column += 1) {
+        for (let row = 0; row < 4; row += 1) {
+          output[column * 4 + row] =
+            a[row] * b[column * 4] + a[4 + row] * b[column * 4 + 1] +
+            a[8 + row] * b[column * 4 + 2] + a[12 + row] * b[column * 4 + 3];
+        }
+      }
+      return output;
+    }
+
+    const gl = modelCanvas.getContext("webgl", { antialias: true, alpha: false });
+    let modelAvailable = Boolean(gl);
+    if (!modelAvailable) document.getElementById("webglError").style.display = "grid";
+
+    let program = null;
+    let positionBuffer = null;
+    let normalBuffer = null;
+    let colorBuffer = null;
+    let selectedPositionBuffer = null;
+    let selectedNormalBuffer = null;
+    let vertexCount = 0;
+    let selectedVertexCount = 0;
+    let allTriangleRecords = [];
+    let modelCenter = [0, 0, 0];
+    let modelRadius = 1;
+    let cameraTarget = [0, 0, 0];
+    let cameraDistance = 3;
+    let cameraYaw = -0.75;
+    let cameraPitch = 0.3;
+    let modelRenderPending = false;
+
+    function compileShader(type, source) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader));
+      return shader;
+    }
+
+    function createProgram() {
+      const vertexSource = `
+        attribute vec3 aPosition;
+        attribute vec3 aNormal;
+        attribute vec3 aColor;
+        uniform mat4 uMvp;
+        varying vec3 vNormal;
+        varying vec3 vColor;
+        void main() {
+          gl_Position = uMvp * vec4(aPosition, 1.0);
+          vNormal = aNormal;
+          vColor = aColor;
+        }
+      `;
+      const fragmentSource = `
+        precision mediump float;
+        varying vec3 vNormal;
+        varying vec3 vColor;
+        uniform float uUniformColor;
+        uniform vec4 uColor;
+        void main() {
+          vec3 normal = normalize(vNormal);
+          float key = max(dot(normal, normalize(vec3(0.35, -0.45, 0.82))), 0.0);
+          float fill = max(dot(normal, normalize(vec3(-0.55, 0.25, 0.55))), 0.0);
+          float light = 0.30 + key * 0.58 + fill * 0.12;
+          vec4 source = mix(vec4(vColor * light, 1.0), uColor, uUniformColor);
+          gl_FragColor = source;
+        }
+      `;
+      const result = gl.createProgram();
+      gl.attachShader(result, compileShader(gl.VERTEX_SHADER, vertexSource));
+      gl.attachShader(result, compileShader(gl.FRAGMENT_SHADER, fragmentSource));
+      gl.linkProgram(result);
+      if (!gl.getProgramParameter(result, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(result));
+      return result;
+    }
+
+    function faceModelColor(face) {
+      if (colorModeElement.value === "material") return face.material;
+      if (colorModeElement.value === "visibility") {
+        if (!Number.isFinite(face.visibility)) return [0.48, 0.55, 0.61];
+        if (face.visibility <= 0) return [0.72, 0.18, 0.15];
+        if (face.visibility >= threshold) return [0.24, 0.68, 0.36];
+        return [0.84, 0.65, 0.18];
+      }
+      return [0.48, 0.55, 0.61];
+    }
+
+    function buildModelGeometry() {
+      const positions = [];
+      const normals = [];
+      allTriangleRecords = [];
+      const bounds = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
+      faces.forEach(face => {
+        face.triangles.forEach(triangle => {
+          const points = triangle.map(index => face.positions[index]);
+          const normal = normalize(cross(subtract(points[1], points[0]), subtract(points[2], points[0])));
+          allTriangleRecords.push({ face, points, normal });
+          points.forEach(point => {
+            positions.push(point[0], point[1], point[2]);
+            normals.push(normal[0], normal[1], normal[2]);
+            for (let axis = 0; axis < 3; axis += 1) {
+              bounds.min[axis] = Math.min(bounds.min[axis], point[axis]);
+              bounds.max[axis] = Math.max(bounds.max[axis], point[axis]);
+            }
+          });
+        });
+      });
+      vertexCount = positions.length / 3;
+      modelCenter = bounds.min.map((value, axis) => (value + bounds.max[axis]) * 0.5);
+      modelRadius = Math.max(0.001, Math.hypot(
+        bounds.max[0] - bounds.min[0], bounds.max[1] - bounds.min[1], bounds.max[2] - bounds.min[2]) * 0.5);
+
+      positionBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+      normalBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, normalBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(normals), gl.STATIC_DRAW);
+      colorBuffer = gl.createBuffer();
+      selectedPositionBuffer = gl.createBuffer();
+      selectedNormalBuffer = gl.createBuffer();
+      updateBaseColors();
+      updateSelectionGeometry();
+      resetModelView();
+    }
+
+    function updateBaseColors() {
+      if (!modelAvailable || !colorBuffer) return;
+      const colors = [];
+      allTriangleRecords.forEach(record => {
+        const color = faceModelColor(record.face);
+        for (let index = 0; index < 3; index += 1) colors.push(color[0], color[1], color[2]);
+      });
+      gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(colors), gl.DYNAMIC_DRAW);
+    }
+
+    function updateSelectionGeometry() {
+      if (!modelAvailable || !selectedPositionBuffer) return;
+      const positions = [];
+      const normals = [];
+      allTriangleRecords.forEach(record => {
+        if (!selectedFaceIds.has(record.face.id)) return;
+        record.points.forEach(point => positions.push(point[0], point[1], point[2]));
+        for (let index = 0; index < 3; index += 1) normals.push(record.normal[0], record.normal[1], record.normal[2]);
+      });
+      selectedVertexCount = positions.length / 3;
+      gl.bindBuffer(gl.ARRAY_BUFFER, selectedPositionBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.DYNAMIC_DRAW);
+      gl.bindBuffer(gl.ARRAY_BUFFER, selectedNormalBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(normals), gl.DYNAMIC_DRAW);
+    }
+
+    function resetModelView() {
+      cameraTarget = modelCenter.slice();
+      cameraDistance = modelRadius * 2.65;
+      cameraYaw = -0.75;
+      cameraPitch = 0.3;
+      requestModelRender();
+    }
+
+    function focusSelection() {
+      const selected = allTriangleRecords.filter(record => selectedFaceIds.has(record.face.id));
+      if (!selected.length) {
+        resetModelView();
+        return;
+      }
+      const min = [Infinity, Infinity, Infinity];
+      const max = [-Infinity, -Infinity, -Infinity];
+      selected.forEach(record => record.points.forEach(point => {
+        for (let axis = 0; axis < 3; axis += 1) {
+          min[axis] = Math.min(min[axis], point[axis]);
+          max[axis] = Math.max(max[axis], point[axis]);
+        }
+      }));
+      cameraTarget = min.map((value, axis) => (value + max[axis]) * 0.5);
+      const radius = Math.max(modelRadius * 0.01, Math.hypot(max[0] - min[0], max[1] - min[1], max[2] - min[2]) * 0.5);
+      cameraDistance = radius * 2.8;
+      requestModelRender();
+    }
+
+    function bindAttribute(name, buffer) {
+      const location = gl.getAttribLocation(program, name);
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.vertexAttribPointer(location, 3, gl.FLOAT, false, 0, 0);
+      gl.enableVertexAttribArray(location);
+    }
+
+    function renderModel() {
+      modelRenderPending = false;
+      if (!modelAvailable) return;
+      const rect = modelCanvas.getBoundingClientRect();
+      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      const width = Math.max(1, Math.round(rect.width * ratio));
+      const height = Math.max(1, Math.round(rect.height * ratio));
+      if (modelCanvas.width !== width || modelCanvas.height !== height) {
+        modelCanvas.width = width;
+        modelCanvas.height = height;
+      }
+      gl.viewport(0, 0, width, height);
+      gl.clearColor(0.055, 0.067, 0.079, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      gl.enable(gl.DEPTH_TEST);
+      gl.disable(gl.CULL_FACE);
+
+      const horizontal = Math.cos(cameraPitch) * cameraDistance;
+      const eye = [
+        cameraTarget[0] + Math.sin(cameraYaw) * horizontal,
+        cameraTarget[1] - Math.cos(cameraYaw) * horizontal,
+        cameraTarget[2] + Math.sin(cameraPitch) * cameraDistance,
+      ];
+      const projection = perspective(Math.PI / 4, width / height, Math.max(modelRadius * 0.0001, cameraDistance * 0.001), cameraDistance + modelRadius * 20);
+      const view = lookAt(eye, cameraTarget, [0, 0, 1]);
+      const mvp = multiplyMatrix(projection, view);
+
+      gl.useProgram(program);
+      gl.uniformMatrix4fv(gl.getUniformLocation(program, "uMvp"), false, new Float32Array(mvp));
+      gl.uniform1f(gl.getUniformLocation(program, "uUniformColor"), 0);
+      bindAttribute("aPosition", positionBuffer);
+      bindAttribute("aNormal", normalBuffer);
+      bindAttribute("aColor", colorBuffer);
+      gl.drawArrays(gl.TRIANGLES, 0, vertexCount);
+
+      if (selectedVertexCount > 0) {
+        bindAttribute("aPosition", selectedPositionBuffer);
+        bindAttribute("aNormal", selectedNormalBuffer);
+        gl.disableVertexAttribArray(gl.getAttribLocation(program, "aColor"));
+        gl.vertexAttrib3f(gl.getAttribLocation(program, "aColor"), 1, 1, 1);
+        gl.uniform1f(gl.getUniformLocation(program, "uUniformColor"), 1);
+        if (xrayElement.checked) {
+          gl.disable(gl.DEPTH_TEST);
+          gl.enable(gl.BLEND);
+          gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+          gl.uniform4f(gl.getUniformLocation(program, "uColor"), 1, 0.25, 0.04, 0.34);
+          gl.drawArrays(gl.TRIANGLES, 0, selectedVertexCount);
+          gl.disable(gl.BLEND);
+        }
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LEQUAL);
+        gl.enable(gl.POLYGON_OFFSET_FILL);
+        gl.polygonOffset(-1, -1);
+        gl.uniform4f(gl.getUniformLocation(program, "uColor"), 1, 0.30, 0.05, 1);
+        gl.drawArrays(gl.TRIANGLES, 0, selectedVertexCount);
+        gl.disable(gl.POLYGON_OFFSET_FILL);
+        gl.depthFunc(gl.LESS);
+      }
+    }
+
+    function requestModelRender() {
+      if (modelRenderPending) return;
+      modelRenderPending = true;
+      requestAnimationFrame(renderModel);
+    }
+
+    let modelDrag = null;
+    modelCanvas.addEventListener("pointerdown", event => {
+      modelCanvas.setPointerCapture(event.pointerId);
+      modelDrag = { x: event.clientX, y: event.clientY, pan: event.button !== 0 };
+    });
+    modelCanvas.addEventListener("pointermove", event => {
+      if (!modelDrag) return;
+      const dx = event.clientX - modelDrag.x;
+      const dy = event.clientY - modelDrag.y;
+      modelDrag.x = event.clientX;
+      modelDrag.y = event.clientY;
+      if (modelDrag.pan) {
+        const amount = cameraDistance * 0.0015;
+        const right = [Math.cos(cameraYaw), Math.sin(cameraYaw), 0];
+        cameraTarget[0] -= right[0] * dx * amount;
+        cameraTarget[1] -= right[1] * dx * amount;
+        cameraTarget[2] += dy * amount;
+      } else {
+        cameraYaw -= dx * 0.008;
+        cameraPitch = Math.max(-1.48, Math.min(1.48, cameraPitch + dy * 0.008));
+      }
+      requestModelRender();
+    });
+    modelCanvas.addEventListener("pointerup", () => { modelDrag = null; });
+    modelCanvas.addEventListener("pointercancel", () => { modelDrag = null; });
+    modelCanvas.addEventListener("contextmenu", event => event.preventDefault());
+    modelCanvas.addEventListener("wheel", event => {
+      event.preventDefault();
+      cameraDistance = Math.max(modelRadius * 0.002, Math.min(modelRadius * 100, cameraDistance * Math.exp(event.deltaY * 0.001)));
+      requestModelRender();
+    }, { passive: false });
+
+    document.getElementById("resetModel").addEventListener("click", resetModelView);
+    document.getElementById("focusSelection").addEventListener("click", focusSelection);
+    window.addEventListener("keydown", event => {
+      if (event.key === "Escape") clearSelection();
+      if (event.key.toLowerCase() === "f") focusSelection();
+    });
+
+    if (modelAvailable) {
+      try {
+        program = createProgram();
+        buildModelGeometry();
+      } catch (error) {
+        modelAvailable = false;
+        document.getElementById("webglError").style.display = "grid";
+        document.getElementById("webglError").textContent = `Unable to initialize the 3D view: ${error.message}`;
+      }
+    }
+
+    const resizeObserver = new ResizeObserver(() => {
+      resizeCanvas2D();
+      requestModelRender();
+    });
+    resizeObserver.observe(uvCanvas.parentElement);
+    resizeObserver.observe(modelCanvas.parentElement);
+    resizeCanvas2D();
+    drawUv();
+    requestModelRender();
+  </script>
+</body>
+</html>
