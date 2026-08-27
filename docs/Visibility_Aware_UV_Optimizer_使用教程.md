@@ -1,5 +1,10 @@
 # Visibility Aware UV Optimizer 使用教程
 
+> 本文是 0.5.2 Legacy Smart 历史教程。当前 0.5.5 的硬表面工作流、UV 合同和
+> 严格质量门禁请阅读 [硬表面使用说明与 0.5.5 增量](Visibility_Aware_UV_Optimizer_硬表面使用说明_0.5.4.md)。
+> 已有可用大岛、只需整理碎岛与重复结构时，请直接查看其中的
+> `12.1 Refine Layout：优化已有 Unique UV`。
+
 本文对应插件版本 `0.5.2`。
 
 ## 1. 插件用途

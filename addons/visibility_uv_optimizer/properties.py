@@ -41,6 +41,18 @@ def _update_overlay(settings, context):
         pass
 
 
+def _update_hard_surface_profile(settings, context):
+    """Apply a profile threshold while leaving later manual edits possible."""
+    angles = {
+        'WEAPON': math.radians(70.0),
+        'GENERAL': math.radians(80.0),
+        'DEFAULT': math.radians(80.0),
+    }
+    angle = angles.get(settings.hard_surface_profile)
+    if angle is not None:
+        settings.hard_surface_sharp_angle = angle
+
+
 class VUVSettings(bpy.types.PropertyGroup):
     ray_source: EnumProperty(
         name="Ray Source",
@@ -217,16 +229,131 @@ class VUVSettings(bpy.types.PropertyGroup):
     filter_active: BoolProperty(default=False, options={'HIDDEN'})
     filter_update_suspended: BoolProperty(default=False, options={'HIDDEN'})
 
+    initial_uv_mode: EnumProperty(
+        name="Initial UV Mode",
+        description=(
+            "Choose how the first UV charts are seeded. Auto uses marked seams "
+            "when present and otherwise the hard-surface classifier"
+        ),
+        items=(
+            (
+                'AUTO',
+                "Auto",
+                "Use marked-seam mode when existing seams are present, otherwise hard surface",
+            ),
+            (
+                'HARD_SURFACE',
+                "Hard Surface",
+                "Seed panels, strips, bevels, cylinders, and caps with explicit geometric cuts",
+            ),
+            (
+                'MARKED_SEAMS',
+                "Marked Seams",
+                "Treat artist-marked seams as locked boundaries and add only necessary cuts",
+            ),
+            (
+                'REFINE_LAYOUT',
+                "Refine Layout",
+                "Keep existing charts, then safely stitch small fragments and group related islands",
+            ),
+            (
+                'PRESERVE_LAYOUT',
+                "Preserve Layout",
+                "Keep the active UV map and seam flags unchanged",
+            ),
+            (
+                'LEGACY_SMART',
+                "Legacy Smart",
+                "Use the 0.5.3 Smart UV Project seed and merge behavior",
+            ),
+        ),
+        default='AUTO',
+    )
+    hard_surface_profile: EnumProperty(
+        name="Hard Surface Profile",
+        description="Geometry policy preset used when a hard-surface seed mode is active",
+        items=(
+            ('WEAPON', "Weapon / Prop", "Aggressive panel, bevel, strip, and cylinder separation"),
+            ('GENERAL', "General Hard Surface", "Use the same rules with less aggressive angle cuts"),
+            ('DEFAULT', "Default", "Use the standard 0.5.5 hard-surface thresholds"),
+        ),
+        default='WEAPON',
+        update=_update_hard_surface_profile,
+    )
+    uv_usage: EnumProperty(
+        name="UV Usage",
+        description=(
+            "Controls whether overlap is forbidden. Auto detects Unique, TrimSheet, "
+            "LED, and InfoAtlas from the object name"
+        ),
+        items=(
+            ('AUTO', "Auto", "Infer the UV contract from the object name"),
+            ('UNIQUE', "Unique / Bake", "Require non-overlapping texture coverage"),
+            ('TRIM_SHEET', "Trim Sheet", "Allow intentional repeated trim UVs"),
+            ('LED', "LED / VFX", "Allow intentional strip and repeated UVs"),
+            ('INFO_ATLAS', "Info Atlas", "Allow intentional label/atlas overlap"),
+        ),
+        default='AUTO',
+    )
+    hard_surface_sharp_angle: FloatProperty(
+        name="Auto Hard Edge Angle",
+        description="Geometric turn angle at which a smooth edge becomes a hard-surface cut",
+        default=math.radians(70.0),
+        min=math.radians(30.0),
+        max=math.radians(175.0),
+        subtype='ANGLE',
+    )
+    hard_surface_planar_angle: FloatProperty(
+        name="Panel Flatness",
+        description="Maximum normal spread used to classify a planar panel",
+        default=math.radians(5.0),
+        min=math.radians(0.5),
+        max=math.radians(20.0),
+        subtype='ANGLE',
+    )
+    hard_surface_respect_sharp: BoolProperty(
+        name="Cut Sharp Edges",
+        description="Treat Blender Sharp edges as hard-surface UV boundaries in the new modes",
+        default=False,
+    )
+    hard_surface_align_cardinal: BoolProperty(
+        name="Align Long Islands",
+        description="Rotate long UV islands to the nearest horizontal or vertical axis",
+        default=True,
+    )
+    hard_surface_hidden_collapse: BoolProperty(
+        name="Collapse Hidden Overrides",
+        description="Collapse only explicitly Hidden-overridden faces to the UV origin",
+        default=False,
+    )
+    small_cleanup_enabled: BoolProperty(
+        name="Stitch Small Islands / 缝合小岛",
+        description=(
+            "Safely stitch topology-adjacent small UV islands while preserving "
+            "locked seams, material boundaries, and the Unique UV quality gate; "
+            "安全缝合拓扑相邻的小 UV 岛，并保留锁定接缝、材质边界和唯一 UV 门禁"
+        ),
+        default=True,
+    )
+    uv_group_layout_enabled: BoolProperty(
+        name="Group Related Islands / 关联岛分组",
+        description=(
+            "Keep repeated, symmetric, and model-space-near UV islands together "
+            "without overlapping them; 将重复、对称及模型空间邻近的 UV 岛靠近排布且不重叠"
+        ),
+        default=True,
+    )
+
     smart_angle: FloatProperty(
         name="Initial Angle",
-        default=math.radians(55.0),
+        default=math.radians(70.0),
         min=math.radians(1.0),
         max=math.radians(89.0),
         subtype='ANGLE',
     )
     merge_angle: FloatProperty(
         name="Merge Search Angle",
-        default=math.radians(110.0),
+        default=math.radians(130.0),
         min=math.radians(1.0),
         max=math.radians(179.0),
         subtype='ANGLE',
@@ -239,7 +366,7 @@ class VUVSettings(bpy.types.PropertyGroup):
     developable_angle: FloatProperty(
         name="Developable Angle",
         description="Maximum neighbor angle for developable-band preference",
-        default=math.radians(45.0),
+        default=math.radians(55.0),
         min=math.radians(1.0),
         max=math.radians(89.0),
         subtype='ANGLE',
@@ -247,7 +374,7 @@ class VUVSettings(bpy.types.PropertyGroup):
     developable_bonus: FloatProperty(
         name="Band Merge Bonus",
         description="How strongly aligned face bands resist fragmentation",
-        default=0.25,
+        default=0.40,
         min=0.0,
         max=2.0,
     )
@@ -288,33 +415,99 @@ class VUVSettings(bpy.types.PropertyGroup):
     )
     max_p95_stretch: FloatProperty(
         name="P95 Stretch",
-        default=1.35,
+        default=1.50,
         min=1.001,
         max=10.0,
     )
     max_stretch: FloatProperty(
         name="Max Stretch",
-        default=2.5,
+        default=3.0,
         min=1.001,
         max=20.0,
     )
     max_merge_tests: IntProperty(
         name="Merge Tests",
-        default=250,
+        default=500,
         min=0,
         max=10000,
     )
     small_island_faces: IntProperty(
-        name="Small Island Faces",
-        default=8,
+        name="Face Limit / 小岛面数",
+        description=(
+            "Maximum face count for a small-island candidate; "
+            "小岛候选允许的最大面数"
+        ),
+        default=12,
         min=1,
         max=1000,
     )
     small_island_area_ratio: FloatProperty(
-        name="Small Island Area",
-        default=0.002,
+        name="Mesh Area Ratio / 模型面积比",
+        description=(
+            "Small-island mesh-area threshold relative to the object; both this and "
+            "the UV-area threshold must qualify the island; 相对模型总面积的小岛阈值，"
+            "模型和 UV 面积比必须同时满足"
+        ),
+        default=0.001,
         min=0.0,
         max=0.1,
+        precision=4,
+        subtype='FACTOR',
+    )
+    small_uv_area_ratio: FloatProperty(
+        name="UV Area Ratio / UV 面积比",
+        description=(
+            "Small-island UV-area threshold relative to all UV coverage; both this "
+            "and the mesh-area threshold must qualify the island; 相对 UV 总覆盖面积的"
+            "小岛阈值，UV 和模型面积比必须同时满足"
+        ),
+        default=0.001,
+        min=0.0,
+        max=0.1,
+        precision=4,
+        subtype='FACTOR',
+    )
+    small_boundary_ratio: FloatProperty(
+        name="Shared Boundary / 共享边比例",
+        description=(
+            "Minimum share of the small island perimeter that must touch its stitch "
+            "target; 小岛周长中必须与缝合目标相接的最小比例"
+        ),
+        default=0.25,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        subtype='FACTOR',
+    )
+    small_cleanup_p95: FloatProperty(
+        name="Cleanup P95 / 清理 P95",
+        description=(
+            "P95 stretch limit for a small-island stitch; 小岛缝合的 P95 拉伸上限"
+        ),
+        default=1.35,
+        min=1.001,
+        max=10.0,
+        precision=3,
+    )
+    small_cleanup_max_stretch: FloatProperty(
+        name="Cleanup Max / 清理最大拉伸",
+        description=(
+            "Maximum stretch allowed for a small-island stitch; 小岛缝合允许的最大拉伸"
+        ),
+        default=2.0,
+        min=1.001,
+        max=20.0,
+        precision=3,
+    )
+    proximity_radius_ratio: FloatProperty(
+        name="Model Radius / 模型邻近半径",
+        description=(
+            "Maximum model-space grouping distance as a fraction of the object "
+            "bounding-box diagonal; 按模型包围盒对角线比例计算的最大邻近分组距离"
+        ),
+        default=0.025,
+        min=0.0001,
+        max=1.0,
         precision=4,
         subtype='FACTOR',
     )

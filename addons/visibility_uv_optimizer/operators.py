@@ -529,6 +529,64 @@ class VUV_OT_ExportProbeCandidateReport(ExportHelper, bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _optimization_summary(result, settings):
+    """Build a compact summary while accepting pre-0.5.5 result objects."""
+    summary = (
+        "Islands {} -> {}, merged {}/{}; reject stretch {}, overlap {}, "
+        "topology {}, probe {}; guided {}; mode {}; usage {}; cuts {}; "
+        "repaired {}; mirrored {}; safe pack {}"
+    ).format(
+        result.initial_islands,
+        result.final_islands,
+        result.accepted_merges,
+        result.merge_tests,
+        result.rejected_stretch,
+        result.rejected_overlap,
+        result.rejected_topology,
+        getattr(result, "rejected_probe", 0),
+        getattr(result, "probe_guided_merges", 0),
+        getattr(result, "initial_uv_mode", "LEGACY_SMART"),
+        getattr(result, "uv_usage", "UNIQUE"),
+        getattr(result, "forced_cuts", 0),
+        getattr(result, "repaired_charts", 0),
+        getattr(result, "mirrored_charts", 0),
+        "yes" if getattr(result, "safe_pack_retry", False) else "no",
+    )
+
+    cleanup_enabled = bool(getattr(settings, "small_cleanup_enabled", False))
+    cleanup_data = getattr(result, "small_cleanup_summary", {}) or {}
+    cleanup_applied = bool(cleanup_data.get("enabled", False))
+    if cleanup_applied:
+        cleanup_text = "small/小岛 {}/{} ({} -> {})".format(
+            getattr(result, "small_cleanup_merges", 0),
+            getattr(result, "small_cleanup_tests", 0),
+            getattr(result, "small_cleanup_initial_charts", 0),
+            getattr(result, "small_cleanup_final_charts", 0),
+        )
+    elif cleanup_enabled:
+        cleanup_text = "small/小岛 n/a"
+    else:
+        cleanup_text = "small/小岛 off"
+
+    grouping_enabled = bool(getattr(settings, "uv_group_layout_enabled", False))
+    grouping_applied = bool(getattr(result, "group_layout_applied", False))
+    if grouping_applied:
+        grouping_text = (
+            "groups/分组 repeat {} ({} members), nearby {}, rotated {}, fallback {}"
+        ).format(
+            getattr(result, "group_layout_repeat_groups", 0),
+            getattr(result, "group_layout_repeat_members", 0),
+            getattr(result, "group_layout_small_grouped", 0),
+            getattr(result, "group_layout_rotated_islands", 0),
+            "yes" if getattr(result, "group_layout_fallback_used", False) else "no",
+        )
+    elif grouping_enabled:
+        grouping_text = "groups/分组 n/a"
+    else:
+        grouping_text = "groups/分组 off"
+    return "; ".join((summary, cleanup_text, grouping_text))
+
+
 class VUV_OT_OptimizeUV(bpy.types.Operator):
     bl_idname = "vuv.optimize_uv"
     bl_label = "Optimize Active Object UV"
@@ -556,8 +614,6 @@ class VUV_OT_OptimizeUV(bpy.types.Operator):
             result = uv_optimize.optimize_active_object(context, obj, settings)
             if obj.mode != 'OBJECT':
                 bpy.ops.object.mode_set(mode='OBJECT')
-            uv_optimize.write_face_float(
-                obj.data, result.detail_values, name='vuv_detail_score')
         except Exception as caught_error:
             error = str(caught_error)
         finally:
@@ -571,19 +627,6 @@ class VUV_OT_OptimizeUV(bpy.types.Operator):
         if error is not None:
             self.report({'ERROR'}, "UV optimization failed: {}".format(error))
             return {'CANCELLED'}
-        settings.last_optimize = (
-            "Islands {} -> {}, merged {}/{}; reject stretch {}, overlap {}, "
-            "topology {}, probe {}; guided {}"
-        ).format(
-            result.initial_islands,
-            result.final_islands,
-            result.accepted_merges,
-            result.merge_tests,
-            result.rejected_stretch,
-            result.rejected_overlap,
-            result.rejected_topology,
-            result.rejected_probe,
-            result.probe_guided_merges,
-        )
+        settings.last_optimize = _optimization_summary(result, settings)
         self.report({'INFO'}, settings.last_optimize)
         return {'FINISHED'}

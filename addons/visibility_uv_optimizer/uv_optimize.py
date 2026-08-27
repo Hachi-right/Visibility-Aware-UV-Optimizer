@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 import math
+import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import bmesh
 import bpy
@@ -10,11 +11,340 @@ from mathutils import Vector
 from mathutils.geometry import tessellate_polygon
 
 from . import probe_analysis
+from . import hard_surface
+from . import small_island_cleanup
+from . import uv_group_layout
 from .visibility import effective_face_visibility
+from .visibility import read_face_int
 from .visibility import write_face_float
 
 
 _LOW_VISIBILITY_SCALE = 0.01
+_UV_SELECTION_ATTRIBUTES = (
+    '.uv_select_vert',
+    '.uv_select_edge',
+    '.uv_select_face',
+)
+
+
+def _snapshot_face_float_attribute(mesh, name):
+    attributes = getattr(mesh, 'attributes', None)
+    if attributes is None:
+        return None
+    attribute = attributes.get(name)
+    if (
+            attribute is None
+            or getattr(attribute, 'data_type', None) != 'FLOAT'
+            or str(getattr(attribute, 'domain', '')) != 'FACE'):
+        return None
+    return [float(item.value) for item in attribute.data]
+
+
+def _restore_face_float_attribute(mesh, name, values):
+    attributes = getattr(mesh, 'attributes', None)
+    if attributes is None:
+        return
+    attribute = attributes.get(name)
+    if values is None:
+        if attribute is not None:
+            try:
+                attributes.remove(attribute)
+            except (ReferenceError, RuntimeError):
+                pass
+        return
+    if (
+            attribute is None
+            or getattr(attribute, 'data_type', None) != 'FLOAT'
+            or str(getattr(attribute, 'domain', '')) != 'FACE'):
+        if attribute is not None:
+            try:
+                attributes.remove(attribute)
+            except (ReferenceError, RuntimeError):
+                attribute = None
+        try:
+            attribute = attributes.new(
+                name=name, type='FLOAT', domain='FACE')
+        except (RuntimeError, TypeError, ValueError):
+            attribute = attributes.get(name)
+    if attribute is None or len(attribute.data) != len(values):
+        return
+    for item, value in zip(attribute.data, values):
+        item.value = float(value)
+
+
+def _snapshot_uv_selection_attributes(mesh):
+    attributes = getattr(mesh, 'attributes', None)
+    if attributes is None:
+        return {}
+    result = {}
+    for name in _UV_SELECTION_ATTRIBUTES:
+        attribute = attributes.get(name)
+        if attribute is None or getattr(attribute, 'data_type', None) != 'BOOLEAN':
+            result[name] = None
+            continue
+        result[name] = {
+            'domain': str(attribute.domain),
+            'values': [bool(item.value) for item in attribute.data],
+        }
+    return result
+
+
+def _restore_uv_selection_attributes(mesh, states):
+    attributes = getattr(mesh, 'attributes', None)
+    if attributes is None:
+        return
+    for name, state in (states or {}).items():
+        attribute = attributes.get(name)
+        if state is None:
+            if attribute is not None:
+                try:
+                    attributes.remove(attribute)
+                except (ReferenceError, RuntimeError):
+                    pass
+            continue
+        domain = state.get('domain', 'CORNER')
+        if (
+                attribute is None
+                or getattr(attribute, 'data_type', None) != 'BOOLEAN'
+                or str(getattr(attribute, 'domain', '')) != domain):
+            if attribute is not None:
+                try:
+                    attributes.remove(attribute)
+                except (ReferenceError, RuntimeError):
+                    attribute = None
+            try:
+                attribute = attributes.new(
+                    name=name, type='BOOLEAN', domain=domain)
+            except (RuntimeError, TypeError, ValueError):
+                attribute = attributes.get(name)
+        values = state.get('values', ())
+        if attribute is None or len(attribute.data) != len(values):
+            continue
+        for item, value in zip(attribute.data, values):
+            item.value = bool(value)
+
+
+def _filter_operator_kwargs(operator, kwargs, operator_name=None):
+    """Return kwargs shared by the installed Blender operator RNA.
+
+    Blender 3.3 and 5.2 expose different optional UV operator properties.  The
+    RNA probe keeps the shared code path conservative and is also useful to
+    callers that need to report which options were accepted.
+    """
+    try:
+        properties = operator.get_rna_type().properties
+        supported = {item.identifier for item in properties}
+    except (AttributeError, RuntimeError, TypeError):
+        if operator_name and tuple(bpy.app.version) < (4, 0, 0):
+            blender_33 = {
+                'smart_project': {
+                    'angle_limit', 'island_margin', 'area_weight',
+                    'correct_aspect', 'scale_to_bounds',
+                },
+                'unwrap': {
+                    'method', 'fill_holes', 'correct_aspect',
+                    'use_subsurf_data', 'margin',
+                },
+                'average_islands_scale': {'scale_uv', 'shear'},
+                'pack_islands': {'udim_source', 'rotate', 'margin'},
+            }
+            supported = blender_33.get(operator_name)
+            if supported is not None:
+                return {
+                    key: value for key, value in kwargs.items()
+                    if key in supported
+                }
+        return dict(kwargs)
+    return {key: value for key, value in kwargs.items() if key in supported}
+
+
+def _call_uv_operator(operator, _operator_name=None, **kwargs):
+    return operator(**_filter_operator_kwargs(
+        operator, kwargs, operator_name=_operator_name))
+
+
+def _resolve_uv_usage(obj, settings):
+    value = getattr(settings, "uv_usage", 'AUTO')
+    if value != 'AUTO':
+        return value
+    name = (getattr(obj, "name", "") or "").upper()
+    if 'TRIMSHEET' in name or 'TRIM_SHEET' in name:
+        return 'TRIM_SHEET'
+    if 'INFOATLAS' in name or 'INFO_ATLAS' in name:
+        return 'INFO_ATLAS'
+    tokens = [token for token in name.split('_') if token]
+    if any(
+            token in {'LED', 'VFX'}
+            or (token.startswith('LED') and token[3:].isdigit())
+            or (token.startswith('VFX') and token[3:].isdigit())
+            for token in tokens):
+        return 'LED'
+    return 'UNIQUE'
+
+
+def _resolve_initial_uv_mode(settings, original_seams, uv_usage='UNIQUE'):
+    value = getattr(settings, "initial_uv_mode", 'LEGACY_SMART')
+    if value != 'AUTO':
+        return value
+    # Non-unique texture contracts commonly contain deliberate stacking and
+    # carefully placed atlas coordinates.  Re-projecting or packing them is
+    # destructive, so Auto is a true no-op for these layouts.  Users can still
+    # select Hard Surface or Legacy Smart explicitly when a rebuild is wanted.
+    if uv_usage != 'UNIQUE':
+        return 'PRESERVE_LAYOUT'
+    return 'MARKED_SEAMS' if original_seams else 'HARD_SURFACE'
+
+
+def _inspect_existing_layout(mesh):
+    """Return island/detail data without changing the mesh or its UV layers."""
+    active_layer = mesh.uv_layers.active
+    if active_layer is None or len(active_layer.data) != len(mesh.loops):
+        raise ValueError(
+            "Preserve Layout needs a valid active UV map; choose an explicit "
+            "rebuild mode to create one"
+        )
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        bm.faces.index_update()
+        bm.faces.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        uv_layer = bm.loops.layers.uv.get(active_layer.name)
+        if uv_layer is None:
+            raise ValueError("Active UV map is unavailable in BMesh")
+        # Derive chart boundaries only on this detached BMesh.  Existing Mesh
+        # seam flags and every UV coordinate remain untouched.
+        _derive_seams_from_uv(bm, uv_layer, set())
+        _, charts = _charts(bm)
+        return len(charts), _compute_face_detail(bm)
+    finally:
+        bm.free()
+
+
+def _snapshot_mesh_uv_state(mesh):
+    """Capture UV layers and seam flags without assuming every layer is valid."""
+    layers = []
+    loop_count = len(mesh.loops)
+    for layer in mesh.uv_layers:
+        try:
+            if len(layer.data) != loop_count:
+                continue
+            layers.append((layer.name, [
+                {
+                    'uv': item.uv.copy(),
+                    'select': bool(getattr(item, 'select', False)),
+                    'select_edge': bool(getattr(item, 'select_edge', False)),
+                    'pin_uv': bool(getattr(item, 'pin_uv', False)),
+                }
+                for item in layer.data
+            ]))
+        except (IndexError, ReferenceError, RuntimeError):
+            continue
+    active_layer = mesh.uv_layers.active if mesh.uv_layers.active else None
+    try:
+        render_layer = mesh.uv_layers.active_render
+    except AttributeError:
+        # Blender 3.3 has no active_render accessor on UV layers; the active
+        # layer is the only stable layer identity available there.
+        render_layer = active_layer
+    return {
+        'layers': layers,
+        'layer_names': [name for name, _ in layers],
+        'active_index': int(getattr(mesh.uv_layers, 'active_index', -1)),
+        'active': active_layer.name if active_layer else None,
+        'render': render_layer.name if render_layer else None,
+        'seams': [bool(edge.use_seam) for edge in mesh.edges],
+        'vertex_selection': [bool(vertex.select) for vertex in mesh.vertices],
+        'edge_selection': [bool(edge.select) for edge in mesh.edges],
+        'face_selection': [bool(face.select) for face in mesh.polygons],
+        'vertex_hidden': [bool(vertex.hide) for vertex in mesh.vertices],
+        'edge_hidden': [bool(edge.hide) for edge in mesh.edges],
+        'face_hidden': [bool(face.hide) for face in mesh.polygons],
+        'uv_selection_attributes': _snapshot_uv_selection_attributes(mesh),
+        'detail_score': _snapshot_face_float_attribute(
+            mesh, 'vuv_detail_score'),
+        'active_face': int(getattr(mesh.polygons, 'active', -1)),
+    }
+
+
+def _restore_mesh_interaction_state(mesh, snapshot):
+    for name, values in snapshot.get('layers', ()):
+        layer = mesh.uv_layers.get(name)
+        if layer is None or len(layer.data) != len(values):
+            continue
+        for item, state in zip(layer.data, values):
+            for key in ('select', 'select_edge', 'pin_uv'):
+                if hasattr(item, key):
+                    setattr(item, key, bool(state.get(key, False)))
+    for vertex, state in zip(
+            mesh.vertices, snapshot.get('vertex_selection', ())):
+        vertex.select = bool(state)
+    for edge, state in zip(
+            mesh.edges, snapshot.get('edge_selection', ())):
+        edge.select = bool(state)
+    for face, state in zip(
+            mesh.polygons, snapshot.get('face_selection', ())):
+        face.select = bool(state)
+    for vertex, state in zip(
+            mesh.vertices, snapshot.get('vertex_hidden', ())):
+        vertex.hide = bool(state)
+    for edge, state in zip(
+            mesh.edges, snapshot.get('edge_hidden', ())):
+        edge.hide = bool(state)
+    for face, state in zip(
+            mesh.polygons, snapshot.get('face_hidden', ())):
+        face.hide = bool(state)
+    active_face = int(snapshot.get('active_face', -1))
+    if hasattr(mesh.polygons, 'active'):
+        try:
+            mesh.polygons.active = active_face
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+    _restore_uv_selection_attributes(
+        mesh, snapshot.get('uv_selection_attributes', {}))
+    mesh.update()
+
+
+def _restore_mesh_uv_state(mesh, snapshot):
+    if not snapshot:
+        return
+    original_names = set(snapshot.get('layer_names', ()))
+    # Failed Smart/Unwrap calls may have created a UV layer on an object that
+    # started without one.  Remove only layers introduced after the snapshot.
+    for layer in list(mesh.uv_layers):
+        if layer.name not in original_names:
+            try:
+                mesh.uv_layers.remove(layer)
+            except (ReferenceError, RuntimeError):
+                pass
+    for name, values in snapshot.get('layers', ()):
+        layer = mesh.uv_layers.get(name)
+        if layer is None or len(layer.data) != len(values):
+            continue
+        for item, state in zip(layer.data, values):
+            item.uv = state['uv']
+            for key in ('select', 'select_edge', 'pin_uv'):
+                if hasattr(item, key):
+                    setattr(item, key, bool(state.get(key, False)))
+    for edge, state in zip(mesh.edges, snapshot.get('seams', ())):
+        edge.use_seam = bool(state)
+    _restore_face_float_attribute(
+        mesh, 'vuv_detail_score', snapshot.get('detail_score'))
+    _restore_mesh_interaction_state(mesh, snapshot)
+    active = snapshot.get('active')
+    render = snapshot.get('render')
+    if active and mesh.uv_layers.get(active):
+        mesh.uv_layers.active = mesh.uv_layers.get(active)
+    active_index = int(snapshot.get('active_index', -1))
+    if 0 <= active_index < len(mesh.uv_layers):
+        mesh.uv_layers.active_index = active_index
+    if render and mesh.uv_layers.get(render):
+        try:
+            mesh.uv_layers.active_render = mesh.uv_layers.get(render)
+        except AttributeError:
+            pass
+    mesh.update()
 
 
 @dataclass
@@ -29,6 +359,31 @@ class OptimizeResult:
     detail_values: list
     rejected_probe: int = 0
     probe_guided_merges: int = 0
+    initial_uv_mode: str = 'LEGACY_SMART'
+    uv_usage: str = 'UNIQUE'
+    forced_cuts: int = 0
+    protected_cuts: int = 0
+    repaired_charts: int = 0
+    mirrored_charts: int = 0
+    safe_pack_retry: bool = False
+    local_repair_attempted: int = 0
+    local_repair_accepted: int = 0
+    local_repair_rejected: int = 0
+    smart_repair_input_charts: int = 0
+    smart_repair_output_charts: int = 0
+    small_cleanup_tests: int = 0
+    small_cleanup_merges: int = 0
+    small_cleanup_initial_charts: int = 0
+    small_cleanup_final_charts: int = 0
+    small_cleanup_summary: dict = field(default_factory=dict)
+    group_layout_applied: bool = False
+    group_layout_repeat_groups: int = 0
+    group_layout_repeat_members: int = 0
+    group_layout_small_grouped: int = 0
+    group_layout_rotated_islands: int = 0
+    group_layout_uniform_scale: float = 1.0
+    group_layout_fallback_used: bool = False
+    group_layout_summary: dict = field(default_factory=dict)
 
 
 def _set_uv_selection(bm, uv_layer, selected_faces):
@@ -46,8 +401,65 @@ def _set_uv_selection(bm, uv_layer, selected_faces):
             for edge in face.edges:
                 edge.select_set(True)
         for loop in face.loops:
-            loop[uv_layer].select = state
-            loop[uv_layer].select_edge = state
+            if hasattr(loop, "uv_select_vert_set") and hasattr(loop, "uv_select_edge_set"):
+                loop.uv_select_vert_set(state)
+                loop.uv_select_edge_set(state)
+            else:
+                loop[uv_layer].select = state
+                loop[uv_layer].select_edge = state
+    if hasattr(bm, "uv_select_flush_mode"):
+        bm.uv_select_flush_mode()
+
+
+def _select_all_uvs_for_operator(mesh, bm, uv_layer):
+    """Synchronize whole-layout selection before a global UV operator.
+
+    In Blender 5.x, setting every BMLoop UV selection flag is not sufficient
+    in every UV selection mode.  Pack Islands can report FINISHED while leaving
+    some islands untouched.  Running the UV selection operator after flushing
+    the BMesh state makes the intended whole-layout scope explicit in both 3.3
+    and 5.x.  The public optimizer isolates one active mesh before entering
+    Edit Mode; callers using this helper directly must provide the same scope.
+    """
+    _set_uv_selection(bm, uv_layer, (face.index for face in bm.faces))
+    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+    result = bpy.ops.uv.select_all(action='SELECT')
+    if 'FINISHED' not in result:
+        raise RuntimeError("Select All UVs did not finish")
+    return _refresh_edit_bmesh(mesh)
+
+
+def _refresh_edit_bmesh(mesh):
+    """Return current edit BMesh handles after a UV operator call."""
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.faces.index_update()
+    bm.faces.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.verts.ensure_lookup_table()
+    return bm, bm.loops.layers.uv.verify()
+
+
+def _set_edit_mesh_hidden(bm, hidden=False):
+    """Set element hide flags without changing topology or UV data."""
+    for vertex in bm.verts:
+        vertex.hide = bool(hidden)
+    for edge in bm.edges:
+        edge.hide = bool(hidden)
+    for face in bm.faces:
+        face.hide = bool(hidden)
+
+
+def _restore_edit_mesh_hidden(bm, snapshot):
+    """Restore element visibility captured before entering Edit Mode."""
+    for vertex, state in zip(
+            bm.verts, snapshot.get('vertex_hidden', ())):
+        vertex.hide = bool(state)
+    for edge, state in zip(
+            bm.edges, snapshot.get('edge_hidden', ())):
+        edge.hide = bool(state)
+    for face, state in zip(
+            bm.faces, snapshot.get('face_hidden', ())):
+        face.hide = bool(state)
 
 
 def _uv_at_vertex(face, vertex, uv_layer):
@@ -57,13 +469,18 @@ def _uv_at_vertex(face, vertex, uv_layer):
     raise RuntimeError("Face does not contain edge vertex")
 
 
-def _derive_seams_from_uv(bm, uv_layer, locked_seams):
+def _derive_seams_from_uv(
+        bm, uv_layer, locked_seams, forced_seams=None, preserve_boundaries=False):
+    forced_seams = set(forced_seams or ())
     for edge in bm.edges:
-        if edge.index in locked_seams:
+        if edge.index in locked_seams or edge.index in forced_seams:
             edge.seam = True
             continue
         if len(edge.link_faces) != 2:
-            edge.seam = False
+            # Boundary edges are real chart boundaries even though there is no
+            # pair of UV loops to compare.  Legacy mode keeps the historical
+            # flag behavior; hard-surface mode records them explicitly.
+            edge.seam = bool(preserve_boundaries)
             continue
         face_a, face_b = edge.link_faces
         discontinuous = False
@@ -94,6 +511,37 @@ def _charts(bm):
                     continue
                 for neighbor in edge.link_faces:
                     if chart_ids[neighbor.index] < 0:
+                        chart_ids[neighbor.index] = chart_index
+                        pending.append(neighbor)
+        charts.append(chart)
+    return chart_ids, charts
+
+
+def _uv_charts(bm, uv_layer):
+    """Build charts from actual UV continuity, independent of seam flags."""
+    chart_ids = [-1] * len(bm.faces)
+    charts = []
+    for face in bm.faces:
+        if chart_ids[face.index] >= 0:
+            continue
+        chart_index = len(charts)
+        chart_ids[face.index] = chart_index
+        pending = [face]
+        chart = []
+        while pending:
+            current = pending.pop()
+            chart.append(current)
+            for edge in current.edges:
+                for neighbor in edge.link_faces:
+                    if neighbor == current or chart_ids[neighbor.index] >= 0:
+                        continue
+                    continuous = all(
+                        (_uv_at_vertex(current, vertex, uv_layer)
+                         - _uv_at_vertex(neighbor, vertex, uv_layer)).length_squared
+                        <= 1.0e-12
+                        for vertex in edge.verts
+                    )
+                    if continuous:
                         chart_ids[neighbor.index] = chart_index
                         pending.append(neighbor)
         charts.append(chart)
@@ -193,12 +641,77 @@ def _boundary_seam_cost(boundary, visibility, settings):
 
 
 def _is_disk(faces):
+    """Check connected disk topology, including a single boundary loop.
+
+    Euler characteristic alone accepts disconnected patches and some
+    multi-boundary/non-manifold configurations.  Merge candidates must be a
+    connected orientable disk so an unwrap failure cannot silently weld a hole
+    or a second shell into a chart.
+    """
+    faces = list(faces)
+    if not faces:
+        return False
+    selected = {face.index: face for face in faces}
+    pending = [faces[0]]
+    visited = {faces[0].index}
+    while pending:
+        face = pending.pop()
+        for edge in face.edges:
+            linked = [neighbor for neighbor in edge.link_faces if neighbor.index in selected]
+            if len(linked) > 2:
+                return False
+            for neighbor in linked:
+                if neighbor.index not in visited:
+                    visited.add(neighbor.index)
+                    pending.append(neighbor)
+    if len(visited) != len(selected):
+        return False
     vertices = {vertex.index for face in faces for vertex in face.verts}
-    edges = {edge.index for face in faces for edge in face.edges}
+    edges = {edge.index: edge for face in faces for edge in face.edges}
+    boundary = {
+        index: edge for index, edge in edges.items()
+        if sum(1 for linked in edge.link_faces if linked.index in selected) == 1
+    }
+    if not boundary:
+        return False
+    boundary_degree = {}
+    for edge in boundary.values():
+        for vertex in edge.verts:
+            boundary_degree[vertex.index] = boundary_degree.get(vertex.index, 0) + 1
+    if any(value != 2 for value in boundary_degree.values()):
+        return False
+    pending_edges = [next(iter(boundary.values()))]
+    boundary_seen = {pending_edges[0].index}
+    while pending_edges:
+        edge = pending_edges.pop()
+        edge_vertices = {vertex.index for vertex in edge.verts}
+        for other in boundary.values():
+            if other.index in boundary_seen:
+                continue
+            if edge_vertices.intersection(vertex.index for vertex in other.verts):
+                boundary_seen.add(other.index)
+                pending_edges.append(other)
+    if len(boundary_seen) != len(boundary):
+        return False
     return len(vertices) - len(edges) + len(faces) == 1
 
 
-def _triangle_data(faces, uv_layer):
+def _triangle_data(faces, uv_layer, bm=None):
+    faces = list(faces)
+    if bm is not None:
+        selected = {face.index for face in faces}
+        triangles = []
+        for tri_loops in bm.calc_loop_triangles():
+            if not tri_loops:
+                continue
+            face = tri_loops[0].face
+            if face.index not in selected:
+                continue
+            points = tuple(loop.vert.co.copy() for loop in tri_loops)
+            uvs = tuple(loop[uv_layer].uv.copy() for loop in tri_loops)
+            triangles.append((face.index, points, uvs))
+        return triangles
+
     triangles = []
     for face in faces:
         loops = list(face.loops)
@@ -314,7 +827,7 @@ def _positive_triangle_overlap(uv_a, uv_b, epsilon=1e-7):
     return True
 
 
-def _has_overlap(triangles):
+def _has_overlap(triangles, ignore_same_face=True):
     epsilon = 1e-7
     records = []
     for face_index, _, uvs in triangles:
@@ -329,7 +842,7 @@ def _has_overlap(triangles):
         minimum_x, maximum_x, minimum_y, maximum_y, face_index, uvs = record
         active = [item for item in active if item[1] > minimum_x + epsilon]
         for other in active:
-            if face_index == other[4]:
+            if ignore_same_face and face_index == other[4]:
                 continue
             if min(maximum_y, other[3]) - max(minimum_y, other[2]) <= epsilon:
                 continue
@@ -337,6 +850,156 @@ def _has_overlap(triangles):
                 return True
         active.append(record)
     return False
+
+
+def _triangle_orientation(points, uvs):
+    edge_1 = points[1] - points[0]
+    edge_2 = points[2] - points[0]
+    edge_3 = points[2] - points[1]
+    geometry_scale = max(
+        edge_1.length_squared,
+        edge_2.length_squared,
+        edge_3.length_squared,
+        1.0e-30,
+    )
+    geometry_cross = edge_1.cross(edge_2).length
+    if geometry_cross <= max(geometry_scale * 1.0e-12, 1.0e-24):
+        return 'source_degenerate'
+
+    uv_edge_1 = uvs[1] - uvs[0]
+    uv_edge_2 = uvs[2] - uvs[0]
+    uv_edge_3 = uvs[2] - uvs[1]
+    uv_scale = max(
+        uv_edge_1.length_squared,
+        uv_edge_2.length_squared,
+        uv_edge_3.length_squared,
+        1.0e-30,
+    )
+    signed_uv_area_2 = (
+        uv_edge_1.x * uv_edge_2.y - uv_edge_1.y * uv_edge_2.x)
+    if abs(signed_uv_area_2) <= max(uv_scale * 1.0e-12, 1.0e-24):
+        return 'uv_degenerate'
+    return 'positive' if signed_uv_area_2 > 0.0 else 'negative'
+
+
+def _winding_counts(triangles):
+    counts = {
+        'positive': 0,
+        'negative': 0,
+        'degenerate': 0,
+        'source_degenerate': 0,
+        'uv_degenerate': 0,
+    }
+    for _, points, uvs in triangles:
+        orientation = _triangle_orientation(points, uvs)
+        if orientation in {'positive', 'negative'}:
+            counts[orientation] += 1
+        else:
+            counts['degenerate'] += 1
+            counts[orientation] += 1
+    return counts
+
+
+def _classify_problem_charts(charts, uv_layer, bm=None):
+    """Return charts needing re-projection and consistently mirrored charts."""
+    triangles_by_face = defaultdict(list)
+    if bm is not None:
+        all_faces = [face for chart in charts for face in chart]
+        for triangle in _triangle_data(all_faces, uv_layer, bm=bm):
+            triangles_by_face[triangle[0]].append(triangle)
+    problem = []
+    mirrored = []
+    for chart in charts:
+        if bm is None:
+            triangles = _triangle_data(chart, uv_layer)
+        else:
+            triangles = [
+                triangle
+                for face in chart
+                for triangle in triangles_by_face.get(face.index, ())
+            ]
+        finite = all(
+            math.isfinite(value)
+            for _, _, uvs in triangles
+            for uv in uvs for value in (uv.x, uv.y)
+        )
+        counts = _winding_counts(triangles)
+        positive = counts['positive']
+        negative = counts['negative']
+        invalid = (
+            not triangles
+            or not finite
+            or counts['degenerate'] > 0
+            or (positive > 0 and negative > 0)
+            or _has_overlap(triangles, ignore_same_face=False)
+        )
+        if invalid:
+            problem.append(chart)
+        elif negative > 0 and positive == 0:
+            mirrored.append(chart)
+    return problem, mirrored
+
+
+def _mirror_charts_u(charts, uv_layer):
+    for chart in charts:
+        loops = [loop for face in chart for loop in face.loops]
+        if not loops:
+            continue
+        minimum_u = min(loop[uv_layer].uv.x for loop in loops)
+        maximum_u = max(loop[uv_layer].uv.x for loop in loops)
+        center_u = (minimum_u + maximum_u) * 0.5
+        for loop in loops:
+            loop[uv_layer].uv.x = 2.0 * center_u - loop[uv_layer].uv.x
+
+
+def _audit_unique_layout(bm, uv_layer, epsilon=1.0e-6):
+    points = [loop[uv_layer].uv for face in bm.faces for loop in face.loops]
+    finite = bool(points) and all(
+        math.isfinite(point.x) and math.isfinite(point.y) for point in points
+    )
+    triangles = _triangle_data(list(bm.faces), uv_layer, bm=bm) if finite else []
+    counts = _winding_counts(triangles)
+    inside_tile = finite and all(
+        -epsilon <= value <= 1.0 + epsilon
+        for point in points for value in (point.x, point.y)
+    )
+    return {
+        'triangles': len(triangles),
+        'positive': counts['positive'],
+        'negative': counts['negative'],
+        'degenerate': counts['degenerate'],
+        'source_degenerate': counts['source_degenerate'],
+        'uv_degenerate': counts['uv_degenerate'],
+        'finite': finite,
+        'inside_tile': inside_tile,
+        'overlap': finite and (
+            _has_overlap(triangles, ignore_same_face=False)
+            if triangles else False
+        ),
+    }
+
+
+def _unique_layout_error(audit):
+    if not audit['finite']:
+        return "Unique UV quality gate: non-finite coordinate"
+    if not audit['inside_tile']:
+        return "Unique UV quality gate: coordinates outside the 0-1 tile"
+    if audit['source_degenerate']:
+        return (
+            "Unique UV quality gate: source mesh has {} degenerate triangles; "
+            "clean the geometry before unwrapping"
+        ).format(audit['source_degenerate'])
+    if audit['uv_degenerate']:
+        return "Unique UV quality gate: {} UV-degenerate triangles".format(
+            audit['uv_degenerate'])
+    if audit['negative']:
+        return "Unique UV quality gate: {} flipped triangles".format(
+            audit['negative'])
+    if not audit['positive']:
+        return "Unique UV quality gate: no positive-area triangles"
+    if audit['overlap']:
+        return "Unique UV quality gate: positive-area overlap"
+    return None
 
 
 def _save_uv(faces, uv_layer):
@@ -352,11 +1015,462 @@ def _restore_uv(faces, uv_layer, saved):
             loop[uv_layer].uv = uv
 
 
-def _candidate_groups(bm, chart_ids, charts, locked_seams, blocked,
-                      visibility, settings, probe_evidence=None):
+def _uv_charts_for_faces(faces, uv_layer):
+    """Build UV-continuous charts without traversing outside ``faces``."""
+
+    selected = {face.index: face for face in faces}
+    visited = set()
+    charts = []
+    for start in sorted(selected.values(), key=lambda face: face.index):
+        if start.index in visited:
+            continue
+        visited.add(start.index)
+        pending = [start]
+        chart = []
+        while pending:
+            current = pending.pop()
+            chart.append(current)
+            for edge in current.edges:
+                for neighbor in edge.link_faces:
+                    if (
+                            neighbor.index not in selected
+                            or neighbor.index in visited):
+                        continue
+                    continuous = all(
+                        (_uv_at_vertex(current, vertex, uv_layer)
+                         - _uv_at_vertex(neighbor, vertex, uv_layer)).length_squared
+                        <= 1.0e-12
+                        for vertex in edge.verts
+                    )
+                    if continuous:
+                        visited.add(neighbor.index)
+                        pending.append(neighbor)
+        charts.append(chart)
+    return charts
+
+
+def _validate_local_repair(bm, uv_layer, faces):
+    charts = _uv_charts_for_faces(faces, uv_layer)
+    problem, mirrored = _classify_problem_charts(
+        charts, uv_layer, bm=bm)
+    if problem:
+        return False, 0
+    mirrored_count = len(mirrored)
+    if mirrored:
+        _mirror_charts_u(mirrored, uv_layer)
+        problem, mirrored = _classify_problem_charts(
+            charts, uv_layer, bm=bm)
+    return not problem and not mirrored, mirrored_count
+
+
+def _add_chart_tree_cuts(faces):
+    """Cut dual-graph cycles while retaining a connected face-tree unwrap."""
+
+    selected = {face.index: face for face in faces}
+    retained_edges = set()
+    visited = set()
+    for start in sorted(selected.values(), key=lambda face: face.index):
+        if start.index in visited:
+            continue
+        visited.add(start.index)
+        pending = [start]
+        while pending:
+            current = pending.pop()
+            for edge in sorted(current.edges, key=lambda item: item.index):
+                if edge.seam or len(edge.link_faces) != 2:
+                    continue
+                neighbors = [
+                    face for face in edge.link_faces
+                    if face.index in selected and face.index != current.index
+                ]
+                if len(neighbors) != 1:
+                    continue
+                neighbor = neighbors[0]
+                if neighbor.index in visited:
+                    continue
+                retained_edges.add(edge.index)
+                visited.add(neighbor.index)
+                pending.append(neighbor)
+
+    edges = {
+        edge.index: edge
+        for face in selected.values()
+        for edge in face.edges
+    }
+    forced = set()
+    for edge in edges.values():
+        linked_inside = sum(
+            face.index in selected for face in edge.link_faces)
+        if (
+                len(edge.link_faces) == 2
+                and linked_inside == 2
+                and edge.index in retained_edges):
+            continue
+        edge.seam = True
+        if len(edge.link_faces) >= 2:
+            forced.add(edge.index)
+    return forced
+
+
+def _signed_uv_area_2(points):
+    edge_a = points[1] - points[0]
+    edge_b = points[2] - points[0]
+    return edge_a.x * edge_b.y - edge_a.y * edge_b.x
+
+
+def _stabilize_near_collinear_uv_ears(
+        bm, uv_layer, charts, target_relative_height=1.0e-4):
+    """Nudge only numerically unstable skinny ears to positive UV winding."""
+
+    stabilized = 0
+    loop_triangles = list(bm.calc_loop_triangles())
+    for chart in charts:
+        face_ids = {face.index for face in chart}
+        saved_uv = _save_uv(chart, uv_layer)
+        changed = False
+        for _iteration in range(3):
+            adjusted = False
+            for tri_loops in loop_triangles:
+                if not tri_loops or tri_loops[0].face.index not in face_ids:
+                    continue
+                points = [loop.vert.co.copy() for loop in tri_loops]
+                uvs = [loop[uv_layer].uv.copy() for loop in tri_loops]
+                orientation = _triangle_orientation(points, uvs)
+                if orientation not in {'negative', 'uv_degenerate'}:
+                    continue
+
+                base_a, base_b, apex = max(
+                    ((0, 1, 2), (1, 2, 0), (2, 0, 1)),
+                    key=lambda item: (
+                        points[item[1]] - points[item[0]]).length_squared,
+                )
+                source_base = points[base_b] - points[base_a]
+                source_base_squared = source_base.length_squared
+                if source_base_squared <= 1.0e-24:
+                    continue
+                source_relative_height = (
+                    source_base.cross(points[apex] - points[base_a]).length
+                    / source_base_squared
+                )
+                if source_relative_height > 1.0e-4:
+                    continue
+
+                uv_base = uvs[base_b] - uvs[base_a]
+                uv_base_squared = uv_base.length_squared
+                if uv_base_squared <= 1.0e-24:
+                    continue
+                current_relative_height = abs(
+                    _signed_uv_area_2(uvs)) / uv_base_squared
+                if current_relative_height > 1.0e-3:
+                    continue
+                base_length = math.sqrt(uv_base_squared)
+                direction = uv_base / base_length
+                perpendicular = Vector((-direction.y, direction.x))
+                projection = (
+                    uvs[base_a]
+                    + direction * (uvs[apex] - uvs[base_a]).dot(direction)
+                )
+                target_height = max(
+                    base_length * target_relative_height,
+                    1.0e-12,
+                )
+                candidates = [
+                    projection + perpendicular * target_height,
+                    projection - perpendicular * target_height,
+                ]
+                positive = []
+                for candidate in candidates:
+                    candidate_uvs = list(uvs)
+                    candidate_uvs[apex] = candidate
+                    determinant = _signed_uv_area_2(candidate_uvs)
+                    if determinant > uv_base_squared * 1.0e-12:
+                        positive.append((
+                            (candidate - uvs[apex]).length_squared,
+                            candidate,
+                        ))
+                if not positive:
+                    continue
+                tri_loops[apex][uv_layer].uv = min(
+                    positive, key=lambda item: item[0])[1]
+                adjusted = True
+                changed = True
+            if not adjusted:
+                break
+            problem, mirrored = _classify_problem_charts(
+                [chart], uv_layer, bm=bm)
+            if not problem:
+                if mirrored:
+                    _mirror_charts_u(mirrored, uv_layer)
+                break
+
+        problem, mirrored = _classify_problem_charts(
+            [chart], uv_layer, bm=bm)
+        if changed and not problem:
+            if mirrored:
+                _mirror_charts_u(mirrored, uv_layer)
+            problem, mirrored = _classify_problem_charts(
+                [chart], uv_layer, bm=bm)
+        if changed and not problem and not mirrored:
+            stabilized += 1
+        else:
+            _restore_uv(chart, uv_layer, saved_uv)
+    return stabilized
+
+
+def _project_face_planar_positive(bm, face, uv_layer, offset_u):
+    loops = list(face.loops)
+    if len(loops) < 3 or face.normal.length_squared <= 1.0e-24:
+        return None
+    normal = face.normal.normalized()
+    directions = [
+        loop.link_loop_next.vert.co - loop.vert.co
+        for loop in loops
+    ]
+    axis_u = max(directions, key=lambda value: value.length_squared).copy()
+    axis_u -= normal * axis_u.dot(normal)
+    if axis_u.length_squared <= 1.0e-24:
+        return None
+    axis_u.normalize()
+    axis_v = normal.cross(axis_u)
+    if axis_v.length_squared <= 1.0e-24:
+        return None
+    axis_v.normalize()
+
+    origin = loops[0].vert.co
+    projected = [
+        Vector(((loop.vert.co - origin).dot(axis_u),
+                (loop.vert.co - origin).dot(axis_v)))
+        for loop in loops
+    ]
+    minimum_u = min(point.x for point in projected)
+    minimum_v = min(point.y for point in projected)
+    maximum_u = max(point.x for point in projected)
+    maximum_v = max(point.y for point in projected)
+    width = maximum_u - minimum_u
+    height = maximum_v - minimum_v
+    local_scale = max(width, height, 1.0e-30)
+    if min(width, height) <= max(local_scale * 1.0e-12, 1.0e-24):
+        return None
+    saved_uv = _save_uv([face], uv_layer)
+    for loop, point in zip(loops, projected):
+        loop[uv_layer].uv = Vector((
+            point.x - minimum_u,
+            point.y - minimum_v,
+        ))
+
+    problem, mirrored = _classify_problem_charts(
+        [[face]], uv_layer, bm=bm)
+    if problem:
+        _stabilize_near_collinear_uv_ears(
+            bm, uv_layer, [[face]])
+        problem, mirrored = _classify_problem_charts(
+            [[face]], uv_layer, bm=bm)
+    if problem:
+        _restore_uv([face], uv_layer, saved_uv)
+        return None
+    if mirrored:
+        _mirror_charts_u(mirrored, uv_layer)
+        problem, mirrored = _classify_problem_charts(
+            [[face]], uv_layer, bm=bm)
+        if problem or mirrored:
+            _restore_uv([face], uv_layer, saved_uv)
+            return None
+    for loop in loops:
+        loop[uv_layer].uv.x += offset_u
+    return width, height
+
+
+def _project_chart_faces_individually(
+        bm, uv_layer, faces, forced_cuts):
+    edges = {
+        edge.index: edge
+        for face in faces
+        for edge in face.edges
+    }
+    for edge in edges.values():
+        edge.seam = True
+        if len(edge.link_faces) >= 2:
+            forced_cuts.add(edge.index)
+
+    cursor_u = 0.0
+    for face in sorted(faces, key=lambda item: item.index):
+        dimensions = _project_face_planar_positive(
+            bm, face, uv_layer, cursor_u)
+        if dimensions is None:
+            return False, 0
+        width, height = dimensions
+        cursor_u += width + max(width, height, 1.0) * 1.0e-4
+    return _validate_local_repair(bm, uv_layer, faces)
+
+
+def _repair_remaining_problem_charts(
+        mesh, bm, uv_layer, problem_charts, settings, forced_cuts,
+        force_face_projection=False):
+    """Repair each remaining invalid chart without changing Mesh topology."""
+
+    face_groups = [
+        tuple(sorted(face.index for face in chart))
+        for chart in problem_charts
+    ]
+    mirrored_total = 0
+    for face_indices in face_groups:
+        bm, uv_layer = _refresh_edit_bmesh(mesh)
+        try:
+            faces = [bm.faces[index] for index in face_indices]
+        except IndexError as error:
+            raise RuntimeError(
+                "Unique UV repair unexpectedly changed Mesh topology"
+            ) from error
+
+        forced_cuts.update(_add_chart_tree_cuts(faces))
+        _set_uv_selection(bm, uv_layer, face_indices)
+        bmesh.update_edit_mesh(
+            mesh, loop_triangles=False, destructive=False)
+        unwrap_finished = False
+        if not force_face_projection:
+            try:
+                result = _call_uv_operator(
+                    bpy.ops.uv.unwrap,
+                    _operator_name='unwrap',
+                    method='ANGLE_BASED',
+                    fill_holes=True,
+                    correct_aspect=True,
+                    use_subsurf_data=False,
+                    margin=settings.island_margin,
+                )
+                unwrap_finished = 'FINISHED' in result
+            except (ReferenceError, RuntimeError, TypeError, ValueError):
+                unwrap_finished = False
+
+        bm, uv_layer = _refresh_edit_bmesh(mesh)
+        faces = [bm.faces[index] for index in face_indices]
+        if unwrap_finished:
+            valid, mirrored_count = _validate_local_repair(
+                bm, uv_layer, faces)
+            if valid:
+                mirrored_total += mirrored_count
+                continue
+
+        valid, mirrored_count = _project_chart_faces_individually(
+            bm, uv_layer, faces, forced_cuts)
+        if not valid:
+            raise RuntimeError(
+                "Unique UV local fallback could not repair chart with {} faces".format(
+                    len(face_indices)))
+        mirrored_total += mirrored_count
+        bmesh.update_edit_mesh(
+            mesh, loop_triangles=False, destructive=False)
+    return bm, uv_layer, mirrored_total
+
+
+def _try_local_problem_chart_repairs(
+        mesh, bm, uv_layer, problem_charts, settings, forced_cuts):
+    """Try connected chart repairs and restore every rejected attempt."""
+
+    face_groups = [
+        tuple(sorted(face.index for face in chart))
+        for chart in problem_charts
+    ]
+    accepted = 0
+    rejected = 0
+    mirrored_total = 0
+    for face_indices in face_groups:
+        bm, uv_layer = _refresh_edit_bmesh(mesh)
+        faces = [bm.faces[index] for index in face_indices]
+        saved_uv = _save_uv(faces, uv_layer)
+        chart_edges = {
+            edge.index: edge
+            for face in faces
+            for edge in face.edges
+        }
+        saved_seams = {
+            index: bool(edge.seam) for index, edge in chart_edges.items()
+        }
+        forced_before = set(forced_cuts)
+        local_mirrored = 0
+        valid = False
+
+        try:
+            forced_cuts.update(_add_chart_tree_cuts(faces))
+            _set_uv_selection(bm, uv_layer, face_indices)
+            bmesh.update_edit_mesh(
+                mesh, loop_triangles=False, destructive=False)
+            result = _call_uv_operator(
+                bpy.ops.uv.unwrap,
+                _operator_name='unwrap',
+                method='ANGLE_BASED',
+                fill_holes=True,
+                correct_aspect=True,
+                use_subsurf_data=False,
+                margin=settings.island_margin,
+            )
+            bm, uv_layer = _refresh_edit_bmesh(mesh)
+            faces = [bm.faces[index] for index in face_indices]
+            if 'FINISHED' in result:
+                valid, local_mirrored = _validate_local_repair(
+                    bm, uv_layer, faces)
+                local_charts = _uv_charts_for_faces(faces, uv_layer)
+                triangles = _triangle_data(faces, uv_layer, bm=bm)
+                p95, maximum, flipped = _measure_distortion(triangles)
+                valid = bool(
+                    valid
+                    and len(local_charts) == 1
+                    and not flipped
+                    and p95 <= settings.max_p95_stretch
+                    and maximum <= settings.max_stretch
+                    and not _has_overlap(
+                        triangles, ignore_same_face=False)
+                )
+        except (ReferenceError, RuntimeError, TypeError, ValueError):
+            valid = False
+
+        if valid:
+            accepted += 1
+            mirrored_total += local_mirrored
+            bmesh.update_edit_mesh(
+                mesh, loop_triangles=False, destructive=False)
+            continue
+
+        bm, uv_layer = _refresh_edit_bmesh(mesh)
+        faces = [bm.faces[index] for index in face_indices]
+        _restore_uv(faces, uv_layer, saved_uv)
+        for edge_index, seam in saved_seams.items():
+            bm.edges[edge_index].seam = seam
+        forced_cuts.clear()
+        forced_cuts.update(forced_before)
+        bmesh.update_edit_mesh(
+            mesh, loop_triangles=False, destructive=False)
+        rejected += 1
+
+    return bm, uv_layer, accepted, rejected, mirrored_total
+
+
+def _refresh_merge_candidate(mesh, face_indices, boundary_indices):
+    """Rehydrate a merge candidate after an edit-mode UV operator call."""
+
+    bm, uv_layer = _refresh_edit_bmesh(mesh)
+    try:
+        faces = [bm.faces[index] for index in face_indices]
+        boundary = [bm.edges[index] for index in boundary_indices]
+    except IndexError as error:
+        raise RuntimeError(
+            "UV unwrap unexpectedly changed merge-candidate topology"
+        ) from error
+    return bm, uv_layer, faces, boundary
+
+
+def _candidate_groups(
+        bm, uv_layer, chart_ids, charts, locked_seams, blocked, visibility, settings,
+        probe_evidence=None, edge_policy=None, face_classes=None,
+        hard_surface_mode=False, defer_small=False):
+    edge_policy = edge_policy or {}
+    face_classes = face_classes or {}
     groups = defaultdict(list)
     for edge in bm.edges:
         if not edge.seam or len(edge.link_faces) != 2 or edge.index in locked_seams:
+            continue
+        policy = edge_policy.get(edge.index, 'NEUTRAL')
+        if policy in {'LOCKED_CUT', 'FORCE_CUT'}:
             continue
         face_a, face_b = edge.link_faces
         chart_a = chart_ids[face_a.index]
@@ -367,9 +1481,18 @@ def _candidate_groups(bm, chart_ids, charts, locked_seams, blocked,
             continue
         if settings.respect_sharp and not edge.smooth:
             continue
+        if hard_surface_mode:
+            class_a = face_classes.get(face_a.index, 'GENERAL')
+            class_b = face_classes.get(face_b.index, 'GENERAL')
+            if not hard_surface.can_merge_classes(class_a, class_b):
+                continue
         groups[tuple(sorted((chart_a, chart_b)))].append(edge)
 
     total_area = sum(_chart_area(chart) for chart in charts)
+    total_uv_area = sum(
+        small_island_cleanup._chart_uv_area(chart, uv_layer)
+        for chart in charts
+    )
     candidates = []
     for (chart_a, chart_b), boundary in groups.items():
         signature = frozenset(edge.index for edge in boundary)
@@ -384,11 +1507,25 @@ def _candidate_groups(bm, chart_ids, charts, locked_seams, blocked,
         ) / total_length
         area_left = _chart_area(chart_left)
         area_right = _chart_area(chart_right)
-        small = (
-            min(len(chart_left), len(chart_right)) <= settings.small_island_faces
-            or min(area_left, area_right) <= total_area * settings.small_island_area_ratio
-        )
-        if average_angle > settings.merge_angle and not small:
+        if hard_surface_mode:
+            left_small = small_island_cleanup.is_small_chart(
+                chart_left, uv_layer, total_area, total_uv_area, settings
+            )
+            right_small = small_island_cleanup.is_small_chart(
+                chart_right, uv_layer, total_area, total_uv_area, settings
+            )
+            small = left_small or right_small
+            if defer_small and small:
+                # UNIQUE hard-surface fragments are handled only by the later,
+                # stricter cleanup stage.  This remains true when cleanup is
+                # disabled, so the switch cannot expose the generic thresholds.
+                continue
+        else:
+            small = (
+                min(len(chart_left), len(chart_right)) <= settings.small_island_faces
+                or min(area_left, area_right) <= total_area * settings.small_island_area_ratio
+            )
+        if average_angle > settings.merge_angle and not (small and not hard_surface_mode):
             continue
         seam_cost = _boundary_seam_cost(boundary, visibility, settings)
         score = average_angle / max(settings.merge_angle, 1e-8)
@@ -396,7 +1533,12 @@ def _candidate_groups(bm, chart_ids, charts, locked_seams, blocked,
         score -= seam_cost * 0.25
         score -= _developable_band_bonus(
             chart_left, chart_right, boundary, settings)
-        if small:
+        if small and hard_surface_mode:
+            # Small hardware gets only a modest ordering preference.  It must
+            # still satisfy the normal angle gate and may never cross a hard
+            # policy edge merely because it has few faces.
+            score -= 0.15
+        elif small:
             score -= 0.9
         score -= min(total_length / max(math.sqrt(total_area), 1e-8), 1.0) * 0.1
         probe = probe_analysis.summarize_boundary(
@@ -444,7 +1586,8 @@ def build_probe_candidate_report(obj, settings):
         chart_ids, charts = _charts(bm)
         visibility = effective_face_visibility(obj.data, default=1.0)
         candidates = _candidate_groups(
-            bm, chart_ids, charts, set(), set(), visibility, settings, evidence)
+            bm, uv_layer, chart_ids, charts, set(), set(), visibility, settings,
+            evidence)
         report = {
             "schema": probe_analysis.SCHEMA,
             "object": obj.name,
@@ -469,56 +1612,81 @@ def build_probe_candidate_report(obj, settings):
         bm.free()
 
 
-def _try_merge(obj, bm, uv_layer, faces, boundary, settings):
+def _try_merge(
+        obj, bm, uv_layer, faces, boundary, settings, reject_overlap=True):
     if not _is_disk(faces):
         return False, 'TOPOLOGY'
 
+    face_indices = tuple(sorted(face.index for face in faces))
+    boundary_indices = tuple(sorted(edge.index for edge in boundary))
     saved_uv = _save_uv(faces, uv_layer)
-    old_seams = [edge.seam for edge in boundary]
+    old_seams = {edge.index: edge.seam for edge in boundary}
+    accepted = False
+    reason = 'STRETCH'
+    refreshed = False
     for edge in boundary:
         edge.seam = False
     _set_uv_selection(bm, uv_layer, (face.index for face in faces))
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
 
-    result = bpy.ops.uv.unwrap(
-        method='ANGLE_BASED',
-        fill_holes=True,
-        correct_aspect=True,
-        use_subsurf_data=False,
-        margin=settings.island_margin,
-    )
-    if 'FINISHED' not in result:
-        _restore_uv(faces, uv_layer, saved_uv)
-        for edge, old_value in zip(boundary, old_seams):
-            edge.seam = old_value
-        return False, 'STRETCH'
+    try:
+        result = _call_uv_operator(
+            bpy.ops.uv.unwrap,
+            _operator_name='unwrap',
+            method='ANGLE_BASED',
+            fill_holes=True,
+            correct_aspect=True,
+            use_subsurf_data=False,
+            margin=settings.island_margin,
+        )
+        bm, uv_layer, faces, boundary = _refresh_merge_candidate(
+            obj.data, face_indices, boundary_indices)
+        refreshed = True
+        if 'FINISHED' in result:
+            # Use the refreshed edit BMesh tessellation and the same overlap
+            # contract as the final unique-layout gate.  UV operators may
+            # invalidate every loop wrapper even when topology is unchanged.
+            triangles = _triangle_data(faces, uv_layer, bm=bm)
+            p95, maximum, flipped = _measure_distortion(triangles)
+            if (
+                not flipped
+                and p95 <= settings.max_p95_stretch
+                and maximum <= settings.max_stretch
+            ):
+                if reject_overlap and _has_overlap(
+                        triangles, ignore_same_face=False):
+                    reason = 'OVERLAP'
+                else:
+                    accepted = True
+                    reason = 'ACCEPT'
+    except (ReferenceError, RuntimeError, ValueError, TypeError):
+        reason = 'STRETCH'
+    finally:
+        if not refreshed:
+            bm, uv_layer, faces, boundary = _refresh_merge_candidate(
+                obj.data, face_indices, boundary_indices)
+        if not accepted:
+            _restore_uv(faces, uv_layer, saved_uv)
+            for edge in boundary:
+                edge.seam = old_seams[edge.index]
+            bmesh.update_edit_mesh(
+                obj.data, loop_triangles=False, destructive=False)
+    return accepted, reason
 
-    triangles = _triangle_data(faces, uv_layer)
-    p95, maximum, flipped = _measure_distortion(triangles)
-    if flipped or p95 > settings.max_p95_stretch or maximum > settings.max_stretch:
-        _restore_uv(faces, uv_layer, saved_uv)
-        for edge, old_value in zip(boundary, old_seams):
-            edge.seam = old_value
-        return False, 'STRETCH'
-    if settings.reject_overlap and _has_overlap(triangles):
-        _restore_uv(faces, uv_layer, saved_uv)
-        for edge, old_value in zip(boundary, old_seams):
-            edge.seam = old_value
-        return False, 'OVERLAP'
-    return True, 'ACCEPT'
 
-
-def _scale_charts_by_visibility(bm, uv_layer, charts, visibility,
-                                detail_values, settings):
+def _scale_charts_by_visibility(
+        bm, uv_layer, charts, visibility, detail_values, settings,
+        hard_surface_mode=False):
     for chart in charts:
         all_hidden = all(
             face.index < len(visibility) and visibility[face.index] <= 0.0
             for face in chart
         )
         if all_hidden:
-            # Red/hidden charts are kept small while packing, then collapsed
-            # to the UV origin so they do not need unique texture coverage.
-            scale = _LOW_VISIBILITY_SCALE
+            # Legacy keeps red charts tiny and collapses them later.  A unique
+            # hard-surface layout uses a non-zero floor for automatic zero-hit
+            # faces; only explicit Hidden overrides are collapsed.
+            scale = 0.25 if hard_surface_mode else _LOW_VISIBILITY_SCALE
         else:
             # A chart containing any visible face must not be reduced merely
             # because a neighboring face is hidden. Hidden faces are split
@@ -545,14 +1713,230 @@ def _scale_charts_by_visibility(bm, uv_layer, charts, visibility,
             loop[uv_layer].uv = center + (loop[uv_layer].uv - center) * scale
 
 
-def _collapse_hidden_faces_to_origin(bm, uv_layer, visibility):
-    """Collapse every red/hidden face loop to the lower-left UV origin."""
+def _collapse_hidden_faces_to_origin(
+        bm, uv_layer, visibility, overrides=None, explicit_only=False):
+    """Collapse hidden faces, optionally restricting this to explicit overrides."""
     origin = Vector((0.0, 0.0))
     for face in bm.faces:
         if face.index >= len(visibility) or visibility[face.index] > 0.0:
             continue
+        if explicit_only and (
+                overrides is None or face.index >= len(overrides)
+                or overrides[face.index] >= 0):
+            continue
         for loop in face.loops:
             loop[uv_layer].uv = origin
+
+
+def _normalize_uv_to_tile(bm, uv_layer, margin):
+    """Fit an active unique UV layout into one tile after packing.
+
+    Blender 3.3's pack operator has no ``scale`` keyword, and Blender 5.2's
+    default can likewise preserve large pre-pack coordinates.  A deterministic
+    final affine fit keeps the shared path inside the requested tile without
+    changing island topology or relative texel density.
+    """
+    points = [loop[uv_layer].uv for face in bm.faces for loop in face.loops]
+    if not points:
+        return False
+    minimum_x = min(point.x for point in points)
+    maximum_x = max(point.x for point in points)
+    minimum_y = min(point.y for point in points)
+    maximum_y = max(point.y for point in points)
+    width = maximum_x - minimum_x
+    height = maximum_y - minimum_y
+    usable = max(1.0 - 2.0 * max(float(margin), 0.0), 1.0e-6)
+    if width <= 1.0e-12 and height <= 1.0e-12:
+        return False
+    scale = usable / max(width, height, 1.0e-12)
+    offset = Vector((
+        max(float(margin), 0.0) - minimum_x * scale,
+        max(float(margin), 0.0) - minimum_y * scale,
+    ))
+    for point in points:
+        point *= scale
+        point += offset
+    return True
+
+
+def _pack_unique_aabb(mesh, bm, uv_layer, settings):
+    bm, uv_layer = _select_all_uvs_for_operator(mesh, bm, uv_layer)
+    result = _call_uv_operator(
+        bpy.ops.uv.pack_islands,
+        _operator_name='pack_islands',
+        udim_source='ACTIVE_UDIM',
+        rotate=True,
+        rotate_method='CARDINAL',
+        scale=True,
+        merge_overlap=False,
+        margin=settings.island_margin,
+        margin_method='FRACTION',
+        pin=False,
+        shape_method='AABB',
+    )
+    if 'FINISHED' not in result:
+        raise RuntimeError("Safe AABB Pack Islands did not finish")
+    bm, uv_layer = _refresh_edit_bmesh(mesh)
+    _normalize_uv_to_tile(bm, uv_layer, settings.island_margin)
+    return bm, uv_layer
+
+
+def _repair_and_pack_unique_charts(
+        mesh, bm, uv_layer, problem_charts, settings, forced_cuts,
+        original_seams, hard_surface_mode, force_face_projection=False):
+    bm, uv_layer, mirrored_count = _repair_remaining_problem_charts(
+        mesh,
+        bm,
+        uv_layer,
+        problem_charts,
+        settings,
+        forced_cuts,
+        force_face_projection=force_face_projection,
+    )
+    _derive_seams_from_uv(
+        bm,
+        uv_layer,
+        original_seams,
+        forced_cuts,
+        preserve_boundaries=hard_surface_mode,
+    )
+    bm, uv_layer = _select_all_uvs_for_operator(
+        mesh, bm, uv_layer)
+    scale_result = _call_uv_operator(
+        bpy.ops.uv.average_islands_scale,
+        _operator_name='average_islands_scale')
+    if 'FINISHED' not in scale_result:
+        raise RuntimeError(
+            "Average Islands Scale after local UV repair did not finish")
+    bm, uv_layer = _refresh_edit_bmesh(mesh)
+    bm, uv_layer = _pack_unique_aabb(
+        mesh, bm, uv_layer, settings)
+    _derive_seams_from_uv(
+        bm,
+        uv_layer,
+        original_seams,
+        forced_cuts,
+        preserve_boundaries=hard_surface_mode,
+    )
+    _, final_charts = _uv_charts(bm, uv_layer)
+    problem_charts, mirrored_charts = _classify_problem_charts(
+        final_charts, uv_layer, bm=bm)
+    mirrored_count += len(mirrored_charts)
+    _mirror_charts_u(mirrored_charts, uv_layer)
+    return (
+        bm,
+        uv_layer,
+        final_charts,
+        problem_charts,
+        mirrored_count,
+    )
+
+
+def _repair_pack_until_valid(
+        mesh, bm, uv_layer, problem_charts, settings, forced_cuts,
+        original_seams, hard_surface_mode):
+    mirrored_total = 0
+    final_charts = []
+    for force_face_projection in (False, True):
+        (
+            bm,
+            uv_layer,
+            final_charts,
+            problem_charts,
+            mirrored_count,
+        ) = _repair_and_pack_unique_charts(
+            mesh,
+            bm,
+            uv_layer,
+            problem_charts,
+            settings,
+            forced_cuts,
+            original_seams,
+            hard_surface_mode,
+            force_face_projection=force_face_projection,
+        )
+        mirrored_total += mirrored_count
+        if problem_charts:
+            stabilized_charts = _stabilize_near_collinear_uv_ears(
+                bm, uv_layer, problem_charts)
+            if stabilized_charts:
+                _derive_seams_from_uv(
+                    bm,
+                    uv_layer,
+                    original_seams,
+                    forced_cuts,
+                    preserve_boundaries=hard_surface_mode,
+                )
+            _, final_charts = _uv_charts(bm, uv_layer)
+            problem_charts, mirrored_charts = _classify_problem_charts(
+                final_charts, uv_layer, bm=bm)
+            mirrored_total += len(mirrored_charts)
+            _mirror_charts_u(mirrored_charts, uv_layer)
+        if not problem_charts:
+            break
+    return (
+        bm,
+        uv_layer,
+        final_charts,
+        problem_charts,
+        mirrored_total,
+    )
+
+
+def _audit_unique_object_mesh(mesh):
+    """Run the existing Unique gates on an Object Mode mesh snapshot."""
+    active_layer = mesh.uv_layers.active
+    if active_layer is None or len(active_layer.data) != len(mesh.loops):
+        raise RuntimeError(
+            "Unique UV post-layout gate: active UV map is unavailable")
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        bm.faces.index_update()
+        bm.faces.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        uv_layer = bm.loops.layers.uv.get(active_layer.name)
+        if uv_layer is None:
+            raise RuntimeError(
+                "Unique UV post-layout gate: active UV map is unavailable in BMesh")
+        _, charts = _uv_charts(bm, uv_layer)
+        problem_charts, mirrored_charts = _classify_problem_charts(
+            charts, uv_layer, bm=bm)
+        if problem_charts:
+            raise RuntimeError(
+                "Unique UV post-layout gate: {} folded or degenerate charts".format(
+                    len(problem_charts)))
+        if mirrored_charts:
+            raise RuntimeError(
+                "Unique UV post-layout gate: {} mirrored charts".format(
+                    len(mirrored_charts)))
+        audit = _audit_unique_layout(bm, uv_layer)
+        quality_error = _unique_layout_error(audit)
+        if quality_error is not None:
+            raise RuntimeError(quality_error)
+        return len(charts), audit
+    finally:
+        bm.free()
+
+
+def _group_layout_options(settings, strict_source_overlap=True):
+    """Map established VUV settings to the experimental post-layout stage."""
+    return uv_group_layout.GroupLayoutOptions(
+        margin=max(float(settings.island_margin), 0.0),
+        small_face_count=max(
+            int(getattr(settings, 'small_island_faces', 12)), 1),
+        small_area_ratio=max(
+            float(getattr(settings, 'small_island_area_ratio', 0.001)), 0.0),
+        small_uv_area_ratio=max(
+            float(getattr(settings, 'small_uv_area_ratio', 0.001)), 0.0),
+        proximity_radius_ratio=max(
+            float(getattr(settings, 'proximity_radius_ratio', 0.025)), 0.0),
+        align_non_repeat_cardinal=bool(getattr(
+            settings, 'hard_surface_align_cardinal', True)),
+        strict_positive_winding=True,
+        strict_source_overlap=bool(strict_source_overlap),
+    )
 
 
 def optimize_active_object(context, obj, settings):
@@ -560,109 +1944,769 @@ def optimize_active_object(context, obj, settings):
     mesh.update()
     if not mesh.polygons:
         raise ValueError("Active mesh contains no faces")
-    # Without analysis, preserve normal texel density instead of treating the
-    # entire object as red/hidden. Manual overrides still apply.
+    snapshot = _snapshot_mesh_uv_state(mesh)
     visibility = effective_face_visibility(mesh, default=1.0)
+    overrides = read_face_int(mesh)
     probe_evidence = probe_analysis.load_stored_evidence(obj)
     original_seams = {
         edge.index for edge in mesh.edges if edge.use_seam
     } if settings.preserve_seams else set()
-
-    bpy.ops.object.mode_set(mode='EDIT')
-    bpy.ops.mesh.select_all(action='SELECT')
-    smart_result = bpy.ops.uv.smart_project(
-        angle_limit=settings.smart_angle,
-        island_margin=settings.island_margin,
-        area_weight=0.0,
-        correct_aspect=True,
-        scale_to_bounds=False,
+    uv_usage = _resolve_uv_usage(obj, settings)
+    initial_uv_mode = _resolve_initial_uv_mode(settings, original_seams, uv_usage)
+    refine_layout_mode = initial_uv_mode == 'REFINE_LAYOUT'
+    hard_surface_mode = initial_uv_mode in {
+        'HARD_SURFACE', 'MARKED_SEAMS', 'REFINE_LAYOUT'
+    }
+    direct_refine_group_pack = (
+        refine_layout_mode
+        and uv_usage == 'UNIQUE'
+        and bool(getattr(settings, 'uv_group_layout_enabled', True))
     )
-    if 'FINISHED' not in smart_result:
-        raise RuntimeError("Smart UV Project did not finish")
+    edge_policy = {}
+    face_classes = {}
+    forced_cuts = set()
+    protected_cuts = set()
+    detail_values = []
+    constraints = None
+    small_cleanup_summary = {
+        'enabled': False,
+        'reason': 'not_hard_surface_unique',
+        'initial_charts': 0,
+        'final_charts': 0,
+        'tests': 0,
+        'accepted': 0,
+    }
+    group_layout_result = None
+    group_layout_disabled_reason = 'not_hard_surface_unique'
+    refine_source_audit = None
+    refine_cleanup_audit = None
+    allow_refine_source_overlap = False
 
-    bm = bmesh.from_edit_mesh(mesh)
-    bm.faces.index_update()
-    bm.faces.ensure_lookup_table()
-    bm.edges.ensure_lookup_table()
-    bm.verts.ensure_lookup_table()
-    uv_layer = bm.loops.layers.uv.verify()
-    detail_values = _compute_face_detail(bm)
-    _derive_seams_from_uv(bm, uv_layer, original_seams)
-    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+    if initial_uv_mode == 'PRESERVE_LAYOUT':
+        island_count, detail_values = _inspect_existing_layout(mesh)
+        try:
+            write_face_float(mesh, detail_values, name='vuv_detail_score')
+        except Exception:
+            _restore_face_float_attribute(
+                mesh, 'vuv_detail_score', snapshot.get('detail_score'))
+            raise
+        return OptimizeResult(
+            initial_islands=island_count,
+            final_islands=island_count,
+            merge_tests=0,
+            accepted_merges=0,
+            rejected_stretch=0,
+            rejected_overlap=0,
+            rejected_topology=0,
+            detail_values=detail_values,
+            initial_uv_mode=initial_uv_mode,
+            uv_usage=uv_usage,
+        )
 
-    _, initial_charts = _charts(bm)
-    initial_count = len(initial_charts)
-    blocked = set()
-    merge_tests = 0
-    accepted = 0
-    rejected_stretch = 0
-    rejected_overlap = 0
-    rejected_topology = 0
-    rejected_probe = 0
-    probe_guided_merges = 0
+    try:
+        bpy.ops.object.mode_set(mode='EDIT')
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.faces.index_update()
+        bm.faces.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        _set_edit_mesh_hidden(bm, hidden=False)
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+        bpy.ops.mesh.select_all(action='SELECT')
 
-    while merge_tests < settings.max_merge_tests:
-        chart_ids, charts = _charts(bm)
-        candidates = _candidate_groups(
-            bm, chart_ids, charts, original_seams, blocked, visibility,
-            settings, probe_evidence)
-        if not candidates:
-            break
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.faces.index_update()
+        bm.faces.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        uv_layer = bm.loops.layers.uv.verify()
 
-        merged_this_round = False
-        for _, chart_a, chart_b, boundary, signature, probe in candidates:
-            if merge_tests >= settings.max_merge_tests:
+        if refine_layout_mode:
+            constraints = hard_surface.classify_edge_constraints(
+                bm,
+                settings,
+                mode='HARD_SURFACE',
+                original_seams=original_seams,
+            )
+            edge_policy = dict(getattr(constraints, 'edge_policy', {}))
+            face_classes = dict(getattr(constraints, 'face_classes', {}))
+            forced_cuts = set(getattr(constraints, 'forced_cuts', set()))
+            protected_cuts = set(getattr(constraints, 'protected_cuts', set()))
+            _derive_seams_from_uv(
+                bm,
+                uv_layer,
+                original_seams,
+                forced_cuts,
+                preserve_boundaries=True,
+            )
+            bmesh.update_edit_mesh(
+                mesh, loop_triangles=False, destructive=False)
+        elif hard_surface_mode:
+            if not settings.preserve_seams:
+                for edge in bm.edges:
+                    edge.seam = False
+            constraints = hard_surface.classify_edge_constraints(
+                bm,
+                settings,
+                mode=initial_uv_mode,
+                original_seams=original_seams,
+            )
+            edge_policy = dict(getattr(constraints, 'edge_policy', {}))
+            face_classes = dict(getattr(constraints, 'face_classes', {}))
+            forced_cuts = set(getattr(constraints, 'forced_cuts', set()))
+            protected_cuts = set(getattr(constraints, 'protected_cuts', set()))
+            locked_cuts = set(getattr(constraints, 'locked_cuts', original_seams))
+            for edge in bm.edges:
+                edge.seam = edge.index in locked_cuts or edge.index in forced_cuts
+            bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+
+            unwrap_result = _call_uv_operator(
+                bpy.ops.uv.unwrap,
+                _operator_name='unwrap',
+                method='ANGLE_BASED',
+                fill_holes=True,
+                correct_aspect=True,
+                use_subsurf_data=False,
+                margin=settings.island_margin,
+            )
+            if 'FINISHED' not in unwrap_result:
+                raise RuntimeError("Hard-surface UV unwrap did not finish")
+
+            # Re-fetch the edit BMesh after an operator call; Blender may
+            # invalidate loop wrappers while rebuilding the UV layer.
+            bm = bmesh.from_edit_mesh(mesh)
+            bm.faces.index_update()
+            bm.faces.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.verts.ensure_lookup_table()
+            uv_layer = bm.loops.layers.uv.verify()
+            # Record the unwrap's real chart boundaries before optional
+            # geometric cleanup.  A classifier region is not allowed to split
+            # an already continuous chart merely because its normals form a
+            # smaller panel or band.
+            _derive_seams_from_uv(
+                bm,
+                uv_layer,
+                locked_cuts,
+                forced_cuts,
+                preserve_boundaries=True,
+            )
+            regions = hard_surface.build_region_seed_records(bm, constraints)
+            for record in regions:
+                region = list(record.faces)
+                classes = {face_classes.get(face.index, 'GENERAL') for face in region}
+                chart_bounded = all(
+                    bm.edges[index].seam
+                    for index in record.boundary_edges
+                    if 0 <= index < len(bm.edges)
+                )
+                planar_classes = {
+                    'PLANAR_PANEL', 'PANEL', 'RADIAL_CAP', 'CAP'
+                }
+                if chart_bounded and classes and classes <= planar_classes:
+                    saved_region_uv = _save_uv(region, uv_layer)
+                    if hard_surface.project_planar_region(region, uv_layer):
+                        triangles = _triangle_data(region, uv_layer, bm=bm)
+                        p95, maximum, flipped = _measure_distortion(triangles)
+                        if (
+                            flipped
+                            or p95 > settings.max_p95_stretch
+                            or maximum > settings.max_stretch
+                            or _has_overlap(
+                                triangles, ignore_same_face=False)
+                        ):
+                            _restore_uv(region, uv_layer, saved_region_uv)
+                band_classes = {
+                    'BEVEL_STRIP', 'BEVEL', 'QUAD_STRIP', 'STRIP',
+                    'CYLINDER_SIDE', 'CYLINDER'
+                }
+                if chart_bounded and classes and classes <= band_classes:
+                    hard_surface.align_island_cardinal(region, uv_layer)
+            _derive_seams_from_uv(
+                bm,
+                uv_layer,
+                locked_cuts,
+                forced_cuts,
+                preserve_boundaries=True,
+            )
+        else:
+            smart_result = _call_uv_operator(
+                bpy.ops.uv.smart_project,
+                _operator_name='smart_project',
+                angle_limit=settings.smart_angle,
+                island_margin=settings.island_margin,
+                area_weight=0.0,
+                correct_aspect=True,
+                scale_to_bounds=False,
+            )
+            if 'FINISHED' not in smart_result:
+                raise RuntimeError("Smart UV Project did not finish")
+            bm = bmesh.from_edit_mesh(mesh)
+            bm.faces.index_update()
+            bm.faces.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.verts.ensure_lookup_table()
+            uv_layer = bm.loops.layers.uv.verify()
+            _derive_seams_from_uv(bm, uv_layer, original_seams)
+
+        detail_values = _compute_face_detail(bm)
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+
+        _, initial_charts = _charts(bm)
+        initial_count = len(initial_charts)
+        blocked = set()
+        merge_tests = 0
+        accepted = 0
+        rejected_stretch = 0
+        rejected_overlap = 0
+        rejected_topology = 0
+        rejected_probe = 0
+        probe_guided_merges = 0
+        repaired_charts = 0
+        mirrored_chart_count = 0
+        safe_pack_retry = False
+        local_repair_attempted = 0
+        local_repair_accepted = 0
+        local_repair_rejected = 0
+        smart_repair_input_charts = 0
+        smart_repair_output_charts = 0
+        reject_overlap = bool(settings.reject_overlap and uv_usage == 'UNIQUE')
+
+        while (
+                not refine_layout_mode
+                and merge_tests < settings.max_merge_tests):
+            chart_ids, charts = _charts(bm)
+            candidates = _candidate_groups(
+                bm, uv_layer, chart_ids, charts, original_seams, blocked, visibility,
+                settings, probe_evidence, edge_policy, face_classes,
+                hard_surface_mode,
+                defer_small=(hard_surface_mode and uv_usage == 'UNIQUE'))
+            if not candidates:
                 break
-            merge_tests += 1
-            if settings.probe_enabled and probe["hard_reject"]:
-                rejected_probe += 1
+
+            merged_this_round = False
+            attempted_merge = False
+            for _, chart_a, chart_b, boundary, signature, probe in candidates:
+                if merge_tests >= settings.max_merge_tests:
+                    break
+                merge_tests += 1
+                if settings.probe_enabled and probe["hard_reject"]:
+                    rejected_probe += 1
+                    blocked.add(signature)
+                    continue
+                faces = charts[chart_a] + charts[chart_b]
+                accepted_merge, reason = _try_merge(
+                    obj, bm, uv_layer, faces, boundary, settings,
+                    reject_overlap=reject_overlap)
+                # Every operator attempt, including a rejected one, invalidates
+                # the candidate list's BMesh wrappers.  Rehydrate here and build
+                # a fresh candidate list on the next outer iteration.
+                bm, uv_layer = _refresh_edit_bmesh(mesh)
+                attempted_merge = True
+                if accepted_merge:
+                    accepted += 1
+                    if (
+                        settings.probe_enabled
+                        and probe["supported"]
+                        and probe["score"] >= 0.5
+                    ):
+                        probe_guided_merges += 1
+                    merged_this_round = True
+                    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+                    break
                 blocked.add(signature)
-                continue
-            faces = charts[chart_a] + charts[chart_b]
-            accepted_merge, reason = _try_merge(
-                obj, bm, uv_layer, faces, boundary, settings)
-            if accepted_merge:
-                accepted += 1
-                if (
-                    settings.probe_enabled
-                    and probe["supported"]
-                    and probe["score"] >= 0.5
-                ):
-                    probe_guided_merges += 1
-                merged_this_round = True
-                bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+                if reason == 'OVERLAP':
+                    rejected_overlap += 1
+                elif reason == 'TOPOLOGY':
+                    rejected_topology += 1
+                else:
+                    rejected_stretch += 1
                 break
-            blocked.add(signature)
-            if reason == 'OVERLAP':
-                rejected_overlap += 1
-            elif reason == 'TOPOLOGY':
-                rejected_topology += 1
+            if not merged_this_round:
+                if attempted_merge:
+                    continue
+                break
+
+        _, final_charts = _uv_charts(bm, uv_layer)
+        if uv_usage == 'UNIQUE':
+            problem_charts, mirrored_charts = _classify_problem_charts(
+                final_charts, uv_layer, bm=bm)
+            mirrored_chart_count += len(mirrored_charts)
+            _mirror_charts_u(mirrored_charts, uv_layer)
+            if problem_charts:
+                repaired_charts = len(problem_charts)
+                # Hard-surface repair should retain each failed structural
+                # region whenever possible. Smart UV can split a small number
+                # of failed large charts into hundreds of fragments, so try
+                # the connected tree-cut unwrap before using it as a fallback.
+                if hard_surface_mode:
+                    local_repair_attempted = len(problem_charts)
+                    (
+                        bm,
+                        uv_layer,
+                        local_repair_accepted,
+                        local_repair_rejected,
+                        local_mirrored,
+                    ) = _try_local_problem_chart_repairs(
+                            mesh,
+                            bm,
+                            uv_layer,
+                            problem_charts,
+                            settings,
+                            forced_cuts,
+                    )
+                    mirrored_chart_count += local_mirrored
+                    _derive_seams_from_uv(
+                        bm,
+                        uv_layer,
+                        original_seams,
+                        forced_cuts,
+                        preserve_boundaries=True,
+                    )
+                    _, final_charts = _uv_charts(bm, uv_layer)
+                    problem_charts, mirrored_charts = _classify_problem_charts(
+                        final_charts, uv_layer, bm=bm)
+                    mirrored_chart_count += len(mirrored_charts)
+                    _mirror_charts_u(mirrored_charts, uv_layer)
+
+                if problem_charts:
+                    smart_repair_input_charts = len(problem_charts)
+                    repair_faces = {
+                        face.index for chart in problem_charts for face in chart
+                    }
+                    _set_uv_selection(bm, uv_layer, repair_faces)
+                    bmesh.update_edit_mesh(
+                        mesh, loop_triangles=False, destructive=False)
+                    repair_result = _call_uv_operator(
+                        bpy.ops.uv.smart_project,
+                        _operator_name='smart_project',
+                        angle_limit=settings.smart_angle,
+                        island_margin=settings.island_margin,
+                        area_weight=0.0,
+                        correct_aspect=True,
+                        scale_to_bounds=False,
+                        preserve_seams=True,
+                    )
+                    if 'FINISHED' not in repair_result:
+                        raise RuntimeError(
+                            "Unique UV repair projection did not finish")
+                    bm, uv_layer = _refresh_edit_bmesh(mesh)
+                    repaired_faces = [
+                        bm.faces[index] for index in sorted(repair_faces)
+                    ]
+                    smart_repair_output_charts = len(
+                        _uv_charts_for_faces(repaired_faces, uv_layer))
+                    smart_chart_budget = max(
+                        smart_repair_input_charts * 8,
+                        smart_repair_input_charts + 32,
+                    )
+                    if smart_repair_output_charts > smart_chart_budget:
+                        raise RuntimeError(
+                            "Unique UV Smart repair fragmented {} charts into {} "
+                            "charts (budget {})".format(
+                                smart_repair_input_charts,
+                                smart_repair_output_charts,
+                                smart_chart_budget,
+                            )
+                        )
+                    _derive_seams_from_uv(
+                        bm,
+                        uv_layer,
+                        original_seams,
+                        forced_cuts,
+                        preserve_boundaries=hard_surface_mode,
+                    )
+                    _, final_charts = _uv_charts(bm, uv_layer)
+                    problem_charts, mirrored_charts = _classify_problem_charts(
+                        final_charts, uv_layer, bm=bm)
+                    mirrored_chart_count += len(mirrored_charts)
+                    _mirror_charts_u(mirrored_charts, uv_layer)
+                if problem_charts:
+                    bm, uv_layer, local_mirrored = (
+                        _repair_remaining_problem_charts(
+                            mesh,
+                            bm,
+                            uv_layer,
+                            problem_charts,
+                            settings,
+                            forced_cuts,
+                        )
+                    )
+                    mirrored_chart_count += local_mirrored
+                    _derive_seams_from_uv(
+                        bm,
+                        uv_layer,
+                        original_seams,
+                        forced_cuts,
+                        preserve_boundaries=hard_surface_mode,
+                    )
+                    _, final_charts = _uv_charts(bm, uv_layer)
+                    problem_charts, mirrored_charts = _classify_problem_charts(
+                        final_charts, uv_layer, bm=bm)
+                    mirrored_chart_count += len(mirrored_charts)
+                    _mirror_charts_u(mirrored_charts, uv_layer)
+                    if problem_charts:
+                        raise RuntimeError(
+                            "Unique UV repair left {} folded or degenerate charts".format(
+                                len(problem_charts)))
+
+        if uv_usage == 'UNIQUE':
+            if direct_refine_group_pack:
+                refine_source_audit = _audit_unique_layout(bm, uv_layer)
+                if refine_source_audit['overlap']:
+                    raise RuntimeError(
+                        "Refine Layout source UV contains positive-area overlap")
+            if hard_surface_mode and constraints is not None:
+                small_cleanup_summary = small_island_cleanup.stitch_small_islands(
+                    obj,
+                    bm,
+                    uv_layer,
+                    settings,
+                    constraints,
+                    sys.modules[__name__],
+                )
+                if not small_cleanup_summary.get('enabled', False):
+                    small_cleanup_summary.setdefault(
+                        'reason', 'disabled_by_setting')
+                bm, uv_layer = _refresh_edit_bmesh(mesh)
+                _derive_seams_from_uv(
+                    bm,
+                    uv_layer,
+                    original_seams,
+                    forced_cuts,
+                    preserve_boundaries=True,
+                )
+                _, final_charts = _uv_charts(bm, uv_layer)
+                cleanup_problem, cleanup_mirrored = _classify_problem_charts(
+                    final_charts, uv_layer, bm=bm)
+                if cleanup_problem or cleanup_mirrored:
+                    raise RuntimeError(
+                        "Small-island cleanup left {} invalid charts".format(
+                            len(cleanup_problem) + len(cleanup_mirrored)))
+                if direct_refine_group_pack:
+                    refine_cleanup_audit = _audit_unique_layout(bm, uv_layer)
+                    audit_without_position = dict(refine_cleanup_audit)
+                    audit_without_position['inside_tile'] = True
+                    audit_without_position['overlap'] = False
+                    cleanup_error = _unique_layout_error(audit_without_position)
+                    if cleanup_error is not None:
+                        raise RuntimeError(cleanup_error)
+                    allow_refine_source_overlap = bool(
+                        not refine_source_audit['overlap']
+                        and int(small_cleanup_summary.get('accepted', 0)) > 0
+                        and refine_cleanup_audit['overlap']
+                    )
+                    if (
+                        refine_cleanup_audit['overlap']
+                        and not allow_refine_source_overlap
+                    ):
+                        raise RuntimeError(
+                            "Refine Layout cleanup introduced unexplained overlap")
             else:
-                rejected_stretch += 1
-        if not merged_this_round:
-            break
+                small_cleanup_summary = {
+                    'enabled': False,
+                    'reason': 'hard_surface_constraints_unavailable',
+                    'initial_charts': len(final_charts),
+                    'final_charts': len(final_charts),
+                    'tests': 0,
+                    'accepted': 0,
+                }
 
-    _, final_charts = _charts(bm)
-    _set_uv_selection(bm, uv_layer, (face.index for face in bm.faces))
-    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
-    bpy.ops.uv.average_islands_scale()
-    _scale_charts_by_visibility(
-        bm, uv_layer, final_charts, visibility, detail_values, settings)
-    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
-    bpy.ops.uv.pack_islands(rotate=True, margin=settings.island_margin)
-    _collapse_hidden_faces_to_origin(bm, uv_layer, visibility)
-    _derive_seams_from_uv(bm, uv_layer, original_seams)
-    bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=False)
+        if not direct_refine_group_pack:
+            bm, uv_layer = _select_all_uvs_for_operator(
+                mesh, bm, uv_layer)
+            scale_result = _call_uv_operator(
+                bpy.ops.uv.average_islands_scale,
+                _operator_name='average_islands_scale')
+            if 'FINISHED' not in scale_result:
+                raise RuntimeError("Average Islands Scale did not finish")
+            bm, uv_layer = _refresh_edit_bmesh(mesh)
+            _, final_charts = _uv_charts(bm, uv_layer)
+            _scale_charts_by_visibility(
+                bm, uv_layer, final_charts, visibility, detail_values, settings,
+                hard_surface_mode=hard_surface_mode)
+            if hard_surface_mode and getattr(
+                    settings, 'hard_surface_align_cardinal', True):
+                for chart in final_charts:
+                    hard_surface.align_island_cardinal(chart, uv_layer)
+            bm, uv_layer = _select_all_uvs_for_operator(
+                mesh, bm, uv_layer)
+            if hard_surface_mode:
+                pack_result = _call_uv_operator(
+                    bpy.ops.uv.pack_islands,
+                    _operator_name='pack_islands',
+                    udim_source='ACTIVE_UDIM',
+                    rotate=False,
+                    scale=True,
+                    merge_overlap=False,
+                    margin=settings.island_margin,
+                    margin_method='FRACTION',
+                    pin=False,
+                    rotate_method='CARDINAL',
+                    shape_method='CONCAVE',
+                )
+            else:
+                pack_result = _call_uv_operator(
+                    bpy.ops.uv.pack_islands,
+                    _operator_name='pack_islands',
+                    udim_source='ACTIVE_UDIM',
+                    rotate=True,
+                    scale=True,
+                    merge_overlap=False,
+                    margin=settings.island_margin,
+                    margin_method='FRACTION',
+                    pin=False,
+                    shape_method='CONCAVE',
+                )
+            if 'FINISHED' not in pack_result:
+                raise RuntimeError("Pack Islands did not finish")
+        # UV packing is an edit-mesh operator.  Re-fetch the BMesh before any
+        # final seam derivation so a stale wrapper cannot write pre-pack UVs
+        # back over the packed coordinates (notably visible on cap/side
+        # islands in Blender 3.3 and 5.x).
+        bm, uv_layer = _refresh_edit_bmesh(mesh)
+        if uv_usage == 'UNIQUE' and not direct_refine_group_pack:
+            _normalize_uv_to_tile(bm, uv_layer, settings.island_margin)
+        if hard_surface_mode and getattr(settings, 'hard_surface_hidden_collapse', False):
+            _collapse_hidden_faces_to_origin(
+                bm,
+                uv_layer,
+                visibility,
+                overrides=overrides,
+                explicit_only=True,
+            )
+        elif not hard_surface_mode:
+            _collapse_hidden_faces_to_origin(bm, uv_layer, visibility)
+        _derive_seams_from_uv(
+            bm,
+            uv_layer,
+            original_seams,
+            forced_cuts,
+            preserve_boundaries=hard_surface_mode,
+        )
+        _, final_charts = _uv_charts(bm, uv_layer)
+        if uv_usage == 'UNIQUE':
+            problem_charts, mirrored_charts = _classify_problem_charts(
+                final_charts, uv_layer, bm=bm)
+            mirrored_chart_count += len(mirrored_charts)
+            _mirror_charts_u(mirrored_charts, uv_layer)
+            stabilized_charts = _stabilize_near_collinear_uv_ears(
+                bm, uv_layer, problem_charts)
+            if stabilized_charts:
+                repaired_charts += stabilized_charts
+                _derive_seams_from_uv(
+                    bm,
+                    uv_layer,
+                    original_seams,
+                    forced_cuts,
+                    preserve_boundaries=hard_surface_mode,
+                )
+                _, final_charts = _uv_charts(bm, uv_layer)
+                problem_charts, mirrored_charts = _classify_problem_charts(
+                    final_charts, uv_layer, bm=bm)
+                mirrored_chart_count += len(mirrored_charts)
+                _mirror_charts_u(mirrored_charts, uv_layer)
+            if problem_charts:
+                safe_pack_retry = True
+                repaired_charts += len(problem_charts)
+                (
+                    bm,
+                    uv_layer,
+                    final_charts,
+                    problem_charts,
+                    local_mirrored,
+                ) = _repair_pack_until_valid(
+                    mesh,
+                    bm,
+                    uv_layer,
+                    problem_charts,
+                    settings,
+                    forced_cuts,
+                    original_seams,
+                    hard_surface_mode,
+                )
+                mirrored_chart_count += local_mirrored
+            if problem_charts:
+                raise RuntimeError(
+                    "Unique UV quality gate: {} folded or degenerate charts".format(
+                        len(problem_charts)))
+            audit = _audit_unique_layout(bm, uv_layer)
+            if audit['overlap'] and not direct_refine_group_pack:
+                safe_pack_retry = True
+                # Exact concave packing can still leave numerical or cross-tile
+                # collisions on dense imported layouts.  AABB is less compact,
+                # but its disjoint rectangles provide a deterministic safety
+                # fallback before the transaction is rejected.
+                bm, uv_layer = _pack_unique_aabb(
+                    mesh, bm, uv_layer, settings)
+                _derive_seams_from_uv(
+                    bm,
+                    uv_layer,
+                    original_seams,
+                    forced_cuts,
+                    preserve_boundaries=hard_surface_mode,
+                )
+                _, final_charts = _uv_charts(bm, uv_layer)
+                problem_charts, mirrored_charts = _classify_problem_charts(
+                    final_charts, uv_layer, bm=bm)
+                mirrored_chart_count += len(mirrored_charts)
+                _mirror_charts_u(mirrored_charts, uv_layer)
+                stabilized_charts = _stabilize_near_collinear_uv_ears(
+                    bm, uv_layer, problem_charts)
+                if stabilized_charts:
+                    repaired_charts += stabilized_charts
+                    _derive_seams_from_uv(
+                        bm,
+                        uv_layer,
+                        original_seams,
+                        forced_cuts,
+                        preserve_boundaries=hard_surface_mode,
+                    )
+                    _, final_charts = _uv_charts(bm, uv_layer)
+                    problem_charts, mirrored_charts = _classify_problem_charts(
+                        final_charts, uv_layer, bm=bm)
+                    mirrored_chart_count += len(mirrored_charts)
+                    _mirror_charts_u(mirrored_charts, uv_layer)
+                if problem_charts:
+                    repaired_charts += len(problem_charts)
+                    (
+                        bm,
+                        uv_layer,
+                        final_charts,
+                        problem_charts,
+                        local_mirrored,
+                    ) = _repair_pack_until_valid(
+                        mesh,
+                        bm,
+                        uv_layer,
+                        problem_charts,
+                        settings,
+                        forced_cuts,
+                        original_seams,
+                        hard_surface_mode,
+                    )
+                    mirrored_chart_count += local_mirrored
+                if problem_charts:
+                    raise RuntimeError(
+                        "Unique UV quality gate: {} invalid charts after safe pack".format(
+                            len(problem_charts)))
+                audit = _audit_unique_layout(bm, uv_layer)
+            audit_for_gate = dict(audit)
+            if direct_refine_group_pack:
+                # The rigid group layout below owns final tile placement. A
+                # temporary cross-island collision is allowed only when the
+                # conservative cleanup introduced it from a clean source.
+                audit_for_gate['inside_tile'] = True
+                if allow_refine_source_overlap:
+                    audit_for_gate['overlap'] = False
+            quality_error = _unique_layout_error(audit_for_gate)
+            if quality_error is not None:
+                raise RuntimeError(quality_error)
+        else:
+            for loop in (loop for face in bm.faces for loop in face.loops):
+                uv = loop[uv_layer].uv
+                if not (math.isfinite(uv.x) and math.isfinite(uv.y)):
+                    raise RuntimeError(
+                        "UV operation produced a non-finite coordinate")
+        _restore_edit_mesh_hidden(bm, snapshot)
+        bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=False)
+        bpy.ops.object.mode_set(mode='OBJECT')
+        _restore_mesh_interaction_state(mesh, snapshot)
+        post_layout_final_count = len(final_charts)
+        if uv_usage == 'UNIQUE' and hard_surface_mode:
+            if bool(getattr(settings, 'uv_group_layout_enabled', True)):
+                group_layout_result = uv_group_layout.layout_active_uv_adaptive(
+                    obj,
+                    _group_layout_options(
+                        settings,
+                        strict_source_overlap=not allow_refine_source_overlap,
+                    ),
+                )
+            else:
+                group_layout_disabled_reason = 'disabled_by_setting'
+        if uv_usage == 'UNIQUE':
+            post_layout_final_count, _post_layout_audit = (
+                _audit_unique_object_mesh(mesh))
+        write_face_float(mesh, detail_values, name='vuv_detail_score')
 
-    return OptimizeResult(
-        initial_islands=initial_count,
-        final_islands=len(final_charts),
-        merge_tests=merge_tests,
-        accepted_merges=accepted,
-        rejected_stretch=rejected_stretch,
-        rejected_overlap=rejected_overlap,
-        rejected_topology=rejected_topology,
-        detail_values=detail_values,
-        rejected_probe=rejected_probe,
-        probe_guided_merges=probe_guided_merges,
-    )
+        if group_layout_result is None:
+            group_layout_summary = {
+                'applied': False,
+                'reason': group_layout_disabled_reason,
+            }
+            repeat_group_count = 0
+            repeat_member_count = 0
+            grouped_small_count = 0
+            rotated_island_count = 0
+            group_uniform_scale = 1.0
+            group_fallback_used = False
+        else:
+            group_layout_summary = group_layout_result.to_dict(
+                include_islands=False)
+            arranged_repeat_groups = [
+                group
+                for group in group_layout_result.analysis.layout_groups
+                if (
+                    group.reason in {'MIRROR', 'ROTATIONAL', 'REPEATED'}
+                    and len(group.anchor_ids) >= 2
+                )
+            ]
+            repeat_group_count = len(arranged_repeat_groups)
+            repeat_member_count = sum(
+                len(group.anchor_ids) for group in arranged_repeat_groups)
+            grouped_small_count = group_layout_result.grouped_small_islands
+            rotated_island_count = group_layout_result.rotated_islands
+            group_uniform_scale = group_layout_result.uniform_scale
+            group_fallback_used = group_layout_result.fallback_used
+
+        return OptimizeResult(
+            initial_islands=initial_count,
+            final_islands=post_layout_final_count,
+            merge_tests=merge_tests,
+            accepted_merges=accepted,
+            rejected_stretch=rejected_stretch,
+            rejected_overlap=rejected_overlap,
+            rejected_topology=rejected_topology,
+            detail_values=detail_values,
+            rejected_probe=rejected_probe,
+            probe_guided_merges=probe_guided_merges,
+            initial_uv_mode=initial_uv_mode,
+            uv_usage=uv_usage,
+            forced_cuts=len(forced_cuts),
+            protected_cuts=len(protected_cuts),
+            repaired_charts=repaired_charts,
+            mirrored_charts=mirrored_chart_count,
+            safe_pack_retry=safe_pack_retry,
+            local_repair_attempted=local_repair_attempted,
+            local_repair_accepted=local_repair_accepted,
+            local_repair_rejected=local_repair_rejected,
+            smart_repair_input_charts=smart_repair_input_charts,
+            smart_repair_output_charts=smart_repair_output_charts,
+            small_cleanup_tests=int(
+                small_cleanup_summary.get('tests', 0)),
+            small_cleanup_merges=int(
+                small_cleanup_summary.get('accepted', 0)),
+            small_cleanup_initial_charts=int(
+                small_cleanup_summary.get('initial_charts', 0)),
+            small_cleanup_final_charts=int(
+                small_cleanup_summary.get('final_charts', 0)),
+            small_cleanup_summary=dict(small_cleanup_summary),
+            group_layout_applied=group_layout_result is not None,
+            group_layout_repeat_groups=repeat_group_count,
+            group_layout_repeat_members=repeat_member_count,
+            group_layout_small_grouped=grouped_small_count,
+            group_layout_rotated_islands=rotated_island_count,
+            group_layout_uniform_scale=group_uniform_scale,
+            group_layout_fallback_used=group_fallback_used,
+            group_layout_summary=group_layout_summary,
+        )
+    except Exception:
+        # The operator is undoable, but a direct API call or an operator error
+        # should also leave the user's original UVs and seams intact.
+        try:
+            if obj.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+        except (RuntimeError, ValueError):
+            pass
+        _restore_mesh_uv_state(mesh, snapshot)
+        raise

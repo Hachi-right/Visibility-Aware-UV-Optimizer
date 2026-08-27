@@ -1,193 +1,271 @@
-# Visibility Aware UV Optimizer
+# Visibility Aware UV Optimizer 0.5.5
 
-Blender 3.3 add-on for camera-based face visibility analysis and conservative
-UV island merging.
-
-Version 0.5.2 removes the obsolete `Hidden UV Scale` and `Hidden Corner Size`
-controls. Red/hidden faces now have one fixed rule: every UV loop collapses to
-the `(0, 0)` origin. The low-visibility packing floor remains an internal
-implementation detail for yellow UV charts.
-
-Version 0.5.1 collapses every red/hidden face loop to the lower-left UV origin
-`(0, 0)` after packing. This matches snapping the selected red-face UVs to a
-cursor placed at the origin, while remaining independent of the UV Editor
-context. Visible and yellow UVs are no longer resized to reserve a hidden-face
-corner.
-
-Version 0.5.0 adds texture-direction probe evidence import, read-only UV
-boundary candidate reports, probe-guided chart scoring, and conservative
-rejection of boundaries marked as flipped or non-connectable.
-
-Version 0.4.2 fixes the all-red heatmap regression in Blender 3.3 Edit Mode.
-Blender exposes face-attribute metadata there but reports an empty
-`MeshAttribute.data` collection; reading it previously replaced every face
-score with the default zero. Heatmap geometry and visibility selection now read
-the authoritative BMesh face layers in Edit Mode, retain the object-mode path
-elsewhere, skip hidden faces in the custom overlay, and clear stale vertex and
-edge selection before selecting Low or Hidden faces.
-
-Version 0.4.1 hardens operator state restoration and edge cases found during a
-full code audit. Failed analysis and UV operations now restore Edit Mode and
-the prior object selection. UV optimization without visibility data uses normal
-visible texel density instead of collapsing the whole object as hidden. Manual
-Important/Hidden/Auto overrides update immediately and Auto restores the saved
-automatic analysis score from `vuv_visibility_auto`. The audit also adds safe
-handling for reserved-name collisions, linked mesh-data analysis, concave
-n-gon distortion checks, fully flipped UVs, missing overlay data, non-finite
-mapping exports, and responsive viewer resizing.
-
-Version 0.4.0 adds a standalone interactive mapping export for selected mesh
-objects. The single HTML file shows UVs without vertex dots beside an orbitable
-3D model. Exact polygon hit testing replaces nearest-vertex selection; clicking
-a UV face or island highlights the corresponding model surface. Overlapping UV
-faces can be cycled with repeated clicks at the same position. The viewer also
-supports UV pan/zoom, 3D orbit/pan/zoom, selection focus, x-ray highlighting,
-and neutral, material, or visibility colors. It has no external dependencies.
-
-Version 0.3.1 keeps the viewport heatmap compatible with Blender 3.3 through
-5.x by falling back from the legacy `3D_SMOOTH_COLOR` shader name to the newer
-`SMOOTH_COLOR` name.
-
-Version 0.3.2 keeps red/hidden faces in the mesh and UV data, but scales them
-to the configured linear `Hidden UV Scale` (default 0.01) and moves them after
-packing into a reserved top-right UV square. Visible and yellow faces are
-normalized into the complementary lower-left region. This intentionally
-overlaps hidden faces with one another; it is suitable for faces that do not
-need unique texture coverage.
-
-Version 0.3.3 makes Face Display a strictly non-destructive view filter. The
-per-mesh hide-state layer is now the authoritative filter state, visibility
-values are preserved across every toggle, and Show All restores the original
-hide state in one update. Switching Green/Yellow/Red does not require another
-visibility analysis.
-
-Version 0.4.3 exports UV mapping data directly from BMesh while an object is in
-Edit Mode. This avoids Blender 3.3's empty `MeshUVLoopLayer.data` edit-mode
-snapshot, supports multi-object Edit Mode, and preserves the user's mode after
-the interactive viewer is exported.
-
-## Current scope
-
-- Six generated orthographic cameras, selected cameras, or hybrid analysis.
-- Reflection-symmetric sphere sampling with adjustable radius, coverage grid,
-  and multi-layer hits.
-- Exterior-air voxel flood fill that distinguishes outside surfaces, open
-  cavities, and sealed internal surfaces.
-- Combined occlusion across all selected mesh objects.
-- Persistent face visibility and manual priority override attributes.
-- Reversible automatic visibility stored separately as `vuv_visibility_auto`.
-- Non-destructive viewport heatmap.
-- Independent green, yellow, and red face display filters with hide-state restore.
-- Smart UV seed generation followed by adjacent-island merge tests.
-- Merge rejection for non-disk topology, UV stretch, flips, and overlap.
-- Reduced texel density for low-visibility islands.
-- Red/hidden faces collapsed to one overlapping UV point at the `(0, 0)` origin.
-- Developable-band preference for planar, cylindrical, conical, and bevel regions.
-- Visibility-aware seam scoring that favors hidden, hard, and concave boundaries.
-- Detail-aware texel density using local normal variation, stored as
-  `vuv_detail_score` on mesh faces.
-- Standalone HTML export for interactive UV-to-model face and island mapping.
-- Direction-probe evidence import for texture-flow-aware chart merging.
-- UV optimization currently runs on the active mesh object.
+Blender 3.3 through 5.2 add-on for visibility analysis and conservative UV
+generation. Version 0.5.5 adds topology-safe small-island cleanup and
+structure-aware post-layout for hard-surface weapons and props while retaining
+the 0.5.3 Legacy Smart mode.
 
 ## Install
 
-Install the ZIP through Edit > Preferences > Add-ons > Install, then enable
-"Visibility Aware UV Optimizer". The panel is in View3D > Sidebar > UV Optimizer.
+Install the release ZIP through `Edit > Preferences > Add-ons > Install`, then
+enable `Visibility Aware UV Optimizer`. The panel is in
+`View3D > Sidebar > UV Optimizer`.
 
-Select one or more mesh objects with active UV maps, then use `Interactive
-Mapping > Export Viewer`. The export opens in the default browser unless `Open
-After Export` is disabled in Blender's file browser. In the viewer, left-click
-selects an exact UV face, repeated clicks cycle overlapping faces, middle- or
-right-drag pans, and the mouse wheel zooms. The 3D view uses left-drag to orbit,
-middle- or right-drag to pan, and the mouse wheel to zoom.
+The optimizer operates on the active mesh object. Duplicate production assets
+or keep a source-control copy before replacing an approved UV layout.
 
-## Notes
+## Recommended hard-surface workflow
 
-The optimizer rewrites the active UV map and seam flags. Use it on a duplicate
-asset or rely on Blender Undo while tuning thresholds. Concave n-gons are
-evaluated with a fan triangulation in version 0.2; triangulate unusually complex
-n-gons before optimization.
+1. Apply or verify object scale and clean zero-area faces, duplicate vertices,
+   non-manifold edges, and invalid n-gons.
+2. Mark artist seams in Edit Mode with `Edge > Mark Seam` where a continuous
+   texture must stop.
+3. Set `Initial UV Mode` to `Auto`, `UV Usage` to `Auto`, and use the
+   `Weapon / Prop` profile.
+4. Keep `Preserve Existing Seams`, `Respect Material Borders`, and
+   `Align Long Islands` enabled.
+5. Keep `Cut Sharp Edges` disabled for imported production assets unless Sharp
+   edges were deliberately authored as UV cuts.
+6. Keep `Stitch Small Islands / 缝合小岛` and
+   `Group Related Islands / 关联岛分组` enabled for the 0.5.5 hard-surface pass.
+7. Run `Optimize Active Object UV`. A Unique result is committed only when the
+   final quality gate passes.
 
-Sphere mode places an Empty sphere around the selected mesh bounding box. The
-direction set is mirrored across the three world axes, so bilateral geometry is
-sampled symmetrically. `Coverage Grid` controls how many parallel rays are cast
-for each direction: 1x1 is the original center ray, 3x3 is the recommended
-setting, and 5x5 is useful for small or tangential exterior faces. `Hit Layers`
-records the first N front-facing surfaces along each ray; deeper layers are
-multiplied by `Layer Falloff`, so occluded intermediate geometry retains lower
-priority rather than being classified as completely invisible. Visibility scores
-are accumulated per face, then normalized; repeated hits do not make a face
-exceed the visible range. This is useful for concentric shells, where the outer
-shell should remain green and the inner shell should normally become yellow
-rather than green.
+### Refine an existing UV layout
 
-For UV optimization, `Developable Bands` lowers the merge cost of coherent
-low-angle face bands. `Seam Visibility Weight`, `Hard Edge Seam Bonus`, and
-`Concave Seam Bonus` influence which existing boundaries are removed first.
-`Detail Density Strength` gives high normal-variation areas more UV space, with
-`Detail Density Cap` limiting the scale increase. These are conservative scoring
-terms; final merges still require the stretch, winding, overlap, and topology
-checks.
+Choose `Initial UV Mode: Refine Layout` when the active UV map already has
+useful large charts and the remaining problem is fragmented small faces or
+scattered repeated parts. Use it with a Unique / Bake contract. Trim Sheet,
+Info Atlas, and LED/VFX layouts should normally remain on `Auto` so their
+deliberate stacking and out-of-tile coordinates are preserved.
 
-The final UV pass treats a chart containing red and visible faces as mixed:
-the visible part is not reduced by the red face, and the red face loops are
-split into UV discontinuities before being collapsed to the UV origin. This
-prevents a hidden face from forcing an entire visible chart to become tiny.
+Refine Layout derives chart boundaries from the active UV map and skips the
+initial global `Unwrap`, `Smart UV Project`, and general chart-growth merge
+pass. Valid large charts are therefore not globally re-cut. This is not the
+same as `Preserve Layout`: accepted small-island stitches may locally update an
+anchor chart, and island scale, cardinal direction, and position can change
+during the final global packing and structure-aware layout.
 
-Use `Sphere Radius` and `Update Sphere` for repeatable sizing. The Empty can also
-be moved or uniformly scaled in the viewport; analysis reads its world-space
-position and scale.
+The Refine Layout pipeline is:
 
-## Direction probe evidence
+1. read the active UV charts and derive matching seam boundaries;
+2. classify hard-surface constraints without rebuilding the initial charts;
+3. locally repair only charts that already fail the Unique winding or
+   degeneracy checks, if a safe repair is possible;
+4. stitch a small island only across an eligible shared mesh edge;
+5. normalize island scale, align directions, and globally pack all islands;
+6. assign unstitched fragments to an owner by shared topology first,
+   model-space distance second, and material compatibility third; pack each
+   owner and its attachments as one atomic cell; then place repeated, bilateral,
+   and rotational owner cohorts nearby with a common direction; and
+7. run the strict Unique gate again after the structure layout. Any unresolved
+   overlap or cohort-proximity failure restores the complete pre-operation UV
+   and seam state.
 
-The optimizer can consume evidence generated by a separate surface-probe or
-texture-bake pipeline. The probe is expected to be independent of the current
-UV layout, then baked back into that layout so each currently split 3D edge can
-be evaluated for texture continuity.
+Recommended 0.5.5 starting values are:
 
-Import evidence from the `Texture Direction Probe` panel. The JSON schema is:
+| Setting | Value |
+| --- | ---: |
+| Stitch Small Islands | On |
+| Group Related Islands | On |
+| Auto Hard Edge Angle | 70 degrees |
+| Panel Flatness | 5 degrees |
+| Initial Angle | 70 degrees |
+| Merge Search Angle | 130 degrees |
+| P95 Stretch | 1.50 |
+| Max Stretch | 3.0 |
+| Merge Tests | 500 |
+| Small Island Faces | 12 |
+| Small Mesh Area Ratio | 0.001 |
+| Small UV Area Ratio | 0.001 |
+| Small Area Logic | Mesh AND UV |
+| Minimum Shared Boundary | 0.25 |
+| Model Proximity Radius | 0.025 of bounding-box diagonal |
+| Small-Stitch P95 Stretch | 1.35 |
+| Small-Stitch Max Stretch | 2.0 |
+| Developable Angle | 55 degrees |
+| Band Merge Bonus | 0.40 |
+| Island Margin | 0.002 |
 
-```json
-{
-  "schema": "vuv-probe-evidence-v1",
-  "object": "UV_Test_Model",
-  "source": "openSHIBIE",
-  "edges": [
-    {
-      "vertices": [12, 18],
-      "merge_score": 0.92,
-      "confidence": 0.95,
-      "direction_delta_deg": 4.5,
-      "scale_ratio": 1.02,
-      "phase_error": 0.03,
-      "flipped": false,
-      "can_merge": true
-    }
-  ]
-}
-```
+## Structure-aware layout
 
-The edge key is the sorted pair of mesh vertex indices, so it remains usable
-while chart membership changes during the merge pass. `merge_score` may be
-provided directly; otherwise the optimizer derives a conservative score from
-direction, scale, and phase metrics. Evidence marked `flipped: true` or
-`can_merge: false` is kept as a seam when `Reject Flipped Probe` is enabled.
-`Export Candidate Report` is read-only and writes the current UV boundary,
-chart pair, probe score, and rejection reason for external review.
+Isomorphic or exact-topology repeated parts, bilateral counterparts, rotational
+repeats, and other duplicated mechanical structures are resolved into owner
+cohorts. Cohort owners receive a common directed UV orientation and their
+owner cells are kept near one another during packing. An owner cell contains
+the owner chart and all fragments assigned to it and is moved as one atomic
+unit. This is a rigid layout operation:
 
-Evidence is optional. With `Use Direction Probe` disabled or no evidence
-loaded, the existing visibility, topology, stretch, overlap, and developable
-band scoring remains unchanged.
+- UV coordinates may be translated or rotated to a common cardinal direction;
+- islands remain disjoint and retain the configured margin;
+- no UV island is reflected or mirrored;
+- no repeated islands are stacked or intentionally overlapped; and
+- disconnected mesh parts are never welded into one UV island.
 
-Exterior Flood mode builds a conservative voxel surface from the selected
-meshes, floods empty cells from the grid boundary, and marks faces that touch
-the outside-air region. `Exterior Resolution` is the largest voxel axis count;
-96 is a practical starting point for a real asset. `Water Depth Falloff`
-reduces the score for surfaces reached through a deep open cavity, while
-`Exterior Face Samples` controls how much of each face is tested. The mode
-writes `vuv_exterior_ratio` and `vuv_exterior_depth` face attributes in
-addition to the regular `vuv_visibility` score. It is a topology/exposure
-classification, not a replacement for direct camera visibility: an open
-barrel interior can be outside-air connected while still receiving lower
-priority because of its flood distance.
+Mirror and rotational relationships are evidence for grouping and ordering,
+not permission to mirror the UV coordinates. Relative texel density, winding,
+and the Unique no-overlap contract remain unchanged.
+
+Orientation groups and concrete layout groups are separate. Repeat detection
+resolves a shared direction and ordering, while owner cohorts impose a concrete
+nearby-cell constraint. Repeated tiny fragments keep the orientation evidence,
+but owner assignment still follows shared mesh topology first, model-space
+distance second, and material compatibility third. Distant identical slivers
+are therefore not pulled into a global fragment block.
+
+The cohort constraint is mandatory, not a best-effort hint. The deterministic
+packer uses bounded backtracking and progressively wider candidate searches,
+but every accepted result must keep cohort owner cells near one another,
+preserve the configured margin, and remain free of positive-area overlap. If
+those conditions cannot all be met, structure layout fails and the complete UV
+operation is rolled back.
+
+## Topology-safe small-island cleanup
+
+An island is a small-layout candidate only when it has at most 12 faces, its
+mesh-area ratio is at most 0.001, and its UV-area ratio is at most 0.001. Both
+area tests must pass (`AND`). This prevents a chart with few faces and little
+3D area but substantial UV coverage from being misclassified as a disposable
+fragment.
+
+Actual stitching is more restrictive. Two islands must share real mesh
+topology, and the eligible shared edge length must cover at least 0.25 of the
+small island's perimeter. The stitch is rejected if it crosses a preserved
+artist Seam, a respected material boundary, a protected Sharp edge, a locked
+structural cut, or non-manifold topology. The merged chart must then pass
+connected-disk topology, finite-coordinate, positive-winding, non-degeneracy,
+P95/Max stretch
+`1.35 / 2.0`, and positive-area overlap checks.
+
+Model-space proximity alone never authorizes a stitch. Small islands without an
+eligible shared topology edge remain separate UV islands. For layout, their
+owner is selected by shared topology first, model-space distance second, and
+material compatibility third. Each fragment is packed atomically with that
+owner while retaining the 0.002 island margin; model-space distance beyond
+0.025 of the object's bounding-box diagonal is not treated as a nearby match.
+
+## Local residual-chart repair
+
+If the strict Unique checks still find folded or degenerate charts, repair is
+limited to those residual invalid charts. The optimizer retains a spanning tree
+of each chart's face adjacency, adds local seam cuts around the remaining
+cycles, and reruns a local unwrap. A per-face projection is available as a last
+local fallback. Unrelated valid charts are not globally re-cut, and a repair is
+kept only after local winding and degeneracy checks pass.
+
+Near-collinear ear triangles produced when an n-gon is triangulated can sit at
+the numerical winding threshold. For source triangles that are genuinely
+near-collinear, the optimizer may apply a bounded UV adjustment to establish a
+stable positive winding after packing transforms. The adjustment is reverted
+unless the complete chart revalidates; true zero-area source geometry is still
+rejected. These repair paths reduce false failures but do not guarantee that
+every invalid chart can be repaired.
+
+## UV contracts
+
+`UV Usage: Auto` infers the contract from underscore-delimited object-name
+tokens:
+
+| Contract | Recognized name token | Auto behavior |
+| --- | --- | --- |
+| Unique / Bake | default | Generate, pack to 0-1, and run the strict gate |
+| Trim Sheet | `TrimSheet` or `Trim_Sheet` | Preserve the existing layout |
+| Info Atlas | `InfoAtlas` or `Info_Atlas` | Preserve the existing layout |
+| LED / VFX | `LED`, `LED1`, `VFX`, or `VFX1` | Preserve the existing layout |
+
+Auto preservation applies only when `Initial UV Mode` is also `Auto`.
+Selecting `Hard Surface`, `Marked Seams`, or `Legacy Smart` explicitly requests
+a rebuild and can reproject or pack a non-Unique layout. `Refine Layout` skips
+the initial projection but still repacks and can therefore also damage a
+non-Unique layout.
+
+## Hard-surface boundary rules
+
+The seed pass classifies panels, bevel bands, cylinder sides, radial caps, and
+general geometry. Boundaries are prioritized as follows:
+
+- Mesh boundaries and non-manifold edges are structural cuts.
+- Preserved artist seams are locked and never merged.
+- Material borders are cuts when `Respect Material Borders` is enabled.
+- Cylinder cap boundaries and one stable longitudinal cylinder opening are
+  cuts. A regular capped cylinder is expected to produce one side island and
+  two cap islands.
+- Explicit Sharp edges are cuts only when `Cut Sharp Edges` is enabled. It is
+  disabled by default because production shading data is often much denser
+  than the intended UV seam set.
+- Geometric hard angles, bevels, concave edges, visibility, and developable
+  bands influence merge preference but still pass topology, stretch, winding,
+  and overlap checks.
+
+`Panel Flatness` controls whether a grown region is treated as a planar panel.
+Long accepted islands are aligned to a horizontal or vertical axis when
+`Align Long Islands` is enabled.
+
+## Unique quality gate
+
+Unique / Bake output must satisfy every final condition:
+
+- all UV coordinates are finite and inside the 0-1 tile;
+- source triangles and UV triangles are non-degenerate;
+- every triangle has consistent positive winding;
+- no positive-area overlap exists within an island or between islands;
+- every real UV discontinuity has a matching seam flag.
+
+Blender's pack operator is run with all UVs explicitly selected and the active
+UDIM target. If the concave pack still overlaps, an AABB safety pack is tried.
+A rejected stitch candidate restores that candidate and processing may continue.
+Any unresolved final-gate, local-repair, or structure-layout failure instead
+cancels the entire operation and restores all UV layers and coordinates,
+pin/selection data, active/render layer identity, seam flags, mesh selection,
+hidden state, and the prior `vuv_detail_score` attribute.
+
+The final Unique gate remains strict even if `Reject UV Overlap` is disabled;
+that setting controls candidate merge rejection, not the final contract.
+
+Meshes containing zero-area faces, collapsed triangles, duplicate surfaces,
+or severe non-manifold topology may be rejected. Clean the source geometry
+instead of loosening the final gate.
+
+## Multiple UV layers and non-Unique layouts
+
+Rebuild and Refine Layout modes rewrite only the active UV map. Other UV layers
+and the active/render layer identities are preserved. Auto Preserve Layout
+keeps the active UV coordinates and seam flags byte-for-byte stable, including
+deliberate stacking and coordinates outside 0-1; it may refresh the non-UV
+`vuv_detail_score` analysis attribute.
+
+`Collapse Hidden Overrides` is disabled by default. Keep it disabled for a
+Unique contract because collapsed textured faces are intentionally degenerate.
+Use it only for an explicitly rebuilt non-Unique layout where shared hidden
+coverage is acceptable.
+
+## Visibility and mapping viewer
+
+The add-on also provides six-camera, selected-camera, hybrid, sphere-sampling,
+and exterior-flood visibility analysis. Face priorities are stored as mesh
+attributes and can be overridden as Important, Hidden, or Auto.
+
+`Interactive Mapping > Export Viewer` writes a standalone HTML file containing
+the selected mesh and UV data. Click a UV face or island to locate its 3D
+surface; repeated clicks cycle overlapping faces. The viewer has no external
+web dependency.
+
+## Compatibility and validation scope
+
+Version 0.5.5 supports Blender 3.3 through 5.2. Release regression targets are
+Blender 3.3.5 and Blender 5.2.0 LTS. The structure-layout stage uses rigid UV
+transforms and deterministic disjoint-rectangle packing available to both
+versions; it does not rely on 5.x-only mirroring or overlap behavior.
+
+Synthetic coverage includes marked/material/Sharp cuts, a capped cylinder, a
+long rail, hidden geometry, multiple UV layers, non-Unique preservation,
+topology-safe small-island acceptance and rejection, repeated-structure
+grouping, operator RNA differences, selection state, rollback, and injected
+overlap/winding/degeneracy failures.
+
+In the historical 0.5.4 Blender 5.2 weapon validation,
+`SM_CDO_ChopSword_1_LOD1` passes the Unique gate with 220 islands and 4,246
+positive triangles. Four other sampled
+Unique assets are rejected because their source geometry or projected charts
+remain degenerate; their original state is restored. A rejection is an expected
+safe result, not a successful UV rebuild.

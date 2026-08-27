@@ -3,10 +3,10 @@
 bl_info = {
     "name": "Visibility Aware UV Optimizer",
     "author": "SEASUN Tools",
-    "version": (0, 5, 2),
+    "version": (0, 5, 5),
     "blender": (3, 3, 0),
     "location": "View3D > Sidebar > UV Optimizer",
-    "description": "Camera visibility analysis and low-fragmentation UV optimization",
+    "description": "Hard-surface UV optimization with safe small-island and structure grouping",
     "category": "UV",
 }
 
