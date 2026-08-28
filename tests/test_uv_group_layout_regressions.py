@@ -308,31 +308,48 @@ def _test_directed_repeats_resolve_positive_negative_angle():
     assert abs(resolved_a) < 1.0e-6
 
 
-def _test_directed_repeats_resolve_near_180_wrap():
-    first = math.radians(134.9)
-    second = math.radians(-44.9)
+def _test_near_180_directed_conflict_uses_line_equivalence():
+    # The two landmarks straddle the +/-180 wrap, but both disagree with the
+    # geometric -45-degree panel axis by more than the 3-degree cardinal
+    # tolerance.  The component must therefore use its modulo-180 line
+    # contract instead of forcing a false modulo-360 sign.
+    first = math.radians(139.9)
+    second = math.radians(-40.0)
     island_a = _island(
         47,
         (0.0, 0.0, 0.0, 1.0, 1.0, 0.1),
-        principal_angle=math.radians(44.0),
+        principal_angle=math.radians(-45.0),
         direction_angle=first,
         direction_confidence=0.9,
     )
     island_b = _island(
         48,
         (2.0, 0.0, 0.0, 3.0, 1.0, 0.1),
-        principal_angle=math.radians(44.2),
+        principal_angle=math.radians(-45.0),
         direction_angle=second,
         direction_confidence=0.9,
     )
     repeat = VUV.RepeatGroup(0, (47, 48), "TRANSLATED", 0.99, "repeat")
-    rotations = VUV._orientation_angles(
-        _analysis((island_a, island_b), (repeat,)),
-        VUV.GroupLayoutOptions(),
+    analysis = _analysis((island_a, island_b), (repeat,))
+    settings = VUV.GroupLayoutOptions(
+        directed_cardinal_tolerance=math.radians(3.0),
     )
-    resolved_a = VUV._angle_wrap(first + rotations[47])
-    resolved_b = VUV._angle_wrap(second + rotations[48])
-    assert abs(VUV._angle_wrap(resolved_a - resolved_b)) < 1.0e-6
+    VUV._apply_orientation_policy(analysis, settings)
+    assert len(analysis.orientation_downgrades) == 1
+    assert analysis.orientation_downgrades[0]["policy"] == (
+        "center_symmetric_modulo_180"
+    )
+    assert all(item.direction_mode == "center_symmetric" for item in analysis.islands)
+
+    rotations = VUV._orientation_angles(analysis, settings)
+    resolved_a = VUV._line_angle_wrap(
+        island_a.principal_angle + rotations[47]
+    )
+    resolved_b = VUV._line_angle_wrap(
+        island_b.principal_angle + rotations[48]
+    )
+    assert abs(VUV._line_angle_wrap(resolved_a - resolved_b)) < 1.0e-6
+    assert abs(resolved_a) < 1.0e-6
 
 
 def _test_mixed_direction_confidence_uses_group_line_fallback():
@@ -1270,6 +1287,397 @@ def _test_non_repeat_cardinal_switch():
     assert abs(VUV._line_angle_wrap(target_a - target_b)) < 1.0e-12
 
 
+def _test_incompatible_directed_repeat_downgrades_to_cardinal_geometry():
+    # A landmark that points diagonally away from a hard-surface panel's
+    # geometric axis is not a stable orientation cue.  The whole component is
+    # downgraded so its PCA lines can be snapped upright and its exported
+    # metadata cannot make the independent audit apply a false 360 contract.
+    angle = math.radians(35.0)
+    left = _island(
+        1,
+        (0.0, 0.0, 0.0, 1.0, 1.0, 0.1),
+        principal_angle=angle,
+        direction_angle=math.radians(5.0),
+        direction_confidence=0.9,
+    )
+    right = _island(
+        2,
+        (2.0, 0.0, 0.0, 3.0, 1.0, 0.1),
+        principal_angle=-angle,
+        direction_angle=math.radians(-5.0),
+        direction_confidence=0.9,
+    )
+    repeat = VUV.RepeatGroup(0, (1, 2), "REPEATED", 0.99, "directed")
+    analysis = _analysis((left, right), (repeat,))
+    enabled = VUV.GroupLayoutOptions(align_directed_cardinal=True)
+    VUV._apply_orientation_policy(analysis, enabled)
+    assert len(analysis.orientation_downgrades) == 1
+    assert analysis.orientation_downgrades[0]["policy"] == (
+        "center_symmetric_modulo_180"
+    )
+    assert all(
+        island.direction_mode == "center_symmetric"
+        and island.direction_confidence == 0.0
+        for island in analysis.islands
+    )
+    angles = VUV._orientation_angles(analysis, enabled)
+    final_lines = [
+        VUV._line_angle_wrap(island.principal_angle + angles[island.island_id])
+        for island in analysis.islands
+    ]
+    assert all(abs(line) < 1.0e-12 for line in final_lines), final_lines
+
+    # A generous tolerance keeps the original directed behavior available for
+    # genuinely directional parts whose landmark and geometric axis agree
+    # within the caller's declared policy.
+    retained = _analysis((
+        _island(
+            1,
+            (0.0, 0.0, 0.0, 1.0, 1.0, 0.1),
+            principal_angle=angle,
+            direction_angle=math.radians(5.0),
+            direction_confidence=0.9,
+        ),
+        _island(
+            2,
+            (2.0, 0.0, 0.0, 3.0, 1.0, 0.1),
+            principal_angle=-angle,
+            direction_angle=math.radians(-5.0),
+            direction_confidence=0.9,
+        ),
+    ), (repeat,))
+    retained_settings = VUV.GroupLayoutOptions(
+        directed_cardinal_tolerance=math.radians(40.0),
+    )
+    VUV._apply_orientation_policy(retained, retained_settings)
+    assert retained.orientation_downgrades == []
+    assert all(item.direction_mode == "directed" for item in retained.islands)
+    retained_angles = VUV._orientation_angles(retained, retained_settings)
+    retained_directions = [
+        VUV._angle_wrap(
+            math.atan2(island.direction_vector.y, island.direction_vector.x)
+            + retained_angles[island.island_id]
+        )
+        for island in retained.islands
+    ]
+    assert abs(VUV._angle_wrap(retained_directions[0] - retained_directions[1])) < 1.0e-12
+
+
+def _test_directed_repeat_can_disable_cardinal_compatibility_gate():
+    angle = math.radians(35.0)
+    islands = (
+        _island(
+            1,
+            (0.0, 0.0, 0.0, 1.0, 1.0, 0.1),
+            principal_angle=angle,
+            direction_angle=math.radians(5.0),
+            direction_confidence=0.9,
+        ),
+        _island(
+            2,
+            (2.0, 0.0, 0.0, 3.0, 1.0, 0.1),
+            principal_angle=-angle,
+            direction_angle=math.radians(-5.0),
+            direction_confidence=0.9,
+        ),
+    )
+    repeat = VUV.RepeatGroup(0, (1, 2), "REPEATED", 0.99, "directed")
+    analysis = _analysis(islands, (repeat,))
+    settings = VUV.GroupLayoutOptions(align_directed_cardinal=False)
+    VUV._apply_orientation_policy(analysis, settings)
+    assert analysis.orientation_downgrades == []
+    assert all(item.direction_mode == "directed" for item in analysis.islands)
+
+
+def _test_post_layout_owner_partition_reapplies_direction_policy():
+    """A restored owner cohort must retain the executed cardinal downgrade.
+
+    The transaction reuses the pre-boost semantic partition after analysing
+    the final UV layer.  This fixture mirrors that shape: there is no repeat
+    record on the post pass, only an owner cohort.  One landmark points almost
+    horizontal while its geometric panel is vertical, so both owners must be
+    exported as center-symmetric.  A legitimate 90-degree owner pair remains
+    directed because owner cohorts may represent quarter-turned parts.
+    """
+    conflict = (
+        _island(
+            189,
+            (0.0, 0.0, 0.0, 1.0, 1.0, 0.1),
+            principal_angle=math.pi * 0.5,
+            direction_angle=math.radians(0.46),
+            direction_confidence=0.9,
+        ),
+        _island(
+            195,
+            (2.0, 0.0, 0.0, 3.0, 1.0, 0.1),
+            principal_angle=math.pi * 0.5,
+            direction_angle=math.radians(-77.53),
+            direction_confidence=1.0,
+        ),
+    )
+    owner_group = VUV.LayoutGroup(
+        group_id=101,
+        member_ids=(189, 195),
+        reason="ROTATIONAL",
+        anchor_ids=(189, 195),
+        owner_cohorts=((195, 189),),
+    )
+    settings = VUV.GroupLayoutOptions(
+        directed_cardinal_tolerance=math.radians(5.0),
+    )
+    analysis = _analysis(conflict, layout_groups=(owner_group,))
+    VUV._apply_orientation_policy(analysis, settings)
+    assert len(analysis.orientation_downgrades) == 1
+    downgrade = analysis.orientation_downgrades[0]
+    assert set(downgrade["members"]) == {189, 195}
+    assert downgrade["reason"] == (
+        "landmark_geometry_residual_exceeds_cardinal_tolerance"
+    )
+    assert all(item.direction_mode == "center_symmetric" for item in analysis.islands)
+    assert all(item.direction_confidence == 0.0 for item in analysis.islands)
+
+    legal = (
+        _island(
+            289,
+            (0.0, 0.0, 0.0, 1.0, 1.0, 0.1),
+            principal_angle=0.0,
+            direction_angle=0.0,
+            direction_confidence=0.9,
+        ),
+        _island(
+            295,
+            (2.0, 0.0, 0.0, 3.0, 1.0, 0.1),
+            principal_angle=math.pi * 0.5,
+            direction_angle=math.pi * 0.5,
+            direction_confidence=0.9,
+        ),
+    )
+    legal_group = VUV.LayoutGroup(
+        group_id=102,
+        member_ids=(289, 295),
+        reason="ROTATIONAL",
+        anchor_ids=(289, 295),
+        owner_cohorts=((289, 295),),
+    )
+    legal_analysis = _analysis(legal, layout_groups=(legal_group,))
+    VUV._apply_orientation_policy(legal_analysis, settings)
+    assert legal_analysis.orientation_downgrades == []
+    assert all(item.direction_mode == "directed" for item in legal_analysis.islands)
+
+
+def _test_small_island_boost_is_uniform_and_bounded():
+    small = _island(
+        1,
+        (0.0, 0.0, 0.0, 0.2, 0.2, 0.1),
+        small=True,
+    )
+    large = _island(
+        2,
+        (1.0, 0.0, 0.0, 3.0, 2.0, 0.1),
+        small=False,
+    )
+    analysis = _analysis((small, large))
+    oriented = {
+        1: _rectangle(0, 0.2, 0.1),
+        2: _rectangle(10, 1.0, 0.5),
+    }
+    weighted, factors, count = VUV._boost_small_island_coordinates(
+        oriented,
+        analysis,
+        1.35,
+    )
+    assert count == 1
+    assert abs(factors[1] - 1.35) < 1.0e-12
+    assert abs(factors[2] - 1.0) < 1.0e-12
+    small_bounds = VUV._uv_bounds(weighted[1].values())
+    large_bounds = VUV._uv_bounds(weighted[2].values())
+    small_width = small_bounds[2] - small_bounds[0]
+    large_width = large_bounds[2] - large_bounds[0]
+    assert abs(small_width - 0.27) < 1.0e-6
+    assert abs(large_width - 1.0) < 1.0e-6
+    _, capped, _ = VUV._boost_small_island_coordinates(
+        oriented,
+        analysis,
+        9.0,
+    )
+    assert capped[1] == 3.0
+
+
+def _test_square_pack_bias_improves_tile_utilization():
+    # This mix exposes a shelf discontinuity: the compactness-only score picks
+    # a 1.18:1 strip, while the bounded square bias finds a nearly square
+    # candidate without increasing the longest dimension by more than 12%.
+    pairs = (
+        (0.0980, 0.7053),
+        (0.8336, 1.1555),
+        (0.9616, 0.0931),
+        (0.1579, 1.0298),
+    )
+    rectangles = tuple(
+        VUV._Rect(index, width, height, index)
+        for index, (width, height) in enumerate(pairs)
+    )
+    compact = VUV._best_shelf_pack(
+        rectangles,
+        gap=0.06227,
+        allow_rotate=True,
+        square_pack_bias=0.0,
+    )
+    balanced = VUV._best_shelf_pack(
+        rectangles,
+        gap=0.06227,
+        allow_rotate=True,
+        square_pack_bias=VUV.GroupLayoutOptions().square_pack_bias,
+    )
+    compact_aspect = max(compact[1], compact[2]) / min(compact[1], compact[2])
+    balanced_aspect = max(balanced[1], balanced[2]) / min(balanced[1], balanced[2])
+    assert balanced_aspect + 0.1 < compact_aspect, (
+        compact[1:],
+        balanced[1:],
+    )
+    assert max(balanced[1], balanced[2]) <= max(compact[1], compact[2]) * 1.12
+
+
+def _test_shelf_order_ensemble_closes_blank_space_without_scale_loss():
+    # The legacy longest-side order leaves a shallow strip even though the
+    # same rectangles fit a smaller, nearly square shelf layout.  The bounded
+    # order ensemble improves both fitted UV scale and tile coverage, but it
+    # may never increase the longest packed dimension because that would
+    # shrink every UV island.
+    pairs = (
+        (0.29548, 0.62368),
+        (0.59685, 0.57603),
+        (0.30032, 0.58139),
+        (0.06773, 0.15107),
+    )
+    gap = 0.05493
+    rectangles = tuple(
+        VUV._Rect(index, width, height, index)
+        for index, (width, height) in enumerate(pairs)
+    )
+    legacy_candidates = []
+    for target_width in VUV._candidate_shelf_widths(rectangles, gap):
+        placements, width, height = VUV._shelf_pack_once(
+            rectangles,
+            target_width,
+            gap,
+            allow_rotate=True,
+            preserve_order=False,
+        )
+        maximum = max(width, height)
+        minimum = max(min(width, height), VUV._EPSILON)
+        aspect = maximum / minimum
+        score = maximum * (
+            1.0
+            + VUV.GroupLayoutOptions().square_pack_bias
+            * min(max(aspect - 1.0, 0.0), 2.0)
+        )
+        legacy_candidates.append((
+            score,
+            maximum,
+            width * height,
+            aspect,
+            abs(width - height),
+            target_width,
+            placements,
+            width,
+            height,
+        ))
+    legacy = min(legacy_candidates, key=lambda item: item[:6])
+    improved = VUV._best_shelf_pack(
+        rectangles,
+        gap=gap,
+        allow_rotate=True,
+        square_pack_bias=VUV.GroupLayoutOptions().square_pack_bias,
+    )
+    improved_maximum = max(improved[1], improved[2])
+    improved_aspect = improved_maximum / min(improved[1], improved[2])
+    assert improved_maximum <= legacy[1] + 1.0e-12, (
+        legacy[7:],
+        improved[1:],
+    )
+    assert improved_maximum < legacy[1] * 0.95, (
+        legacy[7:],
+        improved[1:],
+    )
+    assert improved_aspect + 0.05 < legacy[3], (
+        legacy[7:],
+        improved[1:],
+    )
+    improved_placements = tuple(improved[0].values())
+    for left_index, left in enumerate(improved_placements):
+        for right in improved_placements[left_index + 1:]:
+            assert VUV._placements_clear(left, right, gap), improved[0]
+
+
+def _test_low_anisotropy_boundary_edge_snaps_cardinal():
+    angle = math.radians(30.0)
+    base = (
+        (-0.2, -0.2),
+        (0.2, -0.2),
+        (0.2, 0.2),
+        (-0.2, 0.2),
+    )
+    rotated = []
+    for point in base:
+        rotated.append(
+            VUV._rotate_point(Vector(point), Vector((0.5, 0.5)), angle)
+        )
+    model = (
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+    )
+    obj, mesh = _polygon_object("VUV_Low_Anisotropy_Cardinal", (model,), (rotated,))
+    try:
+        analysis = VUV.analyze_active_uv(obj)
+        island = analysis.islands[0]
+        assert island.anisotropy < VUV.GroupLayoutOptions().min_pca_anisotropy
+        assert island.dominant_edge_angle is not None
+        assert island.dominant_edge_confidence >= 0.15
+        angles = VUV._orientation_angles(
+            analysis,
+            VUV.GroupLayoutOptions(),
+        )
+        # The long boundary edge is at 30 degrees, so cardinal snapping uses
+        # the negative 30-degree correction even though PCA is isotropic.
+        assert abs(angles[island.island_id] + angle) < 1.0e-6, angles
+        disabled = VUV._orientation_angles(
+            analysis,
+            VUV.GroupLayoutOptions(align_non_repeat_cardinal=False),
+        )
+        assert abs(disabled[island.island_id]) < 1.0e-12, disabled
+    finally:
+        _remove_object_and_mesh(obj, mesh)
+
+
+def _test_margin_correction_with_one_iteration():
+    oriented = {
+        0: _rectangle(0, 0.8, 0.2),
+        1: _rectangle(10, 0.8, 0.2),
+    }
+    groups = (
+        VUV.LayoutGroup(0, (0,), "SINGLE_ANCHOR", (0,)),
+        VUV.LayoutGroup(1, (1,), "SINGLE_ANCHOR", (1,)),
+    )
+    options = VUV.GroupLayoutOptions(
+        margin=0.02,
+        packing_iterations=1,
+    )
+    plan, fitted, _scale = VUV._plan_with_margin(
+        oriented,
+        groups,
+        options,
+    )
+    assert plan.width > 0.0 and plan.height > 0.0
+    assert VUV._minimum_aabb_gap(fitted) + 1.0e-6 >= options.margin, (
+        plan.width,
+        plan.height,
+        VUV._minimum_aabb_gap(fitted),
+    )
+
+
 def _mesh_diagonal(name, include_loose_vertex):
     vertices = [
         (0.0, 0.0, 0.0),
@@ -1311,11 +1719,130 @@ def _test_loose_vertex_does_not_change_radius():
     assert abs(clean * ratio - loose * ratio) < 1.0e-12
 
 
+def _test_area_aware_quality_metrics_use_polygon_area():
+    # Concave UV outline: polygon area is 0.48 while its AABB is 0.64.  A
+    # rectangle-based estimate would incorrectly report a full island.
+    shape = (
+        (0.0, 0.0),
+        (0.8, 0.0),
+        (0.8, 0.8),
+        (0.4, 0.4),
+        (0.0, 0.8),
+    )
+    model = tuple((x, y, 0.0) for x, y in shape)
+    uv = tuple((x + 0.1, y + 0.1) for x, y in shape)
+    obj, mesh = _polygon_object("VUV_QualityConcave", (model,), (uv,))
+    try:
+        analysis = VUV.analyze_active_uv(obj)
+        analysis.islands[0].is_small = True
+        metrics = VUV.evaluate_layout_quality(
+            obj,
+            analysis=analysis,
+            face_to_island=analysis.face_to_island,
+        )
+        assert abs(metrics["polygon_area"] - 0.48) < 1.0e-6, metrics
+        assert abs(metrics["tile_aabb_area"] - 0.64) < 1.0e-6, metrics
+        assert abs(metrics["aabb_fill"] - 0.75) < 1.0e-6, metrics
+        assert abs(metrics["tile_polygon_coverage"] - 0.48) < 1.0e-6
+        assert abs(metrics["island_area_p05"] - 0.48) < 1.0e-6
+        assert abs(metrics["small_island_area_p10"] - 0.48) < 1.0e-6
+        assert metrics["short_edge_p05"] > 0.0
+        assert metrics["small_short_edge_p10"] > 0.0
+        assert metrics["valid"]
+        assert VUV.score_layout_candidate(
+            metrics, metrics, VUV.GroupLayoutOptions()
+        ) > 0.0
+        assert math.isinf(
+            VUV.score_layout_candidate({"valid": False}, metrics)
+        )
+    finally:
+        _remove_object_and_mesh(obj, mesh)
+
+
+def _test_area_score_prioritizes_small_island_tail():
+    options = VUV.GroupLayoutOptions(
+        area_score_weight=1.0,
+        polygon_coverage_score_weight=0.0,
+        aabb_fill_score_weight=0.0,
+        short_edge_score_weight=0.0,
+    )
+    reference = {
+        "valid": True,
+        "small_islands": 20,
+        "small_island_area_p05": 1.0,
+        "small_island_area_p10": 1.0,
+        "island_area_p05": 1.0,
+        "island_area_p10": 1.0,
+    }
+    candidate_a = dict(
+        reference,
+        island_area_p05=2.0,
+        island_area_p10=2.0,
+        small_island_area_p05=0.8,
+        small_island_area_p10=0.8,
+    )
+    candidate_b = dict(
+        reference,
+        island_area_p05=1.2,
+        island_area_p10=1.2,
+        small_island_area_p05=1.5,
+        small_island_area_p10=1.5,
+    )
+    score_a = VUV.score_layout_candidate(candidate_a, reference, options)
+    score_b = VUV.score_layout_candidate(candidate_b, reference, options)
+    assert score_b > score_a, (score_a, score_b)
+
+
+def _test_area_score_falls_back_without_small_islands():
+    options = VUV.GroupLayoutOptions(
+        area_score_weight=1.0,
+        polygon_coverage_score_weight=0.0,
+        aabb_fill_score_weight=0.0,
+        short_edge_score_weight=0.0,
+    )
+    reference = {
+        "valid": True,
+        "small_islands": 0,
+        "small_island_area_p05": 0.0,
+        "small_island_area_p10": 0.0,
+        "island_area_p05": 1.0,
+        "island_area_p10": 1.0,
+    }
+    candidate = dict(reference, island_area_p05=1.5, island_area_p10=1.5)
+    assert VUV.score_layout_candidate(candidate, reference, options) > 1.0
+
+
+def _test_area_score_balances_aabb_fill_and_coverage():
+    """A tight strip must not beat a fuller tile solely on AABB fill."""
+
+    options = VUV.GroupLayoutOptions(
+        area_score_weight=0.0,
+        polygon_coverage_score_weight=0.0,
+        aabb_fill_score_weight=1.0,
+        short_edge_score_weight=0.0,
+    )
+    fuller = {
+        "valid": True,
+        "small_islands": 0,
+        "aabb_fill": 0.5316403872,
+        "tile_aabb_coverage": 0.7622686939,
+    }
+    tighter_strip = {
+        "valid": True,
+        "small_islands": 0,
+        "aabb_fill": 0.6076863685,
+        "tile_aabb_coverage": 0.6601791671,
+    }
+    fuller_score = VUV.score_layout_candidate(fuller, fuller, options)
+    strip_score = VUV.score_layout_candidate(tighter_strip, fuller, options)
+    assert fuller_score > strip_score, (fuller_score, strip_score)
+
+
 _test_repeat_anchor_order_and_packing()
 _test_small_island_requires_small_model_and_uv_area()
 _test_directed_u_repeats_use_360_orientation()
 _test_directed_repeats_resolve_positive_negative_angle()
-_test_directed_repeats_resolve_near_180_wrap()
+_test_near_180_directed_conflict_uses_line_equivalence()
 _test_mixed_direction_confidence_uses_group_line_fallback()
 _test_owner_cohort_uses_one_directed_orientation()
 _test_cross_layout_repeat_keeps_quarter_turn_parity()
@@ -1332,5 +1859,17 @@ _test_centrosymmetric_repeats_remain_180_equivalent()
 _test_tiny_float32_similarity_tolerance()
 _test_quantized_winding_stabilization_and_audit_fields()
 _test_non_repeat_cardinal_switch()
+_test_incompatible_directed_repeat_downgrades_to_cardinal_geometry()
+_test_directed_repeat_can_disable_cardinal_compatibility_gate()
+_test_post_layout_owner_partition_reapplies_direction_policy()
+_test_small_island_boost_is_uniform_and_bounded()
+_test_square_pack_bias_improves_tile_utilization()
+_test_shelf_order_ensemble_closes_blank_space_without_scale_loss()
+_test_low_anisotropy_boundary_edge_snaps_cardinal()
+_test_margin_correction_with_one_iteration()
 _test_loose_vertex_does_not_change_radius()
+_test_area_aware_quality_metrics_use_polygon_area()
+_test_area_score_prioritizes_small_island_tail()
+_test_area_score_falls_back_without_small_islands()
+_test_area_score_balances_aabb_fill_and_coverage()
 print("VUV_GROUP_LAYOUT_REGRESSION_OK")

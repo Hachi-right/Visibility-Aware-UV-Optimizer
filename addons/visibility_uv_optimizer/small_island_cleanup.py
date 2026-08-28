@@ -33,8 +33,7 @@ def _perimeter_length(chart):
     return perimeter
 
 
-def _polygon_uv_area(face, uv_layer):
-    points = [loop[uv_layer].uv for loop in face.loops]
+def _uv_polygon_area(points):
     if len(points) < 3:
         return 0.0
     return abs(sum(
@@ -44,8 +43,60 @@ def _polygon_uv_area(face, uv_layer):
     )) * 0.5
 
 
+def _polygon_uv_area(face, uv_layer):
+    return _uv_polygon_area([loop[uv_layer].uv for loop in face.loops])
+
+
 def _chart_uv_area(chart, uv_layer):
     return sum(_polygon_uv_area(face, uv_layer) for face in chart)
+
+
+def _saved_uv_area(saved_uv):
+    return sum(_uv_polygon_area(points) for points in saved_uv.values())
+
+
+def _normalize_chart_uv_area(chart, uv_layer, target_uv_area):
+    """Restore a merged chart to its pre-unwrap aggregate texel density."""
+
+    target_uv_area = float(target_uv_area)
+    current_uv_area = _chart_uv_area(chart, uv_layer)
+    if (
+        not math.isfinite(target_uv_area)
+        or not math.isfinite(current_uv_area)
+        or target_uv_area <= 1.0e-18
+        or current_uv_area <= 1.0e-18
+    ):
+        return None
+
+    loops = [loop for face in chart for loop in face.loops]
+    if not loops:
+        return None
+    center_x = sum(loop[uv_layer].uv.x for loop in loops) / len(loops)
+    center_y = sum(loop[uv_layer].uv.y for loop in loops) / len(loops)
+    scale = math.sqrt(target_uv_area / current_uv_area)
+    if not math.isfinite(scale) or scale <= 0.0:
+        return None
+
+    if abs(scale - 1.0) > 1.0e-9:
+        for loop in loops:
+            uv = loop[uv_layer].uv
+            uv.x = center_x + (uv.x - center_x) * scale
+            uv.y = center_y + (uv.y - center_y) * scale
+
+    normalized_uv_area = _chart_uv_area(chart, uv_layer)
+    if not math.isfinite(normalized_uv_area) or normalized_uv_area <= 1.0e-18:
+        return None
+    relative_error = abs(normalized_uv_area - target_uv_area) / target_uv_area
+    if relative_error > 5.0e-5:
+        return None
+
+    density_ratio = current_uv_area / target_uv_area
+    normalized_ratio = normalized_uv_area / target_uv_area
+    return {
+        "scale": scale,
+        "density_ratio_before": max(density_ratio, 1.0 / density_ratio),
+        "density_ratio_after": max(normalized_ratio, 1.0 / normalized_ratio),
+    }
 
 
 def is_small_chart(chart, uv_layer, total_mesh_area, total_uv_area, settings):
@@ -313,6 +364,10 @@ def stitch_small_islands(
         "accepted": 0,
         "rejected_operator": 0,
         "rejected_chart_delta": 0,
+        "rejected_texel_density": 0,
+        "density_normalized": 0,
+        "max_density_ratio_before_normalize": 1.0,
+        "max_density_ratio_after_normalize": 1.0,
         "locked_cuts": len(locked_cuts),
         "forced_cuts": len(forced_cuts),
     }
@@ -367,6 +422,7 @@ def stitch_small_islands(
                 sorted(edge.index for edge in candidate["boundary"])
             )
             saved_uv = helpers._save_uv(candidate["faces"], uv_layer)
+            target_uv_area = _saved_uv_area(saved_uv)
             saved_seams = {
                 edge.index: edge.seam for edge in candidate["boundary"]
             }
@@ -387,6 +443,40 @@ def stitch_small_islands(
                 )
                 blocked.add(candidate["signature"])
                 continue
+            refreshed_faces = [bm.faces[index] for index in face_indices]
+            density = _normalize_chart_uv_area(
+                refreshed_faces,
+                uv_layer,
+                target_uv_area,
+            )
+            if density is None:
+                _restore_candidate(
+                    bm,
+                    uv_layer,
+                    face_indices,
+                    boundary_indices,
+                    saved_uv,
+                    saved_seams,
+                    helpers,
+                )
+                bmesh.update_edit_mesh(
+                    obj.data,
+                    loop_triangles=False,
+                    destructive=False,
+                )
+                result["rejected_texel_density"] += 1
+                blocked.add(candidate["signature"])
+                continue
+            result["max_density_ratio_before_normalize"] = max(
+                result["max_density_ratio_before_normalize"],
+                density["density_ratio_before"],
+            )
+            result["max_density_ratio_after_normalize"] = max(
+                result["max_density_ratio_after_normalize"],
+                density["density_ratio_after"],
+            )
+            if density["density_ratio_before"] > 1.0 + 1.0e-6:
+                result["density_normalized"] += 1
             _, after_charts = helpers._uv_charts(bm, uv_layer)
             if len(after_charts) != before_count - 1:
                 _restore_candidate(

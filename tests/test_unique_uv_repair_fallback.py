@@ -521,7 +521,7 @@ def _test_refine_layout_does_not_reseed_valid_uv():
     assert _topology_signature(obj.data) == before_topology
 
 
-def _run_refine_fragment_pair(artist_seam):
+def _run_refine_fragment_pair(artist_seam, inflate_accepted_merge=1.0):
     _clear_scene()
     suffix = "Artist" if artist_seam else "Derived"
     obj, shared_edge_index = _make_small_fragment_pair(
@@ -549,6 +549,7 @@ def _run_refine_fragment_pair(artist_seam):
 
     original_classifier = (
         uv_optimize.hard_surface.classify_edge_constraints)
+    original_try_merge = uv_optimize._try_merge
     classifications = []
 
     def track_classifier(*args, **kwargs):
@@ -559,12 +560,41 @@ def _run_refine_fragment_pair(artist_seam):
         })
         return constraints
 
+    def inflate_merge_result(*args, **kwargs):
+        face_indices = tuple(face.index for face in args[3])
+        accepted, reason = original_try_merge(*args, **kwargs)
+        if not accepted or inflate_accepted_merge <= 1.0:
+            return accepted, reason
+        current_bm, current_uv = uv_optimize._refresh_edit_bmesh(obj.data)
+        loops = [
+            loop
+            for face_index in face_indices
+            for loop in current_bm.faces[face_index].loops
+        ]
+        center = sum(
+            (loop[current_uv].uv for loop in loops),
+            Vector((0.0, 0.0)),
+        ) / len(loops)
+        for loop in loops:
+            uv = loop[current_uv].uv
+            loop[current_uv].uv = center + (
+                uv - center
+            ) * inflate_accepted_merge
+        bmesh.update_edit_mesh(
+            obj.data,
+            loop_triangles=False,
+            destructive=False,
+        )
+        return accepted, reason
+
     uv_optimize.hard_surface.classify_edge_constraints = track_classifier
+    uv_optimize._try_merge = inflate_merge_result
     try:
         result = uv_optimize.optimize_active_object(
             bpy.context, obj, settings)
     finally:
         uv_optimize.hard_surface.classify_edge_constraints = original_classifier
+        uv_optimize._try_merge = original_try_merge
 
     assert len(classifications) == 1, classifications
     uv_optimize._audit_unique_object_mesh(obj.data)
@@ -598,6 +628,24 @@ def _test_refine_derived_uv_cut_allows_safe_small_cleanup():
     assert result.small_cleanup_summary.get(
         'filter_funnel', {}).get('eligible', 0) >= 1
     assert not obj.data.edges[shared_edge_index].use_seam
+
+
+def _test_refine_cleanup_normalizes_unwrap_density_explosion():
+    obj, shared_edge_index, result, _classification = (
+        _run_refine_fragment_pair(
+            artist_seam=False,
+            inflate_accepted_merge=100.0,
+        )
+    )
+    summary = result.small_cleanup_summary
+    assert result.small_cleanup_merges == 1, summary
+    assert result.final_islands == 1
+    assert summary.get("density_normalized", 0) == 1, summary
+    assert summary.get("max_density_ratio_before_normalize", 1.0) > 1000.0
+    assert summary.get("max_density_ratio_after_normalize", 2.0) <= 1.00005
+    assert summary.get("rejected_texel_density", 0) == 0
+    assert not obj.data.edges[shared_edge_index].use_seam
+    uv_optimize._audit_unique_object_mesh(obj.data)
 
 
 def _test_final_pack_gate_repair():
@@ -710,6 +758,7 @@ try:
     _test_refine_layout_does_not_reseed_valid_uv()
     _test_refine_artist_seam_blocks_small_cleanup()
     _test_refine_derived_uv_cut_allows_safe_small_cleanup()
+    _test_refine_cleanup_normalizes_unwrap_density_explosion()
     _test_final_pack_gate_repair()
     _test_outer_transaction_rollback()
 finally:

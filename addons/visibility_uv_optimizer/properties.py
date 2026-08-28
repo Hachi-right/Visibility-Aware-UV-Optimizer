@@ -343,6 +343,72 @@ class VUVSettings(bpy.types.PropertyGroup):
         ),
         default=True,
     )
+    uv_small_island_scale_boost: FloatProperty(
+        name="Small Island Boost / 小岛放大",
+        description=(
+            "Uniformly enlarge classified micro-islands before packing, within a "
+            "strict no-overlap fallback; 对判定为微小机械件的 UV 岛在装箱前等比放大，"
+            "无法满足无重叠时自动回退"
+        ),
+        # 1.25 is the measured hard-surface compromise: it raises detached
+        # micro-charts while leaving enough packing headroom for a dense atlas.
+        default=1.25,
+        min=1.0,
+        max=3.0,
+        precision=2,
+    )
+    uv_square_pack_bias: FloatProperty(
+        name="Square Pack Bias / 方形装箱偏好",
+        description=(
+            "Prefer a compact, square-like 0-1 layout while preserving the best "
+            "texel scale; 优先选择更紧凑的方形排布，同时保持可达到的最佳统一密度"
+        ),
+        default=0.35,
+        min=0.0,
+        max=1.0,
+        precision=2,
+    )
+    uv_square_pack_max_edge_relaxation: FloatProperty(
+        name="Square Pack Edge Relax / 方形装箱最长边容差",
+        description=(
+            "Allow a bounded relative increase of the packed longest edge when "
+            "it materially improves tile utilization; 仅在能明显改善贴图利用率时，"
+            "允许装箱最长边相对基准小幅增加"
+        ),
+        default=0.02,
+        min=0.0,
+        max=0.25,
+        precision=3,
+        subtype='FACTOR',
+    )
+    uv_cardinal_edge_confidence: FloatProperty(
+        name="Cardinal Edge Confidence / 直角边方向置信度",
+        description=(
+            "Use a clear boundary edge as the horizontal or vertical orientation "
+            "cue for round-ish hard-surface islands; 为近方形硬表面 UV 岛使用可靠"
+            "边界边作为水平或垂直方向参考"
+        ),
+        default=0.15,
+        min=0.0,
+        max=1.0,
+        precision=2,
+    )
+    uv_directed_cardinal_tolerance: FloatProperty(
+        name="Directed Cardinal Tolerance / 有向直角容差",
+        description=(
+            "Downgrade a repeat component to center-symmetric alignment when a "
+            "landmark disagrees with its geometric axis by more than this angle; "
+            "当 landmark 与几何主轴偏差超过该角度时，将重复组件降级为中心对称排布"
+        ),
+        # A tighter default keeps high-anisotropy repeat panels truly
+        # horizontal/vertical; the setting remains user-adjustable for
+        # directional props whose landmark intentionally points off-axis.
+        default=math.radians(3.0),
+        min=0.0,
+        max=math.radians(90.0),
+        precision=1,
+        subtype='ANGLE',
+    )
 
     smart_angle: FloatProperty(
         name="Initial Angle",

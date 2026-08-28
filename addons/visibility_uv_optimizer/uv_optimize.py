@@ -384,6 +384,12 @@ class OptimizeResult:
     group_layout_uniform_scale: float = 1.0
     group_layout_fallback_used: bool = False
     group_layout_summary: dict = field(default_factory=dict)
+    # Semantic grouping is computed before the optional small-island display
+    # boost.  Keep that exact partition available to transaction/reporting
+    # callers; re-analyzing the boosted UV can otherwise reclassify borderline
+    # charts and make the recorded owner mapping disagree with the layout that
+    # was actually executed.
+    group_layout_analysis: dict = field(default_factory=dict)
 
 
 def _set_uv_selection(bm, uv_layer, selected_faces):
@@ -1934,6 +1940,36 @@ def _group_layout_options(settings, strict_source_overlap=True):
             float(getattr(settings, 'proximity_radius_ratio', 0.025)), 0.0),
         align_non_repeat_cardinal=bool(getattr(
             settings, 'hard_surface_align_cardinal', True)),
+        align_directed_cardinal=bool(getattr(
+            settings, 'hard_surface_align_cardinal', True)),
+        directed_cardinal_tolerance=max(
+            min(float(getattr(
+                settings, 'uv_directed_cardinal_tolerance', math.radians(3.0)
+            )), math.pi * 0.5),
+            0.0,
+        ),
+        square_pack_bias=max(
+            min(float(getattr(settings, 'uv_square_pack_bias', 0.35)), 1.0),
+            0.0,
+        ),
+        square_pack_max_edge_relaxation=max(
+            min(float(getattr(
+                settings, 'uv_square_pack_max_edge_relaxation', 0.02
+            )), 0.25),
+            0.0,
+        ),
+        min_cardinal_edge_confidence=max(
+            min(float(getattr(
+                settings, 'uv_cardinal_edge_confidence', 0.15
+            )), 1.0),
+            0.0,
+        ),
+        small_island_scale_boost=max(
+            min(float(getattr(
+                settings, 'uv_small_island_scale_boost', 1.25
+            )), 3.0),
+            1.0,
+        ),
         strict_positive_winding=True,
         strict_source_overlap=bool(strict_source_overlap),
     )
@@ -2699,6 +2735,10 @@ def optimize_active_object(context, obj, settings):
             group_layout_uniform_scale=group_uniform_scale,
             group_layout_fallback_used=group_fallback_used,
             group_layout_summary=group_layout_summary,
+            group_layout_analysis=(
+                group_layout_result.analysis.to_dict(include_islands=True)
+                if group_layout_result is not None else {}
+            ),
         )
     except Exception:
         # The operator is undoable, but a direct API call or an operator error

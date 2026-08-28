@@ -28,6 +28,21 @@ or keep a source-control copy before replacing an approved UV layout.
    edges were deliberately authored as UV cuts.
 6. Keep `Stitch Small Islands / 缝合小岛` and
    `Group Related Islands / 关联岛分组` enabled for the 0.5.5 hard-surface pass.
+   The default `Small Island Boost / 小岛放大` value of `1.25` gives detached
+   micro-mechanical parts a readable minimum presence without stretching them;
+   the layout automatically retries with the boost disabled if the strict
+   no-overlap gate cannot be satisfied.
+   `Square Pack Bias / 方形装箱偏好` defaults to `0.35`, balancing maximum
+   usable scale with a compact, square-like atlas. `Cardinal Edge Confidence /
+   直角边方向置信度` defaults to `0.15`; clear boundary edges then provide a
+   stable horizontal/vertical cue for nearly square hard-surface charts.
+   `Square Pack Edge Relax / 方形装箱最长边容差` defaults to `0.02` (2%):
+   the square-biased shelf search may use a candidate whose longest packed edge
+   is at most 2% larger than the compact baseline, which limits any texel
+   density trade-off while closing avoidable blank strips.
+   `Directed Cardinal Tolerance / 有向直角容差` defaults to `3` degrees, so
+   hard-surface repeats are kept visibly upright while genuinely collinear
+   directional landmarks still use the 360-degree contract.
 7. Run `Optimize Active Object UV`. A Unique result is committed only when the
    final quality gate passes.
 
@@ -81,6 +96,11 @@ Recommended 0.5.5 starting values are:
 | Small Area Logic | Mesh AND UV |
 | Minimum Shared Boundary | 0.25 |
 | Model Proximity Radius | 0.025 of bounding-box diagonal |
+| Small Island Boost | 1.25x uniform scale, bounded and rollback-safe |
+| Square Pack Bias | 0.35 |
+| Square Pack Longest-Edge Relaxation | 0.02 (2%, bounded) |
+| Cardinal Edge Confidence | 0.15 |
+| Directed Cardinal Tolerance | 3 degrees |
 | Small-Stitch P95 Stretch | 1.35 |
 | Small-Stitch Max Stretch | 2.0 |
 | Developable Angle | 55 degrees |
@@ -91,7 +111,7 @@ Recommended 0.5.5 starting values are:
 
 Isomorphic or exact-topology repeated parts, bilateral counterparts, rotational
 repeats, and other duplicated mechanical structures are resolved into owner
-cohorts. Cohort owners receive a common directed UV orientation and their
+cohorts. Cohort owners receive a common UV orientation and their
 owner cells are kept near one another during packing. An owner cell contains
 the owner chart and all fragments assigned to it and is moved as one atomic
 unit. This is a rigid layout operation:
@@ -102,9 +122,22 @@ unit. This is a rigid layout operation:
 - no repeated islands are stacked or intentionally overlapped; and
 - disconnected mesh parts are never welded into one UV island.
 
+For a hard-surface repeat, a directed landmark is used for the strict
+modulo-360 sign only when its line agrees with the island's PCA axis (or the
+longest reliable boundary edge) within `Directed Cardinal Tolerance` (3
+degrees by default). If any member of a connected repeat/owner-cohort
+component exceeds that residual, the entire component is explicitly downgraded
+to `center_symmetric_modulo_180` and aligned from geometric axes, keeping
+mirrored panels upright instead of leaving diagonal outliers. The analysis
+manifest records `orientation_policy`, `orientation_downgrades`, each affected
+member's `direction_mode`, and the measured residuals so an independent audit
+uses the same policy.
+
 Mirror and rotational relationships are evidence for grouping and ordering,
-not permission to mirror the UV coordinates. Relative texel density, winding,
-and the Unique no-overlap contract remain unchanged.
+not permission to mirror the UV coordinates. Winding and the Unique
+no-overlap contract remain unchanged. When `Small Island Boost` is above
+`1.0`, only classified micro-islands receive the explicitly requested uniform
+area weighting; all other charts retain their relative texel density.
 
 Orientation groups and concrete layout groups are separate. Repeat detection
 resolves a shared direction and ordering, while owner cohorts impose a concrete

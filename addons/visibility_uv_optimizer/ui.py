@@ -135,6 +135,11 @@ class VUV_PT_MainPanel(bpy.types.Panel):
                 grouping = box.column(align=True)
                 grouping.enabled = settings.uv_group_layout_enabled
                 grouping.prop(settings, "proximity_radius_ratio")
+                grouping.prop(settings, "uv_small_island_scale_boost")
+                grouping.prop(settings, "uv_square_pack_bias")
+                grouping.prop(settings, "uv_square_pack_max_edge_relaxation")
+                grouping.prop(settings, "uv_cardinal_edge_confidence")
+                grouping.prop(settings, "uv_directed_cardinal_tolerance")
             box.prop(settings, "preserve_seams")
             box.prop(settings, "respect_materials")
             box.prop(settings, "respect_sharp")

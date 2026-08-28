@@ -5,8 +5,10 @@ This module does not unwrap, stitch, split, mirror, or edit seams.  It treats
 each UV island as a rigid 2D shape, detects conservative repeated mechanical
 parts, keeps those parts together with a common direction, and places tiny
 detached charts near a model-space neighbor.  The final pack uses disjoint
-axis-aligned rectangles and one positive global scale, so relative texel
-density and every island's winding are preserved.
+axis-aligned rectangles and one positive global scale.  An optional bounded
+uniform boost can improve the readability of tiny mechanical charts; all
+other islands retain their relative texel density and every island retains its
+winding.
 
 The public entry points intentionally work in Object Mode.  This keeps the
 module independent from UV editor selection state and makes rollback reliable
@@ -18,6 +20,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 import hashlib
+import itertools
 import json
 import math
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -40,6 +43,27 @@ def _clamp(value: float, minimum: float, maximum: float) -> float:
 
 def _relative_error(left: float, right: float) -> float:
     return abs(left - right) / max(abs(left), abs(right), _EPSILON)
+
+
+def _quantile(values: Iterable[float], fraction: float) -> float:
+    """Return a deterministic nearest-rank quantile for finite values.
+
+    Layout reports are generated in Blender's embedded Python where pulling in
+    a statistics dependency is undesirable.  Nearest-rank is deliberately
+    simple and stable across Python/Blender versions; it is also less
+    surprising for the lower-tail island metrics than interpolation between
+    two tiny float32 areas.
+    """
+
+    finite = sorted(
+        float(value)
+        for value in values
+        if math.isfinite(float(value))
+    )
+    if not finite:
+        return 0.0
+    index = int(round((len(finite) - 1) * _clamp(float(fraction), 0.0, 1.0)))
+    return finite[max(0, min(len(finite) - 1, index))]
 
 
 def _angle_wrap(angle: float) -> float:
@@ -90,6 +114,44 @@ class GroupLayoutOptions:
     strict_source_overlap: bool = True
     packing_iterations: int = 10
     align_non_repeat_cardinal: bool = True
+    # Directed landmarks are useful for choosing a repeat's front/back sign,
+    # but they can point diagonally on an otherwise axis-aligned hard-surface
+    # panel.  A landmark is used for the strict 360-degree contract only when
+    # its line agrees with the geometric reference within the tolerance below.
+    align_directed_cardinal: bool = True
+    # Maximum modulo-180 residual between a directed landmark and the PCA or
+    # dominant boundary-edge reference before an entire repeat component is
+    # treated as center-symmetric.  This keeps hard-surface repeats upright
+    # while retaining 360-degree direction for genuinely collinear landmarks.
+    directed_cardinal_tolerance: float = math.radians(3.0)
+    # A bounded bias toward square packing keeps the rigid layout from
+    # filling only one strip of the 0-1 tile.  It never changes island scale
+    # independently, so texel density remains uniform.
+    square_pack_bias: float = 0.35
+    # PCA is deliberately conservative for round-ish pieces.  A clear long
+    # boundary edge is a safer orientation cue for hard-surface panels.
+    min_cardinal_edge_confidence: float = 0.15
+    # Small mechanical details are easy to lose at bake resolution.  This is
+    # a bounded *uniform* boost applied only to islands classified as small;
+    # it does not shear or stretch an island and can be disabled with 1.0.
+    small_island_scale_boost: float = 1.0
+    # Permit a small longest-side trade-off when a more square shelf candidate
+    # materially improves use of the 0-1 tile.  The bound is relative to the
+    # compact baseline and keeps texel-density loss explicit and predictable.
+    square_pack_max_edge_relaxation: float = 0.02
+    # Select the best valid adaptive layout with an area-aware objective.  The
+    # switch defaults on for new callers, while callers that need the exact
+    # historical adaptive ordering can set it to False.
+    area_aware_scoring: bool = True
+    # A candidate may not trade away more than this fraction of the reference
+    # uniform scale merely to obtain a fuller-looking tile.
+    candidate_density_floor: float = 0.90
+    # Relative weights for the adaptive candidate score.  They are normalized
+    # at evaluation time, so old callers can omit all of them safely.
+    area_score_weight: float = 0.45
+    polygon_coverage_score_weight: float = 0.25
+    aabb_fill_score_weight: float = 0.15
+    short_edge_score_weight: float = 0.15
 
     def validated(self) -> "GroupLayoutOptions":
         if not math.isfinite(float(self.margin)) or not 0.0 <= self.margin < 0.25:
@@ -114,6 +176,48 @@ class GroupLayoutOptions:
             raise ValueError("max_small_members_per_group must be positive")
         if self.packing_iterations < 1:
             raise ValueError("packing_iterations must be positive")
+        if not math.isfinite(float(self.square_pack_bias)) or not 0.0 <= float(
+            self.square_pack_bias
+        ) <= 1.0:
+            raise ValueError("square_pack_bias must be finite and in [0, 1]")
+        if (
+            not math.isfinite(float(self.directed_cardinal_tolerance))
+            or not 0.0 <= float(self.directed_cardinal_tolerance) <= math.pi * 0.5
+        ):
+            raise ValueError(
+                "directed_cardinal_tolerance must be finite and in [0, pi/2]"
+            )
+        if not math.isfinite(float(self.min_cardinal_edge_confidence)) or not 0.0 <= float(
+            self.min_cardinal_edge_confidence
+        ) <= 1.0:
+            raise ValueError(
+                "min_cardinal_edge_confidence must be finite and in [0, 1]"
+            )
+        if not math.isfinite(float(self.small_island_scale_boost)) or not 1.0 <= float(
+            self.small_island_scale_boost
+        ) <= 3.0:
+            raise ValueError(
+                "small_island_scale_boost must be finite and in [1, 3]"
+            )
+        if not math.isfinite(float(self.square_pack_max_edge_relaxation)) or not 0.0 <= float(
+            self.square_pack_max_edge_relaxation
+        ) <= 0.25:
+            raise ValueError(
+                "square_pack_max_edge_relaxation must be finite and in [0, 0.25]"
+            )
+        if not math.isfinite(float(self.candidate_density_floor)) or not 0.0 < float(
+            self.candidate_density_floor
+        ) <= 1.0:
+            raise ValueError("candidate_density_floor must be finite and in (0, 1]")
+        for name in (
+            "area_score_weight",
+            "polygon_coverage_score_weight",
+            "aabb_fill_score_weight",
+            "short_edge_score_weight",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError("{} must be finite and non-negative".format(name))
         return self
 
 
@@ -143,6 +247,19 @@ class IslandRecord:
     geometry_payload: Mapping[str, Any] = field(repr=False)
     neighbor_ids: Tuple[int, ...] = ()
     is_small: bool = False
+    dominant_edge_angle: Optional[float] = None
+    dominant_edge_confidence: float = 0.0
+    # ``directed`` means a reliable landmark is eligible for modulo-360
+    # repeat alignment.  ``center_symmetric`` records either an intrinsically
+    # unresolved landmark or an explicit cardinal-compatibility downgrade.
+    direction_mode: str = "center_symmetric"
+    direction_downgrade_reason: Optional[str] = None
+    # Shape diagnostics are kept on the island record so reports and adaptive
+    # scoring use the same definitions.  Defaults preserve compatibility with
+    # callers constructing IslandRecord positionally from older releases.
+    uv_aabb_area: float = 0.0
+    uv_polygon_fill: float = 0.0
+    uv_short_edge: float = 0.0
 
     @property
     def face_count(self) -> int:
@@ -182,10 +299,23 @@ class IslandRecord:
             "anisotropy": round(self.anisotropy, 6),
             "direction_confidence": round(self.direction_confidence, 6),
             "direction_angle_degrees": direction_angle,
+            "direction_mode": str(self.direction_mode),
+            "direction_downgrade_reason": self.direction_downgrade_reason,
             "landmark_vertex": self.landmark_vertex,
             "signature": self.geometry_signature,
             "neighbors": list(self.neighbor_ids),
             "small": self.is_small,
+            "dominant_edge_angle_degrees": (
+                None
+                if self.dominant_edge_angle is None
+                else round(math.degrees(self.dominant_edge_angle), 4)
+            ),
+            "dominant_edge_confidence": round(
+                self.dominant_edge_confidence, 6
+            ),
+            "uv_aabb_area": round(float(self.uv_aabb_area), 9),
+            "uv_polygon_fill": round(float(self.uv_polygon_fill), 9),
+            "uv_short_edge": round(float(self.uv_short_edge), 9),
         }
 
 
@@ -279,6 +409,11 @@ class UVLayoutAnalysis:
     repeat_groups: List[RepeatGroup]
     layout_groups: List[LayoutGroup]
     face_to_island: Tuple[int, ...] = field(repr=False)
+    # Explicit records make the fallback auditable in manifests.  The list is
+    # empty for layouts that never needed a directed-to-center-symmetric
+    # downgrade.
+    orientation_downgrades: List[Mapping[str, Any]] = field(default_factory=list)
+    orientation_policy: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self, include_islands: bool = True) -> Dict[str, Any]:
         payload = {
@@ -297,6 +432,10 @@ class UVLayoutAnalysis:
             },
             "repeat_groups": [group.to_dict() for group in self.repeat_groups],
             "layout_groups": [group.to_dict() for group in self.layout_groups],
+            "orientation_policy": dict(self.orientation_policy),
+            "orientation_downgrades": [
+                dict(item) for item in self.orientation_downgrades
+            ],
         }
         if include_islands:
             payload["islands"] = [island.to_dict() for island in self.islands]
@@ -322,6 +461,19 @@ class GroupLayoutResult:
     fallback_errors: Tuple[str, ...] = ()
     quantization_adjusted_islands: int = 0
     max_quantization_rotation_degrees: float = 0.0
+    packed_width: float = 0.0
+    packed_height: float = 0.0
+    tile_occupancy: float = 0.0
+    small_island_scale_boost: float = 1.0
+    small_islands_scaled: int = 0
+    square_pack_max_edge_relaxation: float = 0.02
+    # Read-only post-pack diagnostics.  These fields are appended with
+    # defaults so callers using the pre-0.5.5 positional constructor keep
+    # working.  ``candidate_valid`` is the geometric validity gate; density
+    # eligibility is intentionally kept separate in the adaptive selector.
+    quality_metrics: Mapping[str, Any] = field(default_factory=dict)
+    candidate_score: float = 0.0
+    candidate_valid: bool = True
 
     def to_dict(self, include_islands: bool = False) -> Dict[str, Any]:
         return {
@@ -338,9 +490,25 @@ class GroupLayoutResult:
             "max_quantization_rotation_degrees": round(
                 self.max_quantization_rotation_degrees, 9
             ),
+            "packed_width": round(self.packed_width, 9),
+            "packed_height": round(self.packed_height, 9),
+            "tile_occupancy": round(self.tile_occupancy, 9),
+            "small_island_scale_boost": round(
+                float(self.small_island_scale_boost), 6
+            ),
+            "small_islands_scaled": int(self.small_islands_scaled),
+            "square_pack_max_edge_relaxation": round(
+                float(self.square_pack_max_edge_relaxation), 6
+            ),
+            "quality_metrics": dict(self.quality_metrics),
+            "candidate_score": round(float(self.candidate_score), 9),
+            "candidate_valid": bool(self.candidate_valid),
             "topology_stitches": 0,
             "reflection_applied": False,
-            "relative_texel_density_preserved": True,
+            "relative_texel_density_preserved": bool(
+                int(self.small_islands_scaled) == 0
+                or float(self.small_island_scale_boost) <= 1.0 + 1.0e-9
+            ),
             "before_audit": dict(self.before_audit),
             "after_audit": dict(self.after_audit),
         }
@@ -516,6 +684,85 @@ def _principal_axis(points: Sequence[Vector]) -> Tuple[float, float]:
     minor = max((trace - discriminant) * 0.5, 0.0)
     anisotropy = (major - minor) / max(major, _EPSILON)
     return _line_angle_wrap(angle), _clamp(anisotropy, 0.0, 1.0)
+
+
+def _dominant_uv_edge_angle(
+    mesh: Any,
+    uv_layer: Any,
+    face_indices: Sequence[int],
+    uv_extent: float,
+) -> Tuple[Optional[float], float]:
+    """Return a stable long-edge direction for cardinal alignment.
+
+    PCA becomes undefined for square or nearly circular charts.  Hard-surface
+    charts still commonly have a meaningful straight boundary, so use the
+    longest UV boundary edge as a fallback.  Internal triangulation diagonals
+    are ignored whenever a boundary edge is available; this avoids snapping a
+    panel to an arbitrary diagonal.  The confidence is based on edge length
+    relative to the chart extent and is intentionally capped at one.
+    """
+
+    face_set = {int(index) for index in face_indices}
+    edge_face_counts: Dict[int, int] = defaultdict(int)
+    for face_index in face_set:
+        for loop_index in mesh.polygons[face_index].loop_indices:
+            edge_face_counts[int(mesh.loops[loop_index].edge_index)] += 1
+
+    candidates: List[Tuple[float, float, int, int]] = []
+    for face_index in sorted(face_set):
+        loop_indices = list(mesh.polygons[face_index].loop_indices)
+        for offset, loop_index in enumerate(loop_indices):
+            next_loop_index = loop_indices[(offset + 1) % len(loop_indices)]
+            first = uv_layer.data[loop_index].uv
+            second = uv_layer.data[next_loop_index].uv
+            delta = second - first
+            length = float(delta.length)
+            if not math.isfinite(length) or length <= _EPSILON:
+                continue
+            edge_index = int(mesh.loops[loop_index].edge_index)
+            angle = _line_angle_wrap(math.atan2(delta.y, delta.x))
+            candidates.append((
+                length,
+                angle,
+                edge_index,
+                int(loop_index),
+            ))
+    if not candidates:
+        return None, 0.0
+
+    boundary = [
+        item for item in candidates
+        if edge_face_counts.get(item[2], 0) <= 1
+    ]
+    pool = boundary or candidates
+    # Stable tie-breaking by edge/loop index is important for mirrored meshes
+    # whose equivalent edges have exactly the same length.
+    longest = max(pool, key=lambda item: (item[0], -item[2], -item[3]))
+    extent = max(float(uv_extent), _EPSILON)
+    confidence = _clamp(longest[0] / extent, 0.0, 1.0)
+    return longest[1], confidence
+
+
+def _orientation_reference_angle(
+    island: IslandRecord,
+    min_pca_anisotropy: float = 0.06,
+    min_edge_confidence: float = 0.15,
+) -> Optional[float]:
+    """Choose PCA or a recorded boundary-edge direction for an island."""
+
+    if island.anisotropy >= min_pca_anisotropy:
+        return island.principal_angle
+    edge_angle = getattr(island, "dominant_edge_angle", None)
+    edge_confidence = float(
+        getattr(island, "dominant_edge_confidence", 0.0)
+    )
+    if (
+        edge_angle is not None
+        and math.isfinite(float(edge_angle))
+        and edge_confidence >= min_edge_confidence
+    ):
+        return _line_angle_wrap(float(edge_angle))
+    return None
 
 
 def _stable_hash(payload: Mapping[str, Any]) -> str:
@@ -809,6 +1056,14 @@ def compute_active_uv_islands(
         uv_extent = max(
             bounds_uv[2] - bounds_uv[0], bounds_uv[3] - bounds_uv[1], _EPSILON
         )
+        dominant_edge_angle, dominant_edge_confidence = (
+            _dominant_uv_edge_angle(
+                mesh,
+                uv_layer,
+                face_indices,
+                uv_extent,
+            )
+        )
         direction, direction_confidence, landmark = _landmark_direction(
             mesh,
             uv_layer,
@@ -820,6 +1075,25 @@ def compute_active_uv_islands(
             area_3d,
             uv_extent,
         )
+        uv_width = max(float(bounds_uv[2] - bounds_uv[0]), 0.0)
+        uv_height = max(float(bounds_uv[3] - bounds_uv[1]), 0.0)
+        uv_aabb_area = uv_width * uv_height
+        uv_polygon_fill = (
+            _clamp(uv_area / uv_aabb_area, 0.0, 1.0)
+            if uv_aabb_area > _EPSILON else 0.0
+        )
+        uv_edges = []
+        for face_index in face_indices:
+            face_loops = list(mesh.polygons[face_index].loop_indices)
+            for offset, loop_index in enumerate(face_loops):
+                next_loop = face_loops[(offset + 1) % len(face_loops)]
+                length = (
+                    uv_layer.data[next_loop].uv
+                    - uv_layer.data[loop_index].uv
+                ).length
+                if math.isfinite(float(length)) and length > settings.uv_epsilon:
+                    uv_edges.append(float(length))
+        uv_short_edge = min(uv_edges) if uv_edges else 0.0
         records.append(IslandRecord(
             island_id=island_id,
             face_indices=tuple(face_indices),
@@ -843,6 +1117,11 @@ def compute_active_uv_islands(
             landmark_vertex=landmark,
             geometry_signature=_stable_hash(payload),
             geometry_payload=payload,
+            dominant_edge_angle=dominant_edge_angle,
+            dominant_edge_confidence=dominant_edge_confidence,
+            uv_aabb_area=uv_aabb_area,
+            uv_polygon_fill=uv_polygon_fill,
+            uv_short_edge=uv_short_edge,
         ))
 
     adjacency = _build_adjacency(mesh, face_to_island, edge_records)
@@ -1413,7 +1692,7 @@ def analyze_active_uv(
     layout_groups = build_layout_groups(
         islands, repeat_groups, object_diagonal, settings
     )
-    return UVLayoutAnalysis(
+    analysis = UVLayoutAnalysis(
         object_name=str(obj.name),
         mesh_name=str(mesh.name),
         uv_layer_name=str(uv_layer.name),
@@ -1425,6 +1704,7 @@ def analyze_active_uv(
         layout_groups=layout_groups,
         face_to_island=face_to_island,
     )
+    return _apply_orientation_policy(analysis, settings)
 
 
 def _rotate_point(point: Vector, center: Vector, angle: float) -> Vector:
@@ -1445,19 +1725,41 @@ def _nearest_cardinal_delta(angle: float) -> float:
 def _repeat_target_angle(
     group: RepeatGroup,
     by_id: Mapping[int, IslandRecord],
+    min_pca_anisotropy: float = 0.06,
+    min_edge_confidence: float = 0.15,
 ) -> float:
-    return _member_target_angle(group.member_ids, by_id)
+    return _member_target_angle(
+        group.member_ids,
+        by_id,
+        min_pca_anisotropy=min_pca_anisotropy,
+        min_edge_confidence=min_edge_confidence,
+    )
 
 
 def _member_target_angle(
     member_ids: Sequence[int],
     by_id: Mapping[int, IslandRecord],
+    min_pca_anisotropy: float = 0.06,
+    min_edge_confidence: float = 0.15,
 ) -> float:
     scores = []
     for target in (0.0, math.pi * 0.5):
         score = sum(
-            abs(_line_angle_wrap(target - by_id[index].principal_angle))
-            * max(by_id[index].anisotropy, 0.05)
+            abs(_line_angle_wrap(
+                target - (
+                    _orientation_reference_angle(
+                        by_id[index],
+                        min_pca_anisotropy=min_pca_anisotropy,
+                        min_edge_confidence=min_edge_confidence,
+                    )
+                    or 0.0
+                )
+            ))
+            * max(
+                by_id[index].anisotropy,
+                float(getattr(by_id[index], "dominant_edge_confidence", 0.0)),
+                0.05,
+            )
             for index in member_ids
         )
         scores.append((score, target))
@@ -1515,6 +1817,168 @@ def _orientation_components(
     )
 
 
+def _direction_is_reliable(
+    island: IslandRecord,
+    settings: GroupLayoutOptions,
+) -> bool:
+    """Return whether an island has a finite, sufficiently salient landmark."""
+
+    vector = island.direction_vector
+    return bool(
+        island.direction_confidence >= settings.min_direction_confidence
+        and vector.length_squared > _EPSILON
+        and all(math.isfinite(float(component)) for component in vector)
+    )
+
+
+def _direction_reference_residual(
+    island: IslandRecord,
+    settings: GroupLayoutOptions,
+) -> Optional[float]:
+    """Return the landmark-vs-geometry residual under a modulo-180 line."""
+
+    if not _direction_is_reliable(island, settings):
+        return None
+    reference = _orientation_reference_angle(
+        island,
+        min_pca_anisotropy=settings.min_pca_anisotropy,
+        min_edge_confidence=settings.min_cardinal_edge_confidence,
+    )
+    if reference is None:
+        # There is no stable geometric cue to contradict the landmark.  Keep
+        # the directed evidence and let the shared target choose cardinality.
+        return None
+    direction_angle = math.atan2(
+        island.direction_vector.y,
+        island.direction_vector.x,
+    )
+    return abs(_line_angle_wrap(direction_angle - reference))
+
+
+def _component_direction_policy(
+    member_ids: Sequence[int],
+    by_id: Mapping[int, IslandRecord],
+    settings: GroupLayoutOptions,
+) -> Tuple[str, Dict[int, Optional[float]]]:
+    """Resolve directed vs center-symmetric semantics for one component.
+
+    A component is allowed to use the strict modulo-360 landmark contract
+    only when every member has a reliable landmark and every available
+    geometric reference agrees with that landmark.  One contradictory cue
+    downgrades the whole component, so mirrored hard-surface panels cannot be
+    left with one diagonal directed member and one cardinal center-symmetric
+    member.
+    """
+
+    residuals = {
+        island_id: _direction_reference_residual(by_id[island_id], settings)
+        for island_id in member_ids
+        if island_id in by_id
+    }
+    if len(residuals) != len(member_ids) or not all(
+        _direction_is_reliable(by_id[island_id], settings)
+        for island_id in member_ids
+        if island_id in by_id
+    ):
+        return "center_symmetric", residuals
+    if not settings.align_directed_cardinal:
+        return "directed", residuals
+    incompatible = [
+        island_id
+        for island_id, residual in residuals.items()
+        if residual is not None
+        and residual > settings.directed_cardinal_tolerance + 1.0e-12
+    ]
+    if incompatible:
+        return "center_symmetric_downgraded", residuals
+    return "directed", residuals
+
+
+def _apply_orientation_policy(
+    analysis: UVLayoutAnalysis,
+    settings: GroupLayoutOptions,
+) -> UVLayoutAnalysis:
+    """Annotate analysis and persist cardinal-compatibility downgrades.
+
+    ``analyze_active_uv`` is also called after a layout commit to create the
+    manifest snapshot.  Applying the same policy during every analysis means
+    the exported direction metadata and the independent semantic audit agree
+    without relying on transient in-memory state from the first pass.
+    """
+
+    by_id = {island.island_id: island for island in analysis.islands}
+    for island in analysis.islands:
+        island.direction_mode = (
+            "directed"
+            if _direction_is_reliable(island, settings)
+            else "center_symmetric"
+        )
+        island.direction_downgrade_reason = None
+
+    downgrades: List[Mapping[str, Any]] = []
+    for member_ids in _orientation_components(analysis):
+        policy, residuals = _component_direction_policy(
+            member_ids,
+            by_id,
+            settings,
+        )
+        if policy != "center_symmetric_downgraded":
+            continue
+        incompatible = [
+            island_id
+            for island_id in member_ids
+            if residuals.get(island_id) is not None
+            and residuals[island_id]
+            > settings.directed_cardinal_tolerance + 1.0e-12
+        ]
+        for island_id in member_ids:
+            island = by_id[island_id]
+            # Keep the public record honest: once the component is geometric,
+            # no member should be exported as a reliable directed landmark.
+            island.direction_vector = Vector((0.0, 0.0))
+            island.direction_confidence = 0.0
+            island.landmark_vertex = None
+            island.direction_mode = "center_symmetric"
+            island.direction_downgrade_reason = (
+                "landmark_geometry_residual_exceeds_cardinal_tolerance"
+            )
+        downgrades.append({
+            "members": [int(island_id) for island_id in member_ids],
+            "incompatible_members": [int(island_id) for island_id in incompatible],
+            "residual_degrees": {
+                str(island_id): (
+                    None
+                    if residuals.get(island_id) is None
+                    else round(math.degrees(residuals[island_id]), 6)
+                )
+                for island_id in member_ids
+            },
+            "tolerance_degrees": round(
+                math.degrees(settings.directed_cardinal_tolerance), 6
+            ),
+            "policy": "center_symmetric_modulo_180",
+            "reason": "landmark_geometry_residual_exceeds_cardinal_tolerance",
+        })
+
+    analysis.orientation_downgrades = downgrades
+    analysis.orientation_policy = {
+        "directed_alignment": (
+            "modulo_360_when_cardinal_compatible"
+            if settings.align_directed_cardinal
+            else "modulo_360"
+        ),
+        "fallback_alignment": "center_symmetric_modulo_180",
+        "directed_cardinal_tolerance_degrees": round(
+            math.degrees(settings.directed_cardinal_tolerance), 6
+        ),
+        "min_direction_confidence": round(
+            float(settings.min_direction_confidence), 6
+        ),
+        "downgraded_components": len(downgrades),
+    }
+    return analysis
+
+
 def _orientation_angles(
     analysis: UVLayoutAnalysis,
     settings: GroupLayoutOptions,
@@ -1523,17 +1987,18 @@ def _orientation_angles(
     angles: Dict[int, float] = {}
     constrained = set()
     for member_ids in _orientation_components(analysis):
-        target = _member_target_angle(member_ids, by_id)
-        directed_group = all(
-            by_id[island_id].direction_confidence
-            >= settings.min_direction_confidence
-            and by_id[island_id].direction_vector.length_squared > _EPSILON
-            and all(
-                math.isfinite(float(component))
-                for component in by_id[island_id].direction_vector
-            )
-            for island_id in member_ids
+        target = _member_target_angle(
+            member_ids,
+            by_id,
+            min_pca_anisotropy=settings.min_pca_anisotropy,
+            min_edge_confidence=settings.min_cardinal_edge_confidence,
         )
+        direction_policy, _residuals = _component_direction_policy(
+            member_ids,
+            by_id,
+            settings,
+        )
+        directed_group = direction_policy == "directed"
         for island_id in member_ids:
             island = by_id[island_id]
             constrained.add(island_id)
@@ -1541,14 +2006,21 @@ def _orientation_angles(
                 direction_angle = math.atan2(
                     island.direction_vector.y, island.direction_vector.x
                 )
-                # PCA is an undirected line and cannot distinguish +theta from
-                # -theta. A stable landmark can, so align it directly to the
-                # shared group target under a full 360-degree policy.
+                # A cardinal-compatible directed landmark is the strict
+                # modulo-360 contract.  Components with a contradictory
+                # landmark are classified center-symmetric above and take the
+                # geometric branch below, keeping hard-surface panels upright.
                 angle = _angle_wrap(target - direction_angle)
-            elif island.anisotropy >= settings.min_pca_anisotropy:
-                angle = _line_angle_wrap(target - island.principal_angle)
             else:
-                angle = 0.0
+                reference = _orientation_reference_angle(
+                    island,
+                    min_pca_anisotropy=settings.min_pca_anisotropy,
+                    min_edge_confidence=settings.min_cardinal_edge_confidence,
+                )
+                if reference is not None:
+                    angle = _line_angle_wrap(target - reference)
+                else:
+                    angle = 0.0
             angles[island_id] = angle
 
     for island in analysis.islands:
@@ -1556,9 +2028,17 @@ def _orientation_angles(
             continue
         if (
             settings.align_non_repeat_cardinal
-            and island.anisotropy >= settings.min_pca_anisotropy
         ):
-            angles[island.island_id] = _nearest_cardinal_delta(island.principal_angle)
+            reference = _orientation_reference_angle(
+                island,
+                min_pca_anisotropy=settings.min_pca_anisotropy,
+                min_edge_confidence=settings.min_cardinal_edge_confidence,
+            )
+            angles[island.island_id] = (
+                0.0
+                if reference is None
+                else _nearest_cardinal_delta(reference)
+            )
         else:
             angles[island.island_id] = 0.0
     return angles
@@ -1581,6 +2061,48 @@ def _oriented_coordinates(
     return result
 
 
+def _boost_small_island_coordinates(
+    oriented: Mapping[int, Mapping[int, Vector]],
+    analysis: UVLayoutAnalysis,
+    boost: float,
+) -> Tuple[Dict[int, Dict[int, Vector]], Dict[int, float], int]:
+    """Apply a bounded uniform scale to classified micro-islands.
+
+    The operation happens before packing, so the normal disjoint-rectangle
+    packer can reserve space for the boosted charts.  Group membership and
+    repeat detection come from the pre-boost analysis; a chart cannot cease to
+    be a small candidate merely because this presentation weighting was
+    applied.  Every non-small chart is copied without modification.
+    """
+
+    factor = _clamp(float(boost), 1.0, 3.0)
+    result: Dict[int, Dict[int, Vector]] = {}
+    scales: Dict[int, float] = {}
+    scaled_count = 0
+    for island in analysis.islands:
+        source = oriented.get(island.island_id, {})
+        if not source:
+            result[island.island_id] = {}
+            scales[island.island_id] = 1.0
+            continue
+        island_factor = factor if island.is_small else 1.0
+        if island_factor > 1.0 + 1.0e-9:
+            center = sum(source.values(), Vector((0.0, 0.0))) / len(source)
+            result[island.island_id] = {
+                loop_index: center + (point - center) * island_factor
+                for loop_index, point in source.items()
+            }
+            scaled_count += 1
+        else:
+            result[island.island_id] = {
+                loop_index: point.copy()
+                for loop_index, point in source.items()
+            }
+            island_factor = 1.0
+        scales[island.island_id] = island_factor
+    return result, scales, scaled_count
+
+
 def _candidate_shelf_widths(rectangles: Sequence[_Rect], gap: float) -> List[float]:
     if not rectangles:
         return [1.0]
@@ -1597,6 +2119,20 @@ def _candidate_shelf_widths(rectangles: Sequence[_Rect], gap: float) -> List[flo
         root * 2.00,
         total_width,
     ]
+    # Shelf packing is discontinuous: a tiny change in target width can move
+    # one rectangle to another row.  The old sparse candidates could therefore
+    # select a long strip even when a nearby width produced a much squarer
+    # layout.  Sample the interval deterministically while keeping the list
+    # bounded for dense meshes.
+    upper = max(total_width, maximum)
+    if upper > maximum + _EPSILON:
+        for index in range(1, 17):
+            fraction = index / 16.0
+            values.append(maximum + (upper - maximum) * fraction)
+    # Include widths at the area-root neighbourhood with a finer resolution;
+    # this is where most hard-surface atlases achieve their best utilization.
+    for factor in (0.90, 0.95, 1.05, 1.10):
+        values.append(root * factor)
     return sorted({max(float(value), maximum, _EPSILON) for value in values})
 
 
@@ -1673,36 +2209,221 @@ def _shelf_pack_once(
     return placements, maximum_x, y + row_height
 
 
+def _shelf_rectangle_orders(
+    rectangles: Sequence[_Rect],
+    enumerate_small_orders: bool = True,
+) -> Tuple[Tuple[_Rect, ...], ...]:
+    """Return a bounded set of deterministic shelf insertion orders.
+
+    Shelf row breaks depend heavily on insertion order.  Trying a few common
+    decreasing-size policies closes large holes without changing the packer's
+    rectangle, rotation, or affinity contracts.  For small batches (the common
+    case for detached mechanical parts), enumerate every order as a bounded
+    exact search; this catches useful 2-row arrangements that no monotone sort
+    can express.  Duplicate orders are removed so meshes whose charts already
+    share one size do not pay extra work.
+    """
+
+    policies = (
+        lambda rect: (
+            -max(rect.width, rect.height),
+            -(rect.width * rect.height),
+            rect.sort_rank,
+            rect.key,
+        ),
+        lambda rect: (
+            -(rect.width * rect.height),
+            -max(rect.width, rect.height),
+            rect.sort_rank,
+            rect.key,
+        ),
+        lambda rect: (
+            -rect.height,
+            -rect.width,
+            -(rect.width * rect.height),
+            rect.sort_rank,
+            rect.key,
+        ),
+        lambda rect: (
+            -rect.width,
+            -rect.height,
+            -(rect.width * rect.height),
+            rect.sort_rank,
+            rect.key,
+        ),
+    )
+    orders = []
+    seen = set()
+    for policy in policies:
+        ordered = tuple(sorted(rectangles, key=policy))
+        signature = tuple(rect.key for rect in ordered)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        orders.append(ordered)
+    # Four-island hard-surface groups are where a single misplaced insert can
+    # leave an entire half-row empty.  Factorial search is deliberately capped
+    # at four rectangles (24 orders); larger owner-cell groups retain the
+    # inexpensive heuristic path so dense assets do not pay a combinatorial
+    # cost for a marginal packing gain.
+    if enumerate_small_orders and len(rectangles) <= 4:
+        for ordered in itertools.permutations(rectangles):
+            signature = tuple(rect.key for rect in ordered)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            orders.append(tuple(ordered))
+    return tuple(orders)
+
+
 def _best_shelf_pack(
     rectangles: Sequence[_Rect],
     gap: float,
     allow_rotate: bool,
     preserve_order: bool = False,
     fixed_quarter_turns: Optional[Mapping[int, bool]] = None,
+    square_pack_bias: float = 0.35,
+    square_pack_max_edge_relaxation: float = 0.02,
 ) -> Tuple[Dict[int, _Placement], float, float]:
     if not rectangles:
         return {}, 0.0, 0.0
     candidates = []
-    for target_width in _candidate_shelf_widths(rectangles, gap):
-        placements, width, height = _shelf_pack_once(
+    square_pack_bias = _clamp(float(square_pack_bias), 0.0, 1.0)
+    square_pack_max_edge_relaxation = float(square_pack_max_edge_relaxation)
+    if not math.isfinite(square_pack_max_edge_relaxation):
+        raise ValueError("square_pack_max_edge_relaxation must be finite")
+    square_pack_max_edge_relaxation = _clamp(
+        square_pack_max_edge_relaxation, 0.0, 0.25
+    )
+    # Exhaustive insertion orders and a longest-edge relaxation are reserved
+    # for a small, freely rotatable top-level batch.  Dense owner-cell and
+    # large atlas packing keeps the historical deterministic heuristic; local
+    # square improvements there can otherwise reduce the global UV scale.
+    small_batch_search = bool(
+        not preserve_order
+        and allow_rotate
+        and len(rectangles) <= 4
+        and square_pack_bias > 1.0e-12
+    )
+    bounded_small_search = bool(
+        small_batch_search
+        and square_pack_bias > 1.0e-12
+        and square_pack_max_edge_relaxation > 1.0e-12
+    )
+    effective_relaxation = (
+        square_pack_max_edge_relaxation if bounded_small_search else 0.0
+    )
+    # Keep the historical insertion order for dense atlases.  Even when the
+    # square-search knobs are disabled, trying alternate shelf orders can
+    # move a large number of equal-sized owner blocks across row breaks and
+    # reduce global texel density.  Exhaustive order search is intentionally
+    # limited to the small, freely rotatable batch above.
+    orders = (
+        _shelf_rectangle_orders(
             rectangles,
-            target_width,
-            gap,
-            allow_rotate,
-            preserve_order,
-            fixed_quarter_turns,
+            enumerate_small_orders=True,
         )
-        candidates.append((
-            max(width, height),
-            width * height,
-            abs(width - height),
-            target_width,
-            placements,
-            width,
-            height,
-        ))
-    best = min(candidates, key=lambda item: item[:4])
-    return best[4], best[5], best[6]
+        if small_batch_search
+        else (tuple(rectangles),)
+    )
+    # A raw singleton order retains the historical longest-edge sort inside
+    # ``_shelf_pack_once``.  Explicitly enumerated orders are already sorted
+    # by their policy and must be replayed verbatim.
+    replay_order = bool(small_batch_search or preserve_order)
+    target_widths = _candidate_shelf_widths(rectangles, gap)
+    for order_index, ordered in enumerate(orders):
+        for target_width in target_widths:
+            placements, width, height = _shelf_pack_once(
+                ordered,
+                target_width,
+                gap,
+                allow_rotate,
+                preserve_order=replay_order,
+                fixed_quarter_turns=fixed_quarter_turns,
+            )
+            maximum = max(width, height)
+            minimum = max(min(width, height), _EPSILON)
+            aspect = maximum / minimum
+            square_score = maximum * (
+                1.0
+                + square_pack_bias * min(max(aspect - 1.0, 0.0), 2.0)
+            )
+            candidates.append((
+                square_score,
+                maximum,
+                width * height,
+                aspect,
+                abs(width - height),
+                order_index,
+                target_width,
+                placements,
+                width,
+                height,
+            ))
+
+    # The first (longest-side) order is the stable compact baseline.  Define
+    # that baseline by longest packed edge rather than by the aesthetic score,
+    # then permit only the explicitly configured relative relaxation.  This
+    # makes the texel-density trade-off auditable and prevents a square bias
+    # from silently shrinking every island.
+    baseline = min(
+        (item for item in candidates if item[5] == 0),
+        key=lambda item: (
+            item[1],
+            item[2],
+            item[3],
+            item[4],
+            item[6],
+        ),
+    )
+    baseline_maximum = baseline[1]
+    maximum_allowed = baseline_maximum * (
+        1.0 + effective_relaxation
+    )
+    bounded = [
+        item for item in candidates
+        if item[1] <= maximum_allowed
+        + max(baseline_maximum, 1.0) * 1.0e-12
+    ]
+    if not bounded:
+        # The baseline is always present, but retaining this guard makes the
+        # function robust to future candidate filters.
+        bounded = [baseline]
+
+    def candidate_key(item):
+        _square_score, maximum, area, aspect, delta, order_index, target = item[:7]
+        if not bounded_small_search:
+            # Preserve the historical compact mode for dense/large layouts:
+            # no new aesthetic tie-break should reorder equal-scale shelves.
+            return (
+                maximum,
+                area,
+                aspect,
+                delta,
+                order_index,
+                target,
+            )
+        relative_scale = baseline_maximum / max(maximum, _EPSILON)
+        fill = 1.0 / max(aspect, 1.0)
+        # Geometric blending keeps both objectives meaningful: bias=0 is pure
+        # scale preservation, while larger bias favors a square, area-efficient
+        # tile without ever leaving the longest-edge bound above.
+        quality = (
+            max(relative_scale, _EPSILON) ** (1.0 - square_pack_bias)
+            * max(fill, _EPSILON) ** square_pack_bias
+        )
+        return (
+            -quality,
+            -relative_scale,
+            -fill,
+            aspect,
+            area,
+            order_index,
+            target,
+        )
+
+    best = min(bounded, key=candidate_key)
+    return best[7], best[8], best[9]
 
 
 def _translate_to_origin(coordinates: Mapping[int, Vector]) -> Tuple[Dict[int, Vector], float, float]:
@@ -2047,6 +2768,8 @@ def _pack_owner_cells(
     owner_order: Sequence[int],
     owner_cohorts: Sequence[Sequence[int]],
     gap: float,
+    square_pack_bias: float = 0.35,
+    square_pack_max_edge_relaxation: float = 0.02,
 ) -> Tuple[Dict[int, _Placement], float, float]:
     """Pack owner cells while keeping every repeat owner near a cohort peer."""
 
@@ -2135,6 +2858,8 @@ def _pack_owner_cells(
         gap,
         allow_rotate=False,
         preserve_order=False,
+        square_pack_bias=square_pack_bias,
+        square_pack_max_edge_relaxation=square_pack_max_edge_relaxation,
     )
     placements = {}
     for component_id, local_placements in component_placements.items():
@@ -2358,6 +3083,8 @@ def _pack_layout_group_rectangles(
     repeat_cohorts: Sequence[Sequence[int]],
     gap: float,
     allow_rotate: bool,
+    square_pack_bias: float = 0.35,
+    square_pack_max_edge_relaxation: float = 0.02,
 ) -> Tuple[Dict[int, _Placement], float, float]:
     """Pack cross-group repeats as nearby blocks without merging their owners."""
 
@@ -2459,6 +3186,8 @@ def _pack_layout_group_rectangles(
         allow_rotate=allow_rotate,
         preserve_order=False,
         fixed_quarter_turns=component_rotation_locks,
+        square_pack_bias=square_pack_bias,
+        square_pack_max_edge_relaxation=square_pack_max_edge_relaxation,
     )
 
     placements = {}
@@ -2496,6 +3225,8 @@ def _pack_plan(
     gap: float,
     allow_group_quarter_turn: bool,
     repeat_groups: Sequence[RepeatGroup] = (),
+    square_pack_bias: float = 0.35,
+    square_pack_max_edge_relaxation: float = 0.02,
 ) -> _PackedPlan:
     island_local: Dict[int, Dict[int, Vector]] = {}
     island_sizes: Dict[int, Tuple[float, float]] = {}
@@ -2589,6 +3320,8 @@ def _pack_plan(
             owner_order,
             group.owner_cohorts,
             gap,
+            square_pack_bias=square_pack_bias,
+            square_pack_max_edge_relaxation=square_pack_max_edge_relaxation,
         )
         packed_members: Dict[int, Dict[int, Vector]] = {}
         for cell_id in owner_order:
@@ -2620,6 +3353,8 @@ def _pack_plan(
         repeat_cohorts,
         gap,
         allow_rotate=allow_group_quarter_turn,
+        square_pack_bias=square_pack_bias,
+        square_pack_max_edge_relaxation=square_pack_max_edge_relaxation,
     )
     _validate_repeat_group_rotation_parity(groups, repeat_groups, placements)
     final_coordinates: Dict[int, Dict[int, Vector]] = {}
@@ -2675,39 +3410,82 @@ def _plan_with_margin(
     repeat_groups: Sequence[RepeatGroup] = (),
 ) -> Tuple[_PackedPlan, Dict[int, Dict[int, Vector]], float]:
     gap = 0.0
-    plan = _pack_plan(
-        oriented,
-        groups,
-        gap,
-        settings.allow_group_quarter_turn,
-        repeat_groups,
-    )
-    fitted, scale = _fit_plan_to_tile(plan, settings.margin)
+    attempts = []
+    seen_states = set()
     for _iteration in range(settings.packing_iterations):
+        plan = _pack_plan(
+            oriented,
+            groups,
+            gap,
+            settings.allow_group_quarter_turn,
+            repeat_groups,
+            settings.square_pack_bias,
+            settings.square_pack_max_edge_relaxation,
+        )
+        fitted, scale = _fit_plan_to_tile(plan, settings.margin)
+        achieved = gap * scale
+        state = (
+            round(float(gap), 10),
+            round(float(plan.width), 9),
+            round(float(plan.height), 9),
+        )
+        if state in seen_states:
+            # Shelf row breaks can make the fixed-point map oscillate between
+            # two layouts.  Keep the deterministic history and choose the
+            # best feasible candidate below instead of returning the last,
+            # potentially long-strip, iteration.
+            break
+        seen_states.add(state)
+        attempts.append((gap, plan, fitted, scale, achieved))
         requested_source_gap = settings.margin / max(scale, _EPSILON)
         if abs(requested_source_gap - gap) <= max(requested_source_gap, 1.0) * 1.0e-6:
             break
         gap = requested_source_gap
-        plan = _pack_plan(
-            oriented,
-            groups,
-            gap,
-            settings.allow_group_quarter_turn,
-            repeat_groups,
+
+    if not attempts:
+        raise RuntimeError("UV group layout produced no packing candidate")
+
+    feasible = [
+        item for item in attempts
+        if item[4] + 1.0e-9 >= settings.margin
+    ]
+    candidates = feasible or attempts
+
+    def candidate_key(item):
+        _candidate_gap, candidate_plan, _fitted, candidate_scale, _achieved = item
+        minimum = max(
+            min(candidate_plan.width, candidate_plan.height), _EPSILON
         )
-        fitted, scale = _fit_plan_to_tile(plan, settings.margin)
+        aspect = max(candidate_plan.width, candidate_plan.height) / minimum
+        # Preserve texel density first; use square utilization as a stable
+        # tie-breaker so a nearly-equivalent scale does not leave a strip.
+        return (
+            -candidate_scale,
+            aspect,
+            candidate_plan.width * candidate_plan.height,
+        )
+
+    gap, plan, fitted, scale, achieved = min(candidates, key=candidate_key)
 
     # One conservative correction avoids ending below the requested gap when
     # the fixed-point iteration stops on a shelf-layout discontinuity.
-    achieved = gap * scale
     if achieved + 1.0e-9 < settings.margin:
-        gap *= settings.margin / max(achieved, _EPSILON) * 1.002
+        # ``gap`` can still be zero when ``packing_iterations`` is one or
+        # when every sampled candidate is infeasible.  Derive a non-zero
+        # source-space gap from the selected scale before applying the small
+        # safety factor.
+        gap = max(
+            gap,
+            settings.margin / max(scale, _EPSILON),
+        ) * 1.002
         plan = _pack_plan(
             oriented,
             groups,
             gap,
             settings.allow_group_quarter_turn,
             repeat_groups,
+            settings.square_pack_bias,
+            settings.square_pack_max_edge_relaxation,
         )
         fitted, scale = _fit_plan_to_tile(plan, settings.margin)
     return plan, fitted, scale
@@ -2775,6 +3553,407 @@ def _has_triangle_overlap(
     return False
 
 
+def _triangle_uv_area(points: Sequence[Vector]) -> float:
+    """Return the unsigned area of one UV triangle.
+
+    Blender's tessellated loop triangles are used for quality measurements so
+    concave n-gons are measured by their actual surface area instead of by a
+    potentially misleading bounding rectangle.  The helper intentionally
+    accepts any sequence with three vector-like points for small synthetic
+    regression fixtures as well.
+    """
+
+    if len(points) != 3:
+        return 0.0
+    first, second, third = points
+    determinant = (
+        (second.x - first.x) * (third.y - first.y)
+        - (second.y - first.y) * (third.x - first.x)
+    )
+    value = abs(float(determinant)) * 0.5
+    return value if math.isfinite(value) else 0.0
+
+
+def _uv_face_quality_data(
+    mesh: Any,
+    uv_layer: Any,
+) -> Tuple[Dict[int, float], Dict[int, List[float]]]:
+    """Collect tessellated UV area and boundary-edge lengths per face."""
+
+    face_areas: Dict[int, float] = defaultdict(float)
+    edge_lengths: Dict[int, List[float]] = defaultdict(list)
+    # ``calc_loop_triangles`` exists in Blender 3.3 and 5.2.  Keep a
+    # defensive fallback for light-weight test doubles and malformed meshes.
+    try:
+        mesh.calc_loop_triangles()
+        triangles = list(mesh.loop_triangles)
+    except (AttributeError, RuntimeError, TypeError):
+        triangles = []
+    for triangle in triangles:
+        loop_indices = tuple(int(index) for index in triangle.loops)
+        points = tuple(uv_layer.data[index].uv for index in loop_indices)
+        area = _triangle_uv_area(points)
+        face_index = int(triangle.polygon_index)
+        face_areas[face_index] += area
+
+    for polygon in mesh.polygons:
+        face_index = int(polygon.index)
+        loop_indices = tuple(int(index) for index in polygon.loop_indices)
+        points = [uv_layer.data[index].uv for index in loop_indices]
+        if face_index not in face_areas:
+            # A triangle-less fallback still gives useful diagnostics for a
+            # test double or a polygon Blender could not tessellate.
+            face_areas[face_index] = abs(
+                float(_polygon_signed_uv_area(mesh, uv_layer, face_index))
+            )
+        if len(points) >= 2:
+            for offset, first in enumerate(points):
+                second = points[(offset + 1) % len(points)]
+                length = (second - first).length
+                if math.isfinite(float(length)):
+                    edge_lengths[face_index].append(max(float(length), 0.0))
+    return dict(face_areas), dict(edge_lengths)
+
+
+def _quality_validity(audit: Mapping[str, Any]) -> bool:
+    """Return the single geometric validity predicate used by selection."""
+
+    return bool(
+        audit.get("finite", False)
+        and audit.get("inside_tile", False)
+        and int(audit.get("positive", 0)) > 0
+        and int(audit.get("negative", 0)) == 0
+        and int(audit.get("degenerate", 0)) == 0
+        and not bool(audit.get("overlap", False))
+    )
+
+
+def evaluate_layout_quality(
+    obj: Any,
+    analysis: Optional[UVLayoutAnalysis] = None,
+    face_to_island: Optional[Sequence[int]] = None,
+    audit: Optional[Mapping[str, Any]] = None,
+    epsilon: float = 1.0e-7,
+) -> Dict[str, Any]:
+    """Measure post-layout quality without changing mesh or UV state.
+
+    The returned values deliberately distinguish *polygon* coverage from the
+    fitted AABB occupancy exposed by older releases.  Area quantiles are in
+    tile-space UV units, while ``short_edge`` is the smallest positive UV
+    boundary edge of each island.  Flat aliases are included alongside the
+    nested summaries to keep JSON consumers and Blender panel code simple.
+    """
+
+    mesh, uv_layer = _require_object_mode_mesh(obj)
+    if analysis is None:
+        analysis = analyze_active_uv(
+            obj,
+            GroupLayoutOptions(uv_epsilon=max(float(epsilon), 1.0e-9)),
+        )
+    if face_to_island is None:
+        face_to_island = tuple(analysis.face_to_island)
+    else:
+        face_to_island = tuple(int(value) for value in face_to_island)
+    if len(face_to_island) != len(mesh.polygons):
+        # A stale analysis should never make scoring crash.  Reconstructing is
+        # deterministic and leaves the caller's UV coordinates untouched.
+        _islands, face_to_island, _adjacency, _diagonal = (
+            compute_active_uv_islands(
+                obj,
+                GroupLayoutOptions(uv_epsilon=max(float(epsilon), 1.0e-9)),
+            )
+        )
+        if analysis is None or len(analysis.islands) == 0:
+            analysis = UVLayoutAnalysis(
+                object_name=str(obj.name),
+                mesh_name=str(mesh.name),
+                uv_layer_name=str(uv_layer.name),
+                object_diagonal=1.0,
+                islands=list(_islands),
+                adjacency=[],
+                repeat_candidates=[],
+                repeat_groups=[],
+                layout_groups=[],
+                face_to_island=tuple(face_to_island),
+            )
+
+    if audit is None:
+        audit = audit_active_uv(obj, face_to_island, epsilon=epsilon)
+    audit_data = dict(audit)
+    face_areas, face_edges = _uv_face_quality_data(mesh, uv_layer)
+    by_id = {int(island.island_id): island for island in analysis.islands}
+    island_areas: Dict[int, float] = {
+        island_id: 0.0 for island_id in by_id
+    }
+    island_edges: Dict[int, List[float]] = {
+        island_id: [] for island_id in by_id
+    }
+    island_points: Dict[int, List[Vector]] = {
+        island_id: [] for island_id in by_id
+    }
+    for face_index, island_id in enumerate(face_to_island):
+        island_id = int(island_id)
+        if island_id not in island_areas:
+            island_areas[island_id] = 0.0
+            island_edges[island_id] = []
+            island_points[island_id] = []
+        island_areas[island_id] += max(
+            float(face_areas.get(face_index, 0.0)), 0.0
+        )
+        island_edges[island_id].extend(
+            max(float(value), 0.0)
+            for value in face_edges.get(face_index, ())
+            if math.isfinite(float(value))
+        )
+        try:
+            island_points[island_id].extend(
+                uv_layer.data[int(loop_index)].uv.copy()
+                for loop_index in mesh.polygons[face_index].loop_indices
+            )
+        except (AttributeError, IndexError, TypeError):
+            pass
+
+    # Include islands from the analysis even if a malformed face map omitted
+    # them, keeping quantile cardinality deterministic.
+    island_ids = sorted(set(by_id) | set(island_areas))
+    area_values = [
+        max(float(island_areas.get(island_id, 0.0)), 0.0)
+        for island_id in island_ids
+    ]
+    edge_values = []
+    for island_id in island_ids:
+        positive_edges = [
+            value for value in island_edges.get(island_id, ())
+            if value > max(float(epsilon), 1.0e-12)
+        ]
+        edge_values.append(min(positive_edges) if positive_edges else 0.0)
+    small_ids = {
+        island_id for island_id, island in by_id.items() if bool(island.is_small)
+    }
+    small_area_values = [
+        max(float(island_areas.get(island_id, 0.0)), 0.0)
+        for island_id in island_ids if island_id in small_ids
+    ]
+    small_edge_values = [
+        edge_values[position]
+        for position, island_id in enumerate(island_ids)
+        if island_id in small_ids
+    ]
+
+    all_points = [item.uv for item in uv_layer.data]
+    finite_points = all(
+        math.isfinite(float(point.x)) and math.isfinite(float(point.y))
+        for point in all_points
+    )
+    bounds = _uv_bounds(all_points) if all_points and finite_points else (
+        0.0, 0.0, 0.0, 0.0
+    )
+    width = max(float(bounds[2] - bounds[0]), 0.0)
+    height = max(float(bounds[3] - bounds[1]), 0.0)
+    tile_aabb_area = width * height if finite_points else 0.0
+    polygon_area = sum(area_values) if finite_points else 0.0
+    if not math.isfinite(polygon_area):
+        polygon_area = 0.0
+    tile_polygon_coverage = _clamp(polygon_area, 0.0, 1.0)
+    tile_aabb_coverage = _clamp(tile_aabb_area, 0.0, 1.0)
+    aabb_fill_raw = (
+        polygon_area / tile_aabb_area
+        if tile_aabb_area > max(float(epsilon) ** 2, _EPSILON)
+        else 0.0
+    )
+    aabb_fill = _clamp(aabb_fill_raw, 0.0, 1.0)
+
+    # Orientation is deliberately only a tie-breaker.  A candidate with a
+    # slightly better axis alignment must not displace one with materially
+    # better lower-tail area or polygon coverage.
+    residuals = []
+    for island in analysis.islands:
+        reference = _orientation_reference_angle(island)
+        if reference is None or not math.isfinite(float(reference)):
+            continue
+        residuals.append(abs(_nearest_cardinal_delta(float(reference))))
+    residual_p95 = math.degrees(_quantile(residuals, 0.95))
+
+    valid = _quality_validity(audit_data)
+    metrics: Dict[str, Any] = {
+        "islands": len(island_ids),
+        "small_islands": len(small_area_values),
+        "polygon_area": float(polygon_area),
+        "tile_polygon_coverage": float(tile_polygon_coverage),
+        "tile_aabb_area": float(tile_aabb_area),
+        "tile_aabb_coverage": float(tile_aabb_coverage),
+        "aabb_fill_raw": float(aabb_fill_raw),
+        "aabb_fill": float(aabb_fill),
+        "tile_bounds": _bounds_to_list(bounds),
+        "island_area_p05": _quantile(area_values, 0.05),
+        "island_area_p10": _quantile(area_values, 0.10),
+        "island_area_p50": _quantile(area_values, 0.50),
+        "small_island_area_p05": _quantile(small_area_values, 0.05),
+        "small_island_area_p10": _quantile(small_area_values, 0.10),
+        "short_edge_p05": _quantile(edge_values, 0.05),
+        "short_edge_p10": _quantile(edge_values, 0.10),
+        "short_edge_p50": _quantile(edge_values, 0.50),
+        "small_short_edge_p05": _quantile(small_edge_values, 0.05),
+        "small_short_edge_p10": _quantile(small_edge_values, 0.10),
+        "orientation_residual_p95_degrees": residual_p95,
+        "valid": bool(valid),
+        "finite": bool(audit_data.get("finite", False)),
+        "inside_tile": bool(audit_data.get("inside_tile", False)),
+        "positive": int(audit_data.get("positive", 0)),
+        "negative": int(audit_data.get("negative", 0)),
+        "degenerate": int(audit_data.get("degenerate", 0)),
+        "overlap": bool(audit_data.get("overlap", False)),
+        "triangles": int(audit_data.get("triangles", 0)),
+        "audit": audit_data,
+    }
+    # Concise aliases used by older report scripts and by UI integrations.
+    metrics.update({
+        "polygon_coverage": metrics["tile_polygon_coverage"],
+        "aabb_coverage": metrics["tile_aabb_coverage"],
+        "island_p05": metrics["island_area_p05"],
+        "island_p10": metrics["island_area_p10"],
+        "island_p50": metrics["island_area_p50"],
+        "small_p05": metrics["small_island_area_p05"],
+        "small_p10": metrics["small_island_area_p10"],
+    })
+    return metrics
+
+
+# ``measure_layout_quality`` reads naturally in external integrations and is
+# kept as a stable alias for the more explicit public name.
+measure_layout_quality = evaluate_layout_quality
+
+
+def _metric_value(metrics: Mapping[str, Any], *names: str) -> float:
+    for name in names:
+        value = metrics.get(name)
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            return value
+    return 0.0
+
+
+def score_layout_candidate(
+    candidate: Mapping[str, Any],
+    reference: Optional[Mapping[str, Any]] = None,
+    options: Optional[GroupLayoutOptions] = None,
+    reference_scale: Optional[float] = None,
+    candidate_scale: Optional[float] = None,
+) -> float:
+    """Return a deterministic multi-objective score for one layout.
+
+    Lower-tail island area is the primary objective.  Polygon coverage,
+    polygon-vs-AABB fill/tile coverage, and short-edge readability are bounded
+    secondary terms.  Values are normalized to a reference candidate when
+    supplied, so the score remains meaningful across adaptive variants with
+    different uniform scales.
+    """
+
+    settings = (options or GroupLayoutOptions()).validated()
+    # Accept either the raw metric mapping or a GroupLayoutResult-like object;
+    # this keeps the public helper convenient for add-on and test callers.
+    if not isinstance(candidate, Mapping):
+        candidate = getattr(candidate, "quality_metrics", {}) or {}
+    if reference is not None and not isinstance(reference, Mapping):
+        reference = getattr(reference, "quality_metrics", {}) or {}
+    candidate = candidate or {}
+    reference = reference or candidate
+    valid = bool(candidate.get("valid", candidate.get("candidate_valid", True)))
+    if not valid:
+        return float("-inf")
+
+    def ratio(names: Sequence[str], floor: float = _EPSILON) -> float:
+        value = _metric_value(candidate, *names)
+        baseline = _metric_value(reference, *names)
+        if baseline <= floor:
+            return 1.0 if value > floor else 0.0
+        return _clamp(value / baseline, 0.0, 4.0)
+
+    # The optimization target is the readability of detached mechanical
+    # details, so prefer the lower tail of *small* islands whenever both
+    # candidates describe a non-empty small-island population.  Falling back
+    # to all-island quantiles keeps the helper useful for meshes without any
+    # islands classified as small.
+    candidate_small_count = _metric_value(candidate, "small_islands")
+    reference_small_count = _metric_value(reference, "small_islands")
+    use_small_tail = candidate_small_count > 0.0 and reference_small_count > 0.0
+    if use_small_tail:
+        area_names = (
+            ("small_island_area_p05", "small_p05"),
+            ("small_island_area_p10", "small_p10"),
+        )
+        edge_names = (
+            ("small_short_edge_p05", "short_edge_p05"),
+            ("small_short_edge_p10", "small_short_edge_p10", "short_edge_p10"),
+        )
+    else:
+        area_names = (
+            ("island_area_p05", "island_p05"),
+            ("island_area_p10", "island_p10"),
+        )
+        edge_names = (
+            ("short_edge_p05",),
+            ("short_edge_p10",),
+        )
+    area_gain = min(
+        ratio(area_names[0]),
+        ratio(area_names[1]),
+    )
+    polygon_gain = ratio(("tile_polygon_coverage", "polygon_coverage"))
+    # A high polygon/AABB fill can still be a poor atlas when the whole
+    # bounding box occupies only a narrow strip of the 0-1 tile.  Combine
+    # compactness and tile coverage symmetrically so a candidate cannot win by
+    # trading away substantial occupied area for a tighter rectangle.
+    aabb_fill_gain = ratio(("aabb_fill",), floor=1.0e-9)
+    occupancy_names = ("tile_aabb_coverage", "aabb_coverage")
+    if any(name in candidate for name in occupancy_names) and any(
+        name in reference for name in occupancy_names
+    ):
+        aabb_coverage_gain = ratio(occupancy_names, floor=1.0e-9)
+        fill_gain = math.sqrt(
+            max(aabb_fill_gain * aabb_coverage_gain, 0.0)
+        )
+    else:
+        # Keep the public scorer compatible with pre-0.5.5 metric mappings.
+        fill_gain = aabb_fill_gain
+    edge_gain = min(
+        ratio(edge_names[0]),
+        ratio(edge_names[1]),
+    )
+    weights = [
+        max(float(settings.area_score_weight), 0.0),
+        max(float(settings.polygon_coverage_score_weight), 0.0),
+        max(float(settings.aabb_fill_score_weight), 0.0),
+        max(float(settings.short_edge_score_weight), 0.0),
+    ]
+    total = sum(weights)
+    if total <= _EPSILON:
+        weights = [1.0, 0.0, 0.0, 0.0]
+        total = 1.0
+    score = (
+        weights[0] * area_gain
+        + weights[1] * polygon_gain
+        + weights[2] * fill_gain
+        + weights[3] * edge_gain
+    ) / total
+    # Scale is a soft tie-breaker only.  Density eligibility is enforced by
+    # the adaptive selector, so a direct caller can still compare metrics.
+    if candidate_scale is not None and reference_scale is not None:
+        try:
+            scale_ratio = _clamp(
+                float(candidate_scale) / max(float(reference_scale), _EPSILON),
+                0.0,
+                1.0,
+            )
+            score += 0.02 * scale_ratio
+        except (TypeError, ValueError):
+            pass
+    return float(score)
+
+
 def audit_active_uv(
     obj: Any,
     face_to_island: Optional[Sequence[int]] = None,
@@ -2819,7 +3998,7 @@ def audit_active_uv(
             negative += 1
         else:
             degenerate += 1
-    return {
+    result = {
         "triangles": len(triangle_records),
         "positive": positive,
         "negative": negative,
@@ -2828,6 +4007,11 @@ def audit_active_uv(
         "inside_tile": inside_tile,
         "overlap": finite and _has_triangle_overlap(triangle_records, epsilon),
     }
+    # Keep the validity predicate available to callers that only request the
+    # lightweight audit.  Detailed area/coverage metrics live in
+    # ``evaluate_layout_quality`` so this audit remains cheap and deterministic.
+    result["valid"] = _quality_validity(result)
+    return result
 
 
 def _validate_source_audit(
@@ -3012,7 +4196,9 @@ def _validate_island_similarity(
     uv_layer: Any,
     islands: Sequence[IslandRecord],
     uniform_scale: float,
+    island_scale_factors: Optional[Mapping[int, float]] = None,
 ) -> None:
+    island_scale_factors = island_scale_factors or {}
     for island in islands:
         if not island.loop_indices:
             continue
@@ -3034,7 +4220,11 @@ def _validate_island_similarity(
         real = source.dot(target) / denominator
         imaginary = (source.x * target.y - source.y * target.x) / denominator
         measured_scale = math.sqrt(real * real + imaginary * imaginary)
-        tolerance = max(uniform_scale, 1.0) * 5.0e-7
+        expected_scale = uniform_scale * max(
+            float(island_scale_factors.get(island.island_id, 1.0)),
+            _EPSILON,
+        )
+        tolerance = max(expected_scale, 1.0) * 5.0e-7
         # UV coordinates are stored as float32 by Blender.  For a very small
         # island, a sub-pixel absolute writeback error can exceed a fixed
         # relative-scale threshold even though every loop remains within the
@@ -3045,7 +4235,7 @@ def _validate_island_similarity(
             5.0e-5,
             tolerance / max(source.length, _EPSILON),
         )
-        if _relative_error(measured_scale, uniform_scale) > scale_tolerance:
+        if _relative_error(measured_scale, expected_scale) > scale_tolerance:
             raise RuntimeError(
                 "UV island {} changed relative scale".format(island.island_id)
             )
@@ -3106,6 +4296,13 @@ def layout_active_uv(
 
     angles = _orientation_angles(analysis, settings)
     oriented = _oriented_coordinates(uv_layer, analysis, angles)
+    oriented, island_scale_factors, scaled_small_count = (
+        _boost_small_island_coordinates(
+            oriented,
+            analysis,
+            settings.small_island_scale_boost,
+        )
+    )
     plan, fitted, uniform_scale = _plan_with_margin(
         oriented,
         analysis.layout_groups,
@@ -3135,7 +4332,11 @@ def layout_active_uv(
             )
         _validate_result_audit(after_audit)
         _validate_island_similarity(
-            snapshot, uv_layer, analysis.islands, uniform_scale
+            snapshot,
+            uv_layer,
+            analysis.islands,
+            uniform_scale,
+            island_scale_factors=island_scale_factors,
         )
     except Exception:
         for item, coordinate in zip(uv_layer.data, snapshot):
@@ -3144,6 +4345,13 @@ def layout_active_uv(
         raise
 
     fitted_gap = _minimum_aabb_gap(fitted)
+    fitted_bounds = _uv_bounds(
+        point
+        for coordinates in fitted.values()
+        for point in coordinates.values()
+    )
+    fitted_width = max(fitted_bounds[2] - fitted_bounds[0], 0.0)
+    fitted_height = max(fitted_bounds[3] - fitted_bounds[1], 0.0)
     grouped_small = len({
         island_id
         for group in analysis.layout_groups
@@ -3152,6 +4360,14 @@ def layout_active_uv(
     rotated_islands = sum(
         abs(_angle_wrap(angle)) > 1.0e-7 for angle in angles.values()
     )
+    quality_metrics = evaluate_layout_quality(
+        obj,
+        analysis=analysis,
+        face_to_island=analysis.face_to_island,
+        audit=after_audit,
+        epsilon=settings.uv_epsilon * 0.1,
+    )
+    candidate_valid = bool(quality_metrics.get("valid", False))
     return GroupLayoutResult(
         analysis=analysis,
         uniform_scale=uniform_scale,
@@ -3167,6 +4383,21 @@ def layout_active_uv(
             (abs(math.degrees(value)) for value in quantization_rotations.values()),
             default=0.0,
         ),
+        packed_width=plan.width,
+        packed_height=plan.height,
+        tile_occupancy=_clamp(fitted_width * fitted_height, 0.0, 1.0),
+        small_island_scale_boost=settings.small_island_scale_boost,
+        small_islands_scaled=scaled_small_count,
+        square_pack_max_edge_relaxation=(
+            settings.square_pack_max_edge_relaxation
+        ),
+        quality_metrics=quality_metrics,
+        candidate_score=score_layout_candidate(
+            quality_metrics,
+            quality_metrics,
+            settings,
+        ),
+        candidate_valid=candidate_valid,
     )
 
 
@@ -3174,28 +4405,216 @@ def layout_active_uv_adaptive(
     obj: Any,
     options: Optional[GroupLayoutOptions] = None,
 ) -> GroupLayoutResult:
-    """Try both group-block rotation policies, committing only a valid result."""
+    """Try safe layout variants and commit the best valid result.
+
+    A perceptual small-island boost is deliberately best-effort.  If the
+    enlarged charts cannot satisfy the strict no-overlap contract, the
+    alternate group rotation and finally the boost-disabled variants remain
+    available.  Every variant starts from the same source coordinates.  This
+    matters because the first valid variant is not necessarily the most useful
+    atlas: a different quarter-turn can have a much squarer footprint, while
+    a boost-disabled variant can retain more global texel density.  Selection
+    is based on the resulting uniform scale and tile coverage before aspect
+    ratio, and only a fully audited candidate can be committed.
+    """
 
     primary = (options or GroupLayoutOptions()).validated()
-    attempts = (
+    alternate_turn = replace(
         primary,
-        replace(
-            primary,
-            allow_group_quarter_turn=not primary.allow_group_quarter_turn,
-        ),
+        allow_group_quarter_turn=not primary.allow_group_quarter_turn,
     )
+    attempts = [primary, alternate_turn]
+    if primary.small_island_scale_boost > 1.0 + 1.0e-9:
+        attempts.extend((
+            replace(primary, small_island_scale_boost=1.0),
+            replace(alternate_turn, small_island_scale_boost=1.0),
+        ))
+
+    mesh, uv_layer = _require_object_mode_mesh(obj)
+    source_uv = [item.uv.copy() for item in uv_layer.data]
+
+    def restore_source() -> None:
+        for item, coordinate in zip(uv_layer.data, source_uv):
+            item.uv = coordinate.copy()
+        mesh.update()
+
     errors = []
+    successful = []
     for index, settings in enumerate(attempts):
+        # ``layout_active_uv`` is transactional on its own, but explicitly
+        # restoring here also isolates successful candidates from one another.
+        restore_source()
         try:
             result = layout_active_uv(obj, settings)
-            result.fallback_used = index > 0
-            result.fallback_errors = tuple(errors)
-            return result
-        except RuntimeError as exc:
-            errors.append(str(exc))
-    raise RuntimeError(
-        "Adaptive UV group layout failed: " + " | ".join(errors)
+            # Re-run the read-only quality gate explicitly at the adaptive
+            # boundary.  This protects selection from a future layout backend
+            # that returns a result without propagating its audit fields.
+            quality_metrics = evaluate_layout_quality(
+                obj,
+                analysis=result.analysis,
+                face_to_island=result.analysis.face_to_island,
+                audit=result.after_audit,
+                epsilon=settings.uv_epsilon * 0.1,
+            )
+            result.quality_metrics = quality_metrics
+            result.candidate_valid = bool(quality_metrics.get("valid", False))
+            if not result.candidate_valid:
+                errors.append(
+                    "{}: invalid quality audit".format(index)
+                )
+                restore_source()
+                continue
+            successful.append((
+                index,
+                result,
+                [item.uv.copy() for item in uv_layer.data],
+            ))
+        except Exception as exc:
+            # ``layout_active_uv`` restores its own snapshot, but keep the
+            # adaptive loop defensive: third-party Blender callbacks can
+            # raise non-RuntimeError exceptions after touching the layer.
+            restore_source()
+            errors.append("{}: {}".format(type(exc).__name__, exc))
+
+    if not successful:
+        restore_source()
+        raise RuntimeError(
+            "Adaptive UV group layout failed: " + " | ".join(errors)
+        )
+
+    # A requested small-island boost is a presentation contract.  Do not let
+    # a boost-disabled candidate win merely because it preserves a little
+    # more global texel density.  It remains a true fallback only when every
+    # boosted variant fails (or would require an unreasonable density loss).
+    requested_boost = primary.small_island_scale_boost > 1.0 + 1.0e-9
+    boosted_successful = [
+        record for record in successful
+        if record[1].small_island_scale_boost > 1.0 + 1.0e-9
+    ]
+    selection_pool = list(successful)
+    if requested_boost and boosted_successful:
+        unboosted_scales = [
+            max(float(record[1].uniform_scale), _EPSILON)
+            for record in successful
+            if record[1].small_island_scale_boost <= 1.0 + 1.0e-9
+        ]
+        reference_scale = max(
+            unboosted_scales,
+            default=max(
+                max(float(record[1].uniform_scale), _EPSILON)
+                for record in boosted_successful
+            ),
+        )
+        # The configurable density floor prevents a square/tall candidate from
+        # winning solely on coverage while making the trade-off explicit.
+        density_floor = reference_scale * float(primary.candidate_density_floor)
+        density_eligible = [
+            record for record in boosted_successful
+            if float(record[1].uniform_scale) + 1.0e-9 >= density_floor
+        ]
+        if density_eligible:
+            selection_pool = density_eligible
+        else:
+            # A requested boost is subordinate to the density contract.  If
+            # every boosted layout falls below the floor, retain any valid
+            # candidate that meets it (typically an unboosted layout) before
+            # considering the absolute best valid fallback.
+            all_density_eligible = [
+                record for record in successful
+                if float(record[1].uniform_scale) + 1.0e-9 >= density_floor
+            ]
+            selection_pool = all_density_eligible or list(successful)
+    elif requested_boost:
+        # No boosted candidate survived the strict geometric audit; use the
+        # unboosted candidates as the documented last-resort fallback.
+        selection_pool = list(successful)
+
+    # Apply the same density guard when no boost was requested.  The fallback
+    # to all geometrically valid records keeps the API usable for unusually
+    # small meshes where the shelf packer cannot meet a strict floor.
+    if not requested_boost:
+        reference_scale = max(
+            (max(float(record[1].uniform_scale), _EPSILON) for record in successful),
+            default=_EPSILON,
+        )
+        density_floor = reference_scale * float(primary.candidate_density_floor)
+        density_eligible = [
+            record for record in successful
+            if float(record[1].uniform_scale) + 1.0e-9 >= density_floor
+        ]
+        selection_pool = density_eligible or list(successful)
+
+    # Use the highest-density unboosted layout as the normalization reference;
+    # this makes lower-tail gains attributable to the small-island treatment,
+    # while still rewarding a genuinely fuller polygon atlas.
+    reference_candidates = [
+        record for record in successful
+        if record[1].small_island_scale_boost <= 1.0 + 1.0e-9
+    ]
+    reference_record = max(
+        reference_candidates or successful,
+        key=lambda record: (float(record[1].uniform_scale), -record[0]),
     )
+    reference_metrics = reference_record[1].quality_metrics
+    reference_scale = max(float(reference_record[1].uniform_scale), _EPSILON)
+
+    if primary.area_aware_scoring:
+        for index, result, _coordinates in successful:
+            result.candidate_score = score_layout_candidate(
+                result.quality_metrics,
+                reference_metrics,
+                primary,
+                reference_scale=reference_scale,
+                candidate_scale=result.uniform_scale,
+            )
+        def candidate_key(record):
+            index, result, _coordinates = record
+            metrics = result.quality_metrics
+            # Orientation is a final tie-breaker.  Its contribution is kept
+            # below the score precision so it cannot override area/coverage.
+            residual = _metric_value(
+                metrics, "orientation_residual_p95_degrees"
+            )
+            return (
+                float(result.candidate_score),
+                _metric_value(metrics, "tile_polygon_coverage", "polygon_coverage"),
+                _metric_value(metrics, "aabb_fill"),
+                -residual,
+                float(result.uniform_scale),
+                -index,
+            )
+    else:
+        # Historical ordering remains available for callers that need exact
+        # pre-area-aware behavior.
+        def candidate_key(record):
+            index, result, _coordinates = record
+            scale = max(float(result.uniform_scale), _EPSILON)
+            occupancy = _clamp(float(result.tile_occupancy), 0.0, 1.0)
+            minimum = max(
+                min(float(result.packed_width), float(result.packed_height)),
+                _EPSILON,
+            )
+            aspect = max(
+                float(result.packed_width), float(result.packed_height)
+            ) / minimum
+            return (
+                -occupancy,
+                aspect,
+                -scale,
+                index,
+            )
+
+    selector = max if primary.area_aware_scoring else min
+    best_index, best_result, best_coordinates = selector(
+        selection_pool, key=candidate_key
+    )
+    restore_source()
+    for item, coordinate in zip(uv_layer.data, best_coordinates):
+        item.uv = coordinate.copy()
+    mesh.update()
+    best_result.fallback_used = best_index > 0
+    best_result.fallback_errors = tuple(errors)
+    return best_result
 
 
 # A descriptive alias for integration code in the optimizer transaction.
@@ -3213,6 +4632,9 @@ __all__ = [
     "UVLayoutAnalysis",
     "analyze_active_uv",
     "audit_active_uv",
+    "evaluate_layout_quality",
+    "measure_layout_quality",
+    "score_layout_candidate",
     "build_layout_groups",
     "calculate_island_records",
     "compute_active_uv_islands",

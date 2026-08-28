@@ -135,3 +135,69 @@ v10 是使用最终双面积小岛判定、owner 共同朝向、跨布局组旋�
 替代 v10。仓库只收录
 插件源码、安装 ZIP、轻量验证记录与文档；现场 Blend、manifest、对比 SVG、audit
 和 Blender 自动备份不进入仓库。
+
+`v21_b125_final` 是在此发布验证之后生成的参数调优候选；它不覆盖 v10，也只有在
+重新打包并完成对应校验值更新后，才可作为新的发布包默认现场结果。
+
+## 参数调优复测（v20 / v21）
+
+验证日期：`2026-08-28`
+
+针对“微小 UV 岛可读性不足、图集留白较多、硬表面重复件方向不规整”的复测，当前
+源码默认值调整为：
+
+| 参数 | 当前默认值 | 作用边界 |
+| --- | ---: | --- |
+| `Small Island Boost / 小岛放大` | `1.25x` | 只对同时满足 Mesh 与 UV 面积阈值的微小图表做均匀放大；失败时自动回退 |
+| `Directed Cardinal Tolerance / 有向直角容差` | `3°` | 只有 landmark 与几何主轴在此误差内才采用有向 360° 符号；否则按中心对称 180° 对齐 |
+
+这两个值是独立于 `Panel Flatness` 等几何阈值的布局参数。近方形图表的 PCA 方向在
+数值上不稳定；当可靠边界已经水平/垂直时，不应仅凭 PCA 角度强制旋转。
+
+### 实测对比
+
+`v20` 是 `1.40x / 5°` 的基线产物，独立 Blender 5.2 后处理通过 `151` 项检查，
+`passed=true`、`failures=0`。早期 `v21_b125` 将面积放大改为 `1.25x`，但现场产物
+仍记录了调参前的 `5°` 容差，因此只作为面积与装箱候选。随后生成的
+`v21_b125_final` 同时写入 `1.25x / 3°`，并通过同一套 `151` 项独立审计，
+`passed=true`、`failures=0`。各份产物均保留原始 UV 层，输出写入独立的
+`VUV_Grouped_Final` 层。
+
+| 产物 / Mesh | UV 岛数 | 微小岛放大数 | 图集占用率 |
+| --- | ---: | ---: | ---: |
+| v20 / `Bullet` | `4 -> 4` | `0` | `0.7623` |
+| v20 / `Body` | `681 -> 680` | `545` | `0.9258` |
+| v20 / `Gun Head` | `209 -> 203` | `90` | `0.9789` |
+| v21_b125 / `Bullet` | `4 -> 4` | `0` | `0.7623` |
+| v21_b125 / `Body` | `681 -> 680` | `545` | `0.9901` |
+| v21_b125 / `Gun Head` | `209 -> 203` | `90` | `0.9899` |
+| v21_b125_final / `Bullet` | `4 -> 4` | `0` | `0.7623` |
+| v21_b125_final / `Body` | `681 -> 680` | `545` | `0.9798` |
+| v21_b125_final / `Gun Head` | `209 -> 203` | `90` | `0.9807` |
+
+相较于仍使用 `5°` 的 `v21_b125`，`3°` 最终候选的占用率略低（约 1 个百分点），
+换取了高各向异性图表全部落在 cardinal 方向；这是一项有意的硬表面可读性取舍，
+不是通过压缩间距或允许重叠获得的“填满”。
+
+在同一场景的独立方向探针中，使用 `3°` 容差时，`Body` 和 `Gun Head` 的高各向异性
+图表均落在水平/垂直 cardinal 方向；放宽到 `5°` 会留下少量超过 `3°` 的斜向图表。
+因此当前默认采用 `3°`，同时保留对近方形、低置信度图表的几何轴回退。
+`v21_b125_final` 的 manifest 已记录 `directed_cardinal_tolerance_degrees=3.0`；
+`Body` 的方向策略降级组件为 `47` 个，`Gun Head` 为 `2` 个，均按几何线的
+180° 等价规则审计。该最终候选没有覆盖 v20/v21 历史文件。
+
+`v21_b125_final` 的 Blend SHA-256 为
+`b85c4b33001afeae1994dc3a20e17dc412af6d2e53b7fb909f1de72005f937af`；独立 audit
+SHA-256 为
+`dbe9c1be31cb0bd9de3e4f62b82bf72f75cd4f08f37c9dbc13f81d8351c7c480`。
+
+现场文件（不进入仓库发布包）：
+
+- `release/VUV_0.5.5_FinalScene_v20/拼接武器_VUV_分组优化_v20.blend`
+- `release/VUV_0.5.5_FinalScene_v20/拼接武器_VUV_分组优化_v20_audit.json`
+- `release/VUV_0.5.5_FinalScene_v21/v21_b125/拼接武器_VUV_分组优化_v21_b125.blend`
+- `release/VUV_0.5.5_FinalScene_v21/v21_b125/拼接武器_VUV_分组优化_v21_b125_audit.json`
+- `release/VUV_0.5.5_FinalScene_v21/v21_b125_final/拼接武器_VUV_分组优化_v21_b125_final.blend`
+- `release/VUV_0.5.5_FinalScene_v21/v21_b125_final/拼接武器_VUV_分组优化_v21_b125_final_manifest.json`
+- `release/VUV_0.5.5_FinalScene_v21/v21_b125_final/拼接武器_VUV_分组优化_v21_b125_final_Viewer.html`
+- `release/VUV_0.5.5_FinalScene_v21/v21_b125_final/拼接武器_VUV_分组优化_v21_b125_final_audit.json`
