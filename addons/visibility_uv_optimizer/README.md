@@ -1,9 +1,9 @@
-# Visibility Aware UV Optimizer 0.5.5
+# Visibility Aware UV Optimizer 0.5.6
 
 Blender 3.3 through 5.2 add-on for visibility analysis and conservative UV
-generation. Version 0.5.5 adds topology-safe small-island cleanup and
-structure-aware post-layout for hard-surface weapons and props while retaining
-the 0.5.3 Legacy Smart mode.
+generation. Version 0.5.6 adds a signed geometry-direction contract on top of
+the 0.5.5 topology-safe cleanup and structure-aware hard-surface layout while
+retaining the 0.5.3 Legacy Smart mode.
 
 ## Install
 
@@ -23,11 +23,21 @@ or keep a source-control copy before replacing an approved UV layout.
 3. Set `Initial UV Mode` to `Auto`, `UV Usage` to `Auto`, and use the
    `Weapon / Prop` profile.
 4. Keep `Preserve Existing Seams`, `Respect Material Borders`, and
-   `Align Long Islands` enabled.
+   `Align Long Islands` and `Lock Texture Direction / 锁定纹理方向` enabled.
+   `Texture Up Axis / 纹理向上轴` defaults to `Auto`, which evaluates positive
+   object `Z`, then `X`, then `Y` candidates and maps the selected axis to UV
+   `+V`. Low-projection, bimodal, or locally incoherent candidates are rejected;
+   linked structure, owner, and repeat groups select a shared axis by their
+   weakest member's stability and confidence, with `Z/X/Y` used only to break
+   effective ties. Use `World` direction space
+   when several objects must share one scene-level up convention. `Auto`
+   requires every valid island to resolve and rolls back any unresolved or
+   misaligned candidate. An explicit `X`, `Y`, or `Z` is a partial contract:
+   caps normal to that axis have no geometric sign and remain unresolved.
 5. Keep `Cut Sharp Edges` disabled for imported production assets unless Sharp
    edges were deliberately authored as UV cuts.
 6. Keep `Stitch Small Islands / 缝合小岛` and
-   `Group Related Islands / 关联岛分组` enabled for the 0.5.5 hard-surface pass.
+   `Group Related Islands / 关联岛分组` enabled for the 0.5.6 hard-surface pass.
    The default `Small Island Boost / 小岛放大` value of `1.25` gives detached
    micro-mechanical parts a readable minimum presence without stretching them;
    the layout automatically retries with the boost disabled if the strict
@@ -40,9 +50,16 @@ or keep a source-control copy before replacing an approved UV layout.
    the square-biased shelf search may use a candidate whose longest packed edge
    is at most 2% larger than the compact baseline, which limits any texel
    density trade-off while closing avoidable blank strips.
-   `Directed Cardinal Tolerance / 有向直角容差` defaults to `3` degrees, so
-   hard-surface repeats are kept visibly upright while genuinely collinear
-   directional landmarks still use the 360-degree contract.
+    `Directed Cardinal Tolerance / 有向直角容差` defaults to `3` degrees, so
+    hard-surface repeats are kept visibly upright while genuinely collinear
+    directional landmarks still use the 360-degree contract. Disabling
+    `Group Related Islands` skips structural placement only; the final signed
+    direction audit still runs when texture direction is locked.
+    The signed U/V frame is used only when its parity is positive, its
+    confidence is stable, and its perpendicular-axis residual is within the
+    direction tolerance. Curved or sheared charts are therefore kept on the
+    strict single-axis `+V` alignment instead of receiving a diagonal frame
+    rotation; the downgrade and measured residual remain in the manifest.
 7. Run `Optimize Active Object UV`. A Unique result is committed only when the
    final quality gate passes.
 
@@ -77,10 +94,14 @@ The Refine Layout pipeline is:
    overlap or cohort-proximity failure restores the complete pre-operation UV
    and seam state.
 
-Recommended 0.5.5 starting values are:
+Recommended 0.5.6 starting values are:
 
 | Setting | Value |
 | --- | ---: |
+| Lock Texture Direction | On |
+| Direction Space | Object |
+| Texture Up Axis | Auto: +Z, +X, +Y |
+| Degenerate Axis Threshold | 1e-4 relative derivative signal |
 | Stitch Small Islands | On |
 | Group Related Islands | On |
 | Auto Hard Edge Angle | 70 degrees |
@@ -116,7 +137,8 @@ owner cells are kept near one another during packing. An owner cell contains
 the owner chart and all fragments assigned to it and is moved as one atomic
 unit. This is a rigid layout operation:
 
-- UV coordinates may be translated or rotated to a common cardinal direction;
+- UV charts are first rotated so the selected positive geometry axis points to
+  UV `+V`; subsequent packing uses translation and positive uniform scale only;
 - islands remain disjoint and retain the configured margin;
 - no UV island is reflected or mirrored;
 - no repeated islands are stacked or intentionally overlapped; and
@@ -153,6 +175,22 @@ preserve the configured margin, and remain free of positive-area overlap. If
 those conditions cannot all be met, structure layout fails and the complete UV
 operation is rolled back.
 
+Direction constraints are resolved in a fixed hierarchy: topology structure
+affinity, owner attachments, repeat cohorts, then one owner reconciliation
+pass. Topology and repeat locks are hard contracts. Owner attachments are soft
+until repeat selection completes, so a collection of tiny children cannot
+force a structurally important owner onto an incompatible axis. If an owner
+and child have no common tangent geometry axis, they remain separate direction
+cohorts instead of being visually straightened by a distortion-producing
+rotation.
+
+After every repeat/affinity component has been solved internally, the top-level
+component rectangles are offered to a deterministic, non-rotating MaxRects
+Best Short Side Fit pass. It can translate complete rigid components only. The
+candidate is accepted only when all rectangle dimensions and configured gaps
+remain exact, no rectangles overlap, and its longest packed edge is no longer
+than the shelf baseline; otherwise the shelf result is retained unchanged.
+
 ## Topology-safe small-island cleanup
 
 An island is a small-layout candidate only when it has at most 12 faces, its
@@ -187,12 +225,13 @@ local fallback. Unrelated valid charts are not globally re-cut, and a repair is
 kept only after local winding and degeneracy checks pass.
 
 Near-collinear ear triangles produced when an n-gon is triangulated can sit at
-the numerical winding threshold. For source triangles that are genuinely
-near-collinear, the optimizer may apply a bounded UV adjustment to establish a
-stable positive winding after packing transforms. The adjustment is reverted
-unless the complete chart revalidates; true zero-area source geometry is still
-rejected. These repair paths reduce false failures but do not guarantee that
-every invalid chart can be repaired.
+the numerical winding threshold. Rigid sub-millidegree phase changes are tried
+first. If float32 storage alone still flips a source-verified near-collinear
+ear, at most one source-welded, non-seam manifold vertex fan may move by
+`4e-7` UV units. Every step must strictly reduce the global non-positive set
+and revalidate bounds, overlap, the exact source face partition, similarity,
+and the signed direction contract. The whole island is restored if any gate
+fails; true zero-area source geometry is still rejected.
 
 ## UV contracts
 
@@ -285,7 +324,7 @@ web dependency.
 
 ## Compatibility and validation scope
 
-Version 0.5.5 supports Blender 3.3 through 5.2. Release regression targets are
+Version 0.5.6 supports Blender 3.3 through 5.2. Release regression targets are
 Blender 3.3.5 and Blender 5.2.0 LTS. The structure-layout stage uses rigid UV
 transforms and deterministic disjoint-rectangle packing available to both
 versions; it does not rely on 5.x-only mirroring or overlap behavior.

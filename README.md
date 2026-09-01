@@ -2,16 +2,43 @@
 
 面向 Blender 硬表面游戏资产的可见性分析与保守自动 UV 插件。
 
-当前试验版本：`0.5.5`
+当前试验版本：`0.5.6`
 
 ## 下载与安装
 
-- [Visibility_Aware_UV_Optimizer_0.5.5_HardSurface.zip](release/Visibility_Aware_UV_Optimizer_0.5.5_HardSurface.zip)
+- [Visibility_Aware_UV_Optimizer_0.5.6_HardSurface.zip](release/Visibility_Aware_UV_Optimizer_0.5.6_HardSurface.zip)
 
 在 Blender 中打开 `Edit > Preferences > Add-ons > Install`，选择 ZIP 并启用
 `Visibility Aware UV Optimizer`。面板位于：
 
 `3D Viewport > Sidebar(N) > UV Optimizer`
+
+## 0.5.6 方向一致性增量
+
+- 新增 `Lock Texture Direction / 锁定纹理方向`，默认开启。插件按照 Blender
+  `Align Rotation > Geometry` 的有符号 Jacobian 方法，把选定模型正轴映射到
+  UV `+V`，能够区分 90 度侧转和 180 度倒置。
+- `Texture Up Axis / 纹理向上轴` 默认 `Auto`：按 `+Z -> +X -> +Y`
+  建立候选；低投影、双峰或局部方向不连贯的轴会被排除。结构、owner-child 和
+  重复件随后选择所有成员都能稳定解析的共同轴；真正同分时才按上述顺序决胜。
+  这样既避免近法线噪声，也不会让一个弱 Z 候选压过整组稳定的 X/Y；`Object`
+  与 `World` 两种方向空间均可选。
+- 默认 `Auto` 要求每个合法岛都解析出稳定方向；任何不可解析、超出 `3°` 容差，
+  或最终 float32 回放时丢失原选轴的候选都会回滚。手动 `X/Y/Z` 只约束该轴在
+  切平面上有分量的岛，完全垂直于该轴的盖面没有可定义的正反方向。
+- 方向锁定后，原生 Pack 和结构分组 Pack 都禁止再次旋转；局部修复、重新投影、
+  Average Scale 和候选坐标回放之后都会重新对齐或复审，方向失败会恢复操作前状态。
+  即使关闭 `Group Related Islands / 关联岛分组`，Pack 前的 face-set/选轴合同仍会
+  绑定到最终只读门禁，禁止已解析轴丢失或 `Auto` 静默换轴。
+- 共同方向按 `结构亲和 -> owner-child -> 重复件 -> owner 调和` 分层解析。
+  重复件和拓扑硬锁不会被小岛多数票覆盖；无共同切向轴的盖面确定性拆组，不会
+  为了视觉同向而扭曲 UV。方向锁开启时，最终 MaxRects 只平移完整刚性结构块，
+  且最长边不优于 shelf 基线就自动回退。
+- 真实拼接武器 v31 图层 `VUV_StructuredDirection_v31`：Bullet `4 -> 4`、
+  Body `680 -> 508`、Gun Head `203 -> 160`，共安全合并 `215` 个碎岛；保存后
+  独立重开审计为 `672/672` 可解析、0 侧转、0 倒置、0 超容差，三个对象均为
+  0 overlap、0 退化且 face-set 分区与提交前完全一致。Body/Gun Head 的
+  owner-child 同轴率分别为 `70.35% / 94.87%`，重复件方向通过率为 `100%`。
 
 ## 0.5.5 核心变化
 
@@ -53,10 +80,14 @@
   坐标、active/render 身份、pin/选择、Seam、隐藏状态和分析属性。
 - 修复 Blender 5.2 Pack 前 UV 未全选的问题，同时兼容 Blender 3.3。
 
-## 0.5.5 默认参数
+## 0.5.6 默认参数
 
 | 设置 | 默认值 |
 | --- | ---: |
+| 锁定纹理方向 | 开启 |
+| 方向空间 | `Object` |
+| 纹理向上轴 | `Auto (+Z -> +X -> +Y)` |
+| 方向轴退化阈值 | `1e-4` |
 | 安全小岛缝合 | 开启 |
 | 关联结构分组 | 开启 |
 | 小岛最大面数 | `12` |
@@ -86,6 +117,7 @@
 详细资料：
 
 - [0.5.4 使用说明与 0.5.5 增量](docs/Visibility_Aware_UV_Optimizer_硬表面使用说明_0.5.4.md)
+- [0.5.6 方向一致性与验证记录](docs/Visibility_Aware_UV_Optimizer_方向一致性_0.5.6.md)
 - [0.5.5 验证记录](docs/Visibility_Aware_UV_Optimizer_验证记录_0.5.5.md)
 - [0.5.4 验证记录](docs/Visibility_Aware_UV_Optimizer_验证记录_0.5.4.md)
 - [0.5.2 历史教程](docs/Visibility_Aware_UV_Optimizer_使用教程.md)
@@ -94,7 +126,7 @@
 
 - 支持范围：Blender `3.3` 至 `5.2`
 - 发布回归版本：Blender `3.3.5`、Blender `5.2.0 LTS`
-- 0.5.5 的结构分组只使用两版共有的刚性 UV 变换和确定性矩形排布；不依赖
+- 0.5.6 的方向锁定和结构分组只使用两版共有的刚性 UV 变换和确定性矩形排布；不依赖
   Blender 5.x 专属的镜像或重叠 Pack 行为。
 - 0.5.4 Blender 5.2 ChopSword 历史实测：220 岛、4,246 个正 winding
   三角形、0 overlap、0 退化，全部位于 0-1。

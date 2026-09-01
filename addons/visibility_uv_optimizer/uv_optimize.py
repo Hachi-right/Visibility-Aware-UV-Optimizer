@@ -1124,6 +1124,47 @@ def _signed_uv_area_2(points):
     return edge_a.x * edge_b.y - edge_a.y * edge_b.x
 
 
+def _welded_chart_vertex_loops(chart, start_loop, uv_layer):
+    """Return one UV-welded vertex fan without crossing a chart cut."""
+
+    selected = {face.index: face for face in chart}
+    vertex = start_loop.vert
+    visited = {start_loop.face.index}
+    pending = [start_loop.face]
+    while pending:
+        face = pending.pop()
+        for edge in face.edges:
+            if (
+                    vertex not in edge.verts
+                    or edge.seam
+                    or len(edge.link_faces) != 2):
+                continue
+            neighbors = [
+                linked for linked in edge.link_faces
+                if linked.index in selected and linked.index != face.index
+            ]
+            if len(neighbors) != 1:
+                continue
+            neighbor = neighbors[0]
+            if neighbor.index in visited:
+                continue
+            continuous = all(
+                (_uv_at_vertex(face, edge_vertex, uv_layer)
+                 - _uv_at_vertex(neighbor, edge_vertex, uv_layer)).length_squared
+                <= 1.0e-12
+                for edge_vertex in edge.verts
+            )
+            if not continuous:
+                continue
+            visited.add(neighbor.index)
+            pending.append(neighbor)
+
+    return [
+        next(loop for loop in selected[index].loops if loop.vert == vertex)
+        for index in sorted(visited)
+    ]
+
+
 def _stabilize_near_collinear_uv_ears(
         bm, uv_layer, charts, target_relative_height=1.0e-4):
     """Nudge only numerically unstable skinny ears to positive UV winding."""
@@ -1133,6 +1174,10 @@ def _stabilize_near_collinear_uv_ears(
     for chart in charts:
         face_ids = {face.index for face in chart}
         saved_uv = _save_uv(chart, uv_layer)
+        partition_before = tuple(sorted(
+            tuple(sorted(face.index for face in component))
+            for component in _uv_charts_for_faces(chart, uv_layer)
+        ))
         changed = False
         for _iteration in range(3):
             adjusted = False
@@ -1196,8 +1241,14 @@ def _stabilize_near_collinear_uv_ears(
                         ))
                 if not positive:
                     continue
-                tri_loops[apex][uv_layer].uv = min(
+                target_loop = tri_loops[apex]
+                candidate = min(
                     positive, key=lambda item: item[0])[1]
+                delta = candidate - target_loop[uv_layer].uv
+                for welded_loop in _welded_chart_vertex_loops(
+                        chart, target_loop, uv_layer):
+                    welded_loop[uv_layer].uv = (
+                        welded_loop[uv_layer].uv + delta)
                 adjusted = True
                 changed = True
             if not adjusted:
@@ -1216,7 +1267,15 @@ def _stabilize_near_collinear_uv_ears(
                 _mirror_charts_u(mirrored, uv_layer)
             problem, mirrored = _classify_problem_charts(
                 [chart], uv_layer, bm=bm)
-        if changed and not problem and not mirrored:
+        partition_after = tuple(sorted(
+            tuple(sorted(face.index for face in component))
+            for component in _uv_charts_for_faces(chart, uv_layer)
+        ))
+        if (
+                changed
+                and not problem
+                and not mirrored
+                and partition_after == partition_before):
             stabilized += 1
         else:
             _restore_uv(chart, uv_layer, saved_uv)
@@ -1286,8 +1345,82 @@ def _project_face_planar_positive(bm, face, uv_layer, offset_u):
     return width, height
 
 
+def _face_is_convex_for_projection_fallback(face):
+    """Return whether one face is a non-degenerate convex polygon."""
+
+    loops = list(face.loops)
+    if len(loops) < 3 or face.normal.length_squared <= 1.0e-24:
+        return False
+    normal = face.normal.normalized()
+    points = [loop.vert.co for loop in loops]
+    edge_scale = max(
+        (points[(index + 1) % len(points)] - point).length_squared
+        for index, point in enumerate(points)
+    )
+    tolerance = max(edge_scale * 1.0e-12, 1.0e-24)
+    has_positive_area = False
+    for index, point in enumerate(points):
+        edge = points[(index + 1) % len(points)] - point
+        if edge.length_squared <= tolerance:
+            return False
+        for candidate in points:
+            side = edge.cross(candidate - point).dot(normal)
+            if side < -tolerance:
+                return False
+            if side > tolerance:
+                has_positive_area = True
+    return has_positive_area
+
+
+def _project_face_convex_positive(bm, face, uv_layer, offset_u):
+    """Give one valid face a deterministic convex UV when projection fails.
+
+    Some legal n-gons have an unusable aggregate face normal even though
+    Blender can tessellate them into non-degenerate source triangles.  Mapping
+    the face-loop cycle to a convex polygon preserves the tessellation winding
+    and cannot create positive-area overlap inside the face.  The existing
+    local-repair validator remains authoritative and rejects genuinely
+    degenerate source geometry.
+    """
+
+    loops = list(face.loops)
+    if (
+            len(loops) < 3
+            or not _face_is_convex_for_projection_fallback(face)):
+        return None
+    saved_uv = _save_uv([face], uv_layer)
+    angle_step = math.tau / len(loops)
+    projected = [
+        Vector((math.cos(index * angle_step), math.sin(index * angle_step)))
+        for index in range(len(loops))
+    ]
+    minimum_u = min(point.x for point in projected)
+    minimum_v = min(point.y for point in projected)
+    maximum_u = max(point.x for point in projected)
+    maximum_v = max(point.y for point in projected)
+    width = maximum_u - minimum_u
+    height = maximum_v - minimum_v
+    for loop, point in zip(loops, projected):
+        loop[uv_layer].uv = Vector((
+            point.x - minimum_u + offset_u,
+            point.y - minimum_v,
+        ))
+
+    valid, _mirrored_count = _validate_local_repair(
+        bm, uv_layer, [face])
+    if not valid:
+        _restore_uv([face], uv_layer, saved_uv)
+        return None
+    return width, height
+
+
 def _project_chart_faces_individually(
         bm, uv_layer, faces, forced_cuts):
+    faces = tuple(faces)
+    if (
+            len(faces) != 1
+            or not _face_is_convex_for_projection_fallback(faces[0])):
+        return False, 0
     edges = {
         edge.index: edge
         for face in faces
@@ -1302,6 +1435,9 @@ def _project_chart_faces_individually(
     for face in sorted(faces, key=lambda item: item.index):
         dimensions = _project_face_planar_positive(
             bm, face, uv_layer, cursor_u)
+        if dimensions is None:
+            dimensions = _project_face_convex_positive(
+                bm, face, uv_layer, cursor_u)
         if dimensions is None:
             return False, 0
         width, height = dimensions
@@ -1356,6 +1492,36 @@ def _repair_remaining_problem_charts(
             if valid:
                 mirrored_total += mirrored_count
                 continue
+
+            # ANGLE_BASED can invert a numerically near-collinear tessellation
+            # ear while the connected chart is otherwise valid and free of
+            # overlap.  Repair only that bounded numerical case, and accept it
+            # only when the exact UV face partition is unchanged and the full
+            # local validator succeeds afterwards.
+            saved_unwrap_uv = _save_uv(faces, uv_layer)
+            local_charts = _uv_charts_for_faces(faces, uv_layer)
+            partition_before = tuple(sorted(
+                tuple(sorted(face.index for face in chart))
+                for chart in local_charts
+            ))
+            stabilized = _stabilize_near_collinear_uv_ears(
+                bm, uv_layer, local_charts,
+                target_relative_height=1.0e-6)
+            if stabilized:
+                repaired_charts = _uv_charts_for_faces(faces, uv_layer)
+                partition_after = tuple(sorted(
+                    tuple(sorted(face.index for face in chart))
+                    for chart in repaired_charts
+                ))
+                if partition_after == partition_before:
+                    valid, mirrored_count = _validate_local_repair(
+                        bm, uv_layer, faces)
+                    if valid:
+                        mirrored_total += mirrored_count
+                        bmesh.update_edit_mesh(
+                            mesh, loop_triangles=False, destructive=False)
+                        continue
+            _restore_uv(faces, uv_layer, saved_unwrap_uv)
 
         valid, mirrored_count = _project_chart_faces_individually(
             bm, uv_layer, faces, forced_cuts)
@@ -1765,13 +1931,14 @@ def _normalize_uv_to_tile(bm, uv_layer, margin):
     return True
 
 
-def _pack_unique_aabb(mesh, bm, uv_layer, settings):
+def _pack_unique_aabb(
+        mesh, bm, uv_layer, settings, preserve_direction=False):
     bm, uv_layer = _select_all_uvs_for_operator(mesh, bm, uv_layer)
     result = _call_uv_operator(
         bpy.ops.uv.pack_islands,
         _operator_name='pack_islands',
         udim_source='ACTIVE_UDIM',
-        rotate=True,
+        rotate=not bool(preserve_direction),
         rotate_method='CARDINAL',
         scale=True,
         merge_overlap=False,
@@ -1788,8 +1955,9 @@ def _pack_unique_aabb(mesh, bm, uv_layer, settings):
 
 
 def _repair_and_pack_unique_charts(
-        mesh, bm, uv_layer, problem_charts, settings, forced_cuts,
-        original_seams, hard_surface_mode, force_face_projection=False):
+        obj, mesh, bm, uv_layer, problem_charts, settings, forced_cuts,
+        original_seams, hard_surface_mode, direction_contract,
+        force_face_projection=False):
     bm, uv_layer, mirrored_count = _repair_remaining_problem_charts(
         mesh,
         bm,
@@ -1799,6 +1967,21 @@ def _repair_and_pack_unique_charts(
         forced_cuts,
         force_face_projection=force_face_projection,
     )
+    if hard_surface_mode and bool(getattr(
+            settings, 'hard_surface_direction_lock', True)):
+        # Local repair can rebuild a chart from a projection with an arbitrary
+        # 90/180-degree orientation.  Reapply the signed contract before the
+        # direction-preserving AABB pack establishes final island positions.
+        _, repaired_charts = _uv_charts(bm, uv_layer)
+        direction_contract.clear()
+        for chart in repaired_charts:
+            _align_hard_surface_chart(
+                obj,
+                chart,
+                uv_layer,
+                settings,
+                direction_contract=direction_contract,
+            )
     _derive_seams_from_uv(
         bm,
         uv_layer,
@@ -1816,7 +1999,15 @@ def _repair_and_pack_unique_charts(
             "Average Islands Scale after local UV repair did not finish")
     bm, uv_layer = _refresh_edit_bmesh(mesh)
     bm, uv_layer = _pack_unique_aabb(
-        mesh, bm, uv_layer, settings)
+        mesh,
+        bm,
+        uv_layer,
+        settings,
+        preserve_direction=bool(
+            hard_surface_mode
+            and getattr(settings, 'hard_surface_direction_lock', True)
+        ),
+    )
     _derive_seams_from_uv(
         bm,
         uv_layer,
@@ -1839,8 +2030,8 @@ def _repair_and_pack_unique_charts(
 
 
 def _repair_pack_until_valid(
-        mesh, bm, uv_layer, problem_charts, settings, forced_cuts,
-        original_seams, hard_surface_mode):
+        obj, mesh, bm, uv_layer, problem_charts, settings, forced_cuts,
+        original_seams, hard_surface_mode, direction_contract):
     mirrored_total = 0
     final_charts = []
     for force_face_projection in (False, True):
@@ -1851,6 +2042,7 @@ def _repair_pack_until_valid(
             problem_charts,
             mirrored_count,
         ) = _repair_and_pack_unique_charts(
+            obj,
             mesh,
             bm,
             uv_layer,
@@ -1859,6 +2051,7 @@ def _repair_pack_until_valid(
             forced_cuts,
             original_seams,
             hard_surface_mode,
+            direction_contract,
             force_face_projection=force_face_projection,
         )
         mirrored_total += mirrored_count
@@ -1926,6 +2119,47 @@ def _audit_unique_object_mesh(mesh):
         bm.free()
 
 
+def _audit_directed_object_mesh(obj, settings, direction_contract):
+    """Require the final signed direction contract without moving UVs."""
+
+    options = _group_layout_options(settings)
+    analysis = uv_group_layout.analyze_active_uv(obj, options)
+    try:
+        analysis = uv_group_layout.rebind_geometry_axis_contract(
+            obj,
+            analysis,
+            direction_contract,
+            options,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Hard-surface UV direction gate failed: {}".format(exc)
+        ) from exc
+    audit = uv_group_layout.audit_active_uv(
+        obj,
+        analysis.face_to_island,
+        epsilon=options.uv_epsilon,
+    )
+    metrics = uv_group_layout.evaluate_layout_quality(
+        obj,
+        analysis=analysis,
+        face_to_island=analysis.face_to_island,
+        audit=audit,
+        epsilon=options.uv_epsilon,
+        options=options,
+    )
+    if not bool(metrics.get('directed_geometry_valid', False)):
+        directed = metrics.get('directed_geometry', {})
+        raise RuntimeError(
+            "Hard-surface UV direction gate failed: {} unresolved, {} "
+            "misaligned".format(
+                int(directed.get('unresolved_islands', 0)),
+                int(directed.get('misaligned_islands', 0)),
+            )
+        )
+    return metrics
+
+
 def _group_layout_options(settings, strict_source_overlap=True):
     """Map established VUV settings to the experimental post-layout stage."""
     return uv_group_layout.GroupLayoutOptions(
@@ -1942,6 +2176,24 @@ def _group_layout_options(settings, strict_source_overlap=True):
             settings, 'hard_surface_align_cardinal', True)),
         align_directed_cardinal=bool(getattr(
             settings, 'hard_surface_align_cardinal', True)),
+        align_geometry_direction=bool(getattr(
+            settings, 'hard_surface_direction_lock', True)),
+        direction_space=str(getattr(
+            settings, 'uv_direction_space', 'OBJECT')).upper(),
+        direction_axis=str(getattr(
+            settings, 'uv_direction_axis', 'AUTO')).upper(),
+        # Keep every directed stage on the same strict, configurable AUTO
+        # resolver.  Only a numerically normal axis may trigger the next
+        # fallback; the default remains the historical Z -> X -> Y order.
+        direction_auto_priority=str(getattr(
+            settings,
+            'uv_direction_auto_priority',
+            getattr(settings, 'direction_auto_priority', 'ZXY'),
+        )).upper(),
+        direction_axis_min_projection=(
+            hard_surface.GEOMETRY_AXIS_RELATIVE_EPSILON
+        ),
+        direction_residual_tolerance=math.radians(3.0),
         directed_cardinal_tolerance=max(
             min(float(getattr(
                 settings, 'uv_directed_cardinal_tolerance', math.radians(3.0)
@@ -1964,6 +2216,12 @@ def _group_layout_options(settings, strict_source_overlap=True):
             )), 1.0),
             0.0,
         ),
+        # The long-edge cohort pass is intentionally opt-in.  Existing
+        # property groups do not expose it yet, but scripted callers can set
+        # ``uv_cohere_geometry_long_edge`` without changing older defaults.
+        cohere_geometry_long_edge=bool(getattr(
+            settings, 'uv_cohere_geometry_long_edge', False
+        )),
         small_island_scale_boost=max(
             min(float(getattr(
                 settings, 'uv_small_island_scale_boost', 1.25
@@ -1972,7 +2230,96 @@ def _group_layout_options(settings, strict_source_overlap=True):
         ),
         strict_positive_winding=True,
         strict_source_overlap=bool(strict_source_overlap),
+        continuity_block_enabled=bool(getattr(
+            settings, 'uv_continuity_block_enabled', True)),
+        continuity_block_target_members=max(int(getattr(
+            settings, 'uv_continuity_block_target_members', 32)), 2),
+        continuity_block_max_members=max(int(getattr(
+            settings, 'uv_continuity_block_max_members', 48)), 2),
+        continuity_component_max_groups=max(int(getattr(
+            settings, 'uv_continuity_component_max_groups', 6)), 2),
+        continuity_component_max_members=max(int(getattr(
+            settings, 'uv_continuity_component_max_members', 96)), 2),
+        continuity_block_max_diameter_ratio=max(min(float(getattr(
+            settings, 'uv_continuity_block_max_diameter_ratio', 0.35)), 1.0), 1.0e-6),
     )
+
+
+def _hard_surface_direction_axis_priority(settings):
+    axis = str(getattr(settings, 'uv_direction_axis', 'AUTO')).upper()
+    if axis == 'AUTO':
+        configured = getattr(
+            settings,
+            'uv_direction_auto_priority',
+            getattr(settings, 'direction_auto_priority', 'ZXY'),
+        )
+        try:
+            # The group-layout resolver is the canonical normalizer.  Pass a
+            # tuple to hard_surface so compact strings such as ``YZX`` are
+            # interpreted as three axes rather than one invalid token.
+            return uv_group_layout._direction_axis_order(
+                'AUTO', configured
+            )
+        except (TypeError, ValueError):
+            return hard_surface.DEFAULT_GEOMETRY_AXIS_PRIORITY
+    if axis in {'X', 'Y', 'Z'}:
+        return (axis,)
+    return hard_surface.DEFAULT_GEOMETRY_AXIS_PRIORITY
+
+
+def _align_hard_surface_chart(
+        obj, chart, uv_layer, settings, direction_contract=None):
+    """Apply the directed contract when local geometry axes are available."""
+
+    face_key = tuple(sorted(int(face.index) for face in chart))
+    direction_lock = bool(getattr(
+        settings, 'hard_surface_direction_lock', True))
+    direction_space = str(getattr(
+        settings, 'uv_direction_space', 'OBJECT')).upper()
+    if direction_lock and direction_space in {'OBJECT', 'WORLD'}:
+        geometry_matrix = (
+            obj.matrix_world.to_3x3()
+            if direction_space == 'WORLD'
+            else None
+        )
+        report = None
+        try:
+            report = hard_surface.align_island_geometry_report(
+                chart,
+                uv_layer,
+                axis_priority=_hard_surface_direction_axis_priority(settings),
+                geometry_matrix=geometry_matrix,
+                write=False,
+            )
+        except Exception:
+            pass
+        aligned = hard_surface.align_island_geometry(
+            chart,
+            uv_layer,
+            axis_priority=_hard_surface_direction_axis_priority(settings),
+            geometry_matrix=geometry_matrix,
+        )
+        if direction_contract is not None:
+            selected_axis = (
+                report.selected_axis
+                if (
+                    aligned
+                    and report is not None
+                    and not report.degenerate
+                )
+                else None
+            )
+            direction_contract[face_key] = (
+                selected_axis,
+                direction_space,
+            )
+        if aligned:
+            return True
+    elif direction_contract is not None:
+        direction_contract[face_key] = (None, direction_space)
+    if bool(getattr(settings, 'hard_surface_align_cardinal', True)):
+        return hard_surface.align_island_cardinal(chart, uv_layer)
+    return False
 
 
 def optimize_active_object(context, obj, settings):
@@ -2013,6 +2360,7 @@ def optimize_active_object(context, obj, settings):
         'accepted': 0,
     }
     group_layout_result = None
+    direction_contract = {}
     group_layout_disabled_reason = 'not_hard_surface_unique'
     refine_source_audit = None
     refine_cleanup_audit = None
@@ -2157,7 +2505,7 @@ def optimize_active_object(context, obj, settings):
                     'CYLINDER_SIDE', 'CYLINDER'
                 }
                 if chart_bounded and classes and classes <= band_classes:
-                    hard_surface.align_island_cardinal(region, uv_layer)
+                    _align_hard_surface_chart(obj, region, uv_layer, settings)
             _derive_seams_from_uv(
                 bm,
                 uv_layer,
@@ -2461,10 +2809,18 @@ def optimize_active_object(context, obj, settings):
             _scale_charts_by_visibility(
                 bm, uv_layer, final_charts, visibility, detail_values, settings,
                 hard_surface_mode=hard_surface_mode)
-            if hard_surface_mode and getattr(
-                    settings, 'hard_surface_align_cardinal', True):
+            if hard_surface_mode and (
+                    getattr(settings, 'hard_surface_direction_lock', True)
+                    or getattr(settings, 'hard_surface_align_cardinal', True)):
+                direction_contract.clear()
                 for chart in final_charts:
-                    hard_surface.align_island_cardinal(chart, uv_layer)
+                    _align_hard_surface_chart(
+                        obj,
+                        chart,
+                        uv_layer,
+                        settings,
+                        direction_contract=direction_contract,
+                    )
             bm, uv_layer = _select_all_uvs_for_operator(
                 mesh, bm, uv_layer)
             if hard_surface_mode:
@@ -2552,6 +2908,7 @@ def optimize_active_object(context, obj, settings):
                     problem_charts,
                     local_mirrored,
                 ) = _repair_pack_until_valid(
+                    obj,
                     mesh,
                     bm,
                     uv_layer,
@@ -2560,6 +2917,7 @@ def optimize_active_object(context, obj, settings):
                     forced_cuts,
                     original_seams,
                     hard_surface_mode,
+                    direction_contract,
                 )
                 mirrored_chart_count += local_mirrored
             if problem_charts:
@@ -2574,7 +2932,17 @@ def optimize_active_object(context, obj, settings):
                 # but its disjoint rectangles provide a deterministic safety
                 # fallback before the transaction is rejected.
                 bm, uv_layer = _pack_unique_aabb(
-                    mesh, bm, uv_layer, settings)
+                    mesh,
+                    bm,
+                    uv_layer,
+                    settings,
+                    preserve_direction=bool(
+                        hard_surface_mode
+                        and getattr(
+                            settings, 'hard_surface_direction_lock', True
+                        )
+                    ),
+                )
                 _derive_seams_from_uv(
                     bm,
                     uv_layer,
@@ -2612,6 +2980,7 @@ def optimize_active_object(context, obj, settings):
                         problem_charts,
                         local_mirrored,
                     ) = _repair_pack_until_valid(
+                        obj,
                         mesh,
                         bm,
                         uv_layer,
@@ -2620,6 +2989,7 @@ def optimize_active_object(context, obj, settings):
                         forced_cuts,
                         original_seams,
                         hard_surface_mode,
+                        direction_contract,
                     )
                     mirrored_chart_count += local_mirrored
                 if problem_charts:
@@ -2663,6 +3033,16 @@ def optimize_active_object(context, obj, settings):
         if uv_usage == 'UNIQUE':
             post_layout_final_count, _post_layout_audit = (
                 _audit_unique_object_mesh(mesh))
+            if (
+                    hard_surface_mode
+                    and bool(getattr(
+                        settings, 'hard_surface_direction_lock', True))
+                    and group_layout_result is None):
+                _audit_directed_object_mesh(
+                    obj,
+                    settings,
+                    direction_contract,
+                )
         write_face_float(mesh, detail_values, name='vuv_detail_score')
 
         if group_layout_result is None:

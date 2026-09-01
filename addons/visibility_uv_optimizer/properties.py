@@ -275,7 +275,7 @@ class VUVSettings(bpy.types.PropertyGroup):
         items=(
             ('WEAPON', "Weapon / Prop", "Aggressive panel, bevel, strip, and cylinder separation"),
             ('GENERAL', "General Hard Surface", "Use the same rules with less aggressive angle cuts"),
-            ('DEFAULT', "Default", "Use the standard 0.5.5 hard-surface thresholds"),
+            ('DEFAULT', "Default", "Use the current hard-surface thresholds"),
         ),
         default='WEAPON',
         update=_update_hard_surface_profile,
@@ -320,6 +320,87 @@ class VUVSettings(bpy.types.PropertyGroup):
         name="Align Long Islands",
         description="Rotate long UV islands to the nearest horizontal or vertical axis",
         default=True,
+    )
+    hard_surface_direction_lock: BoolProperty(
+        name="Lock Texture Direction / 锁定纹理方向",
+        description=(
+            "Map a positive model axis to UV +V so arrows, letters, and checker "
+            "orientation stay upright; 将模型正轴映射到 UV +V，避免棋盘格、"
+            "箭头和文字出现 90 度侧转或 180 度倒置"
+        ),
+        default=True,
+    )
+    uv_direction_space: EnumProperty(
+        name="Direction Space / 方向空间",
+        description="Choose whether the texture-up rule follows object-local or world axes",
+        items=(
+            (
+                'OBJECT',
+                "Object / 对象",
+                "Use object-local axes so UV orientation is stable when the object moves or rotates",
+            ),
+            (
+                'WORLD',
+                "World / 世界",
+                "Use world axes so separate scene objects share one visual up direction",
+            ),
+        ),
+        default='OBJECT',
+    )
+    uv_direction_axis: EnumProperty(
+        name="Texture Up Axis / 纹理向上轴",
+        description="Positive model axis that should point toward UV +V",
+        items=(
+            (
+                'AUTO',
+                "Auto / 自动",
+                "Resolve a stable tangent axis using the configurable AUTO priority below",
+            ),
+            ('Z', "+Z", "Map positive Z to UV +V where Z has a tangent-plane component"),
+            ('X', "+X", "Map positive X to UV +V where X has a tangent-plane component"),
+            ('Y', "+Y", "Map positive Y to UV +V where Y has a tangent-plane component"),
+        ),
+        default='AUTO',
+    )
+    uv_direction_auto_priority: EnumProperty(
+        name="AUTO Axis Priority / 自动轴优先级",
+        description=(
+            "Fallback order used when Texture Up Axis is Auto; the first axis "
+            "with a stable tangent projection wins"
+        ),
+        items=(
+            (
+                'ZXY',
+                "Z - X - Y",
+                "Legacy default: prefer +Z, then +X, then +Y",
+            ),
+            (
+                'ZYX',
+                "Z - Y - X",
+                "Prefer +Z, then +Y, then +X",
+            ),
+            (
+                'XZY',
+                "X - Z - Y",
+                "Prefer +X, then +Z, then +Y",
+            ),
+            (
+                'XYZ',
+                "X - Y - Z",
+                "Prefer +X, then +Y, then +Z",
+            ),
+            (
+                'YZX',
+                "Y - Z - X",
+                "Weapon longitudinal default: prefer +Y, then +Z, then +X",
+            ),
+            (
+                'YXZ',
+                "Y - X - Z",
+                "Prefer +Y, then +X, then +Z",
+            ),
+        ),
+        default='ZXY',
     )
     hard_surface_hidden_collapse: BoolProperty(
         name="Collapse Hidden Overrides",
@@ -544,6 +625,48 @@ class VUVSettings(bpy.types.PropertyGroup):
         max=1.0,
         precision=3,
         subtype='FACTOR',
+    )
+    small_structural_cleanup_enabled: BoolProperty(
+        name="Structural Fallback / 结构补缝",
+        description=(
+            "When no strict candidate remains, conservatively stitch local "
+            "panel, bevel, or general fragments without crossing hard cuts; "
+            "严格候选为空时，保守缝合局部面板、倒角或普通碎片且不跨越强制切缝"
+        ),
+        default=True,
+    )
+    small_structural_boundary_ratio: FloatProperty(
+        name="Fallback Boundary / 补缝共享边",
+        description=(
+            "Minimum shared-perimeter ratio for the structural fallback; "
+            "结构补缝所需的最小共享周长比例"
+        ),
+        default=0.08,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        subtype='FACTOR',
+    )
+    small_structural_angle: FloatProperty(
+        name="Fallback Angle / 补缝角度",
+        description=(
+            "Maximum face angle for a structural fallback candidate; "
+            "结构补缝候选允许的最大面夹角"
+        ),
+        default=math.radians(60.0),
+        min=0.0,
+        max=math.pi,
+        subtype='ANGLE',
+    )
+    small_structural_max_merges: IntProperty(
+        name="Fallback Limit / 补缝上限",
+        description=(
+            "Maximum accepted structural fallback stitches per object; "
+            "每个对象最多接受的结构补缝次数"
+        ),
+        default=160,
+        min=0,
+        max=1000,
     )
     small_cleanup_p95: FloatProperty(
         name="Cleanup P95 / 清理 P95",

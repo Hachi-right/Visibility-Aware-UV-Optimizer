@@ -19,4 +19,4 @@
 | 主题 | 用途 |
 | --- | --- |
 | `差异列表.md` | 当前 author 私有代码地图与公共代码地图的缺失、过期和冲突记录。 |
-| `visibility-aware-uv-optimizer.md` | VUV 插件注册、UI、UV 合同、硬表面分类、优化主链和发布入口。 |
+| `visibility-aware-uv-optimizer.md` | VUV 插件注册、UI、UV 合同、有符号方向门禁、硬表面分类、优化主链和发布入口。 |

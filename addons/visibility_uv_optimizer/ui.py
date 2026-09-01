@@ -90,6 +90,13 @@ class VUV_PT_MainPanel(bpy.types.Panel):
             row.prop(settings, "hard_surface_planar_angle")
             box.prop(settings, "hard_surface_respect_sharp")
             box.prop(settings, "hard_surface_align_cardinal")
+            box.prop(settings, "hard_surface_direction_lock")
+            direction = box.column(align=True)
+            direction.enabled = settings.hard_surface_direction_lock
+            row = direction.row(align=True)
+            row.prop(settings, "uv_direction_space")
+            row.prop(settings, "uv_direction_axis")
+            direction.prop(settings, "uv_direction_auto_priority")
             box.prop(settings, "hard_surface_hidden_collapse")
         if settings.initial_uv_mode != 'PRESERVE_LAYOUT':
             box.prop(settings, "smart_angle")

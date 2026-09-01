@@ -76,6 +76,47 @@ def _make_near_planar_ngon(name):
     return obj
 
 
+def _make_convex_ngon(name, vertex_count=7):
+    vertices = [
+        (
+            math.cos(2.0 * math.pi * index / vertex_count),
+            math.sin(2.0 * math.pi * index / vertex_count),
+            0.0,
+        )
+        for index in range(vertex_count)
+    ]
+    mesh = bpy.data.meshes.new(name + "Mesh")
+    mesh.from_pydata(vertices, [], [tuple(range(vertex_count))])
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    for item in uv_layer.data:
+        item.uv = Vector((0.0, 0.0))
+    mesh.update()
+    return obj
+
+
+def _make_concave_ngon(name):
+    vertices = (
+        (0.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (0.0, 2.0, 0.0),
+    )
+    mesh = bpy.data.meshes.new(name + "Mesh")
+    mesh.from_pydata(vertices, [], [tuple(range(len(vertices)))])
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    for item in uv_layer.data:
+        item.uv = Vector((0.0, 0.0))
+    mesh.update()
+    return obj
+
+
 def _make_skinny_triangle(name):
     mesh = bpy.data.meshes.new(name + "Mesh")
     mesh.from_pydata(
@@ -100,6 +141,34 @@ def _make_skinny_triangle(name):
     )
     for loop in mesh.loops:
         uv_layer.data[loop.index].uv = coordinates[loop.vertex_index]
+    mesh.update()
+    return obj
+
+
+def _make_connected_quad_strip(name, face_count):
+    vertices = [
+        (float(index), float(row), 0.0)
+        for row in range(2)
+        for index in range(face_count + 1)
+    ]
+    row_length = face_count + 1
+    faces = [
+        (
+            index,
+            index + 1,
+            row_length + index + 1,
+            row_length + index,
+        )
+        for index in range(face_count)
+    ]
+    mesh = bpy.data.meshes.new(name + "Mesh")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    for item in uv_layer.data:
+        item.uv = Vector((0.0, 0.0))
     mesh.update()
     return obj
 
@@ -152,6 +221,70 @@ def _make_small_fragment_pair(name, artist_seam):
     shared_edge.use_seam = bool(artist_seam)
     mesh.update()
     return obj, shared_edge.index
+
+
+def _small_cleanup_fixture(
+        name,
+        *,
+        face_classes=("PANEL", "BEVEL"),
+        locked=False,
+        forced=False,
+        material_mismatch=False,
+        reject_stretch=False):
+    _clear_scene()
+    obj, shared_edge_index = _make_small_fragment_pair(name, False)
+    _activate(obj)
+    bm, uv_layer = _enter_edit(obj)
+    bm.edges[shared_edge_index].seam = True
+    if material_mismatch:
+        bm.faces[1].material_index = 1
+    bmesh.update_edit_mesh(
+        obj.data, loop_triangles=False, destructive=False)
+    bm, uv_layer = uv_optimize._refresh_edit_bmesh(obj.data)
+    settings = SimpleNamespace(
+        small_cleanup_enabled=True,
+        small_island_faces=1,
+        small_island_area_ratio=0.1,
+        small_uv_area_ratio=0.1,
+        small_boundary_ratio=0.25,
+        small_structural_cleanup_enabled=True,
+        small_structural_boundary_ratio=0.08,
+        small_structural_angle=math.radians(60.0),
+        small_structural_max_merges=4,
+        small_cleanup_tests=8,
+        small_cleanup_max_merges=4,
+        small_cleanup_p95=1.35,
+        small_cleanup_max_stretch=2.0,
+        max_p95_stretch=1.5,
+        max_stretch=3.0,
+        respect_sharp=False,
+        island_margin=0.002,
+    )
+    constraints = SimpleNamespace(
+        locked_cuts={shared_edge_index} if locked else set(),
+        forced_cuts={shared_edge_index} if forced else set(),
+        face_classes={
+            index: face_classes[index]
+            for index in range(len(face_classes))
+        },
+    )
+    original_try_merge = uv_optimize._try_merge
+    if reject_stretch:
+        uv_optimize._try_merge = (
+            lambda *_args, **_kwargs: (False, "STRETCH")
+        )
+    try:
+        result = uv_optimize.small_island_cleanup.stitch_small_islands(
+            obj,
+            bm,
+            uv_layer,
+            settings,
+            constraints,
+            uv_optimize,
+        )
+    finally:
+        uv_optimize._try_merge = original_try_merge
+    return obj, shared_edge_index, result
 
 
 def _topology_signature(mesh):
@@ -235,24 +368,33 @@ def _test_tree_cut_unwrap():
     assert _topology_signature(obj.data) == before_topology
 
 
-def _test_face_projection_fallback():
+def _test_single_convex_face_projection_fallback():
     _clear_scene()
-    obj = _make_degenerate_cube("VUV_LocalRepairProjection")
+    obj = _make_convex_ngon("VUV_LocalRepairProjection")
     before_topology = _topology_signature(obj.data)
     bm, uv_layer = _enter_edit(obj)
     _, charts = uv_optimize._uv_charts(bm, uv_layer)
     problem, _mirrored = uv_optimize._classify_problem_charts(
         charts, uv_layer, bm=bm)
     assert len(problem) == 1
+    assert uv_optimize._face_is_convex_for_projection_fallback(
+        bm.faces[0])
 
     original_call = uv_optimize._call_uv_operator
+    original_projection = uv_optimize._project_face_planar_positive
+    fallback_triggered = {'value': False}
 
     def cancel_unwrap(operator, _operator_name=None, **kwargs):
         if _operator_name == 'unwrap':
             return {'CANCELLED'}
         return original_call(operator, _operator_name=_operator_name, **kwargs)
 
+    def fail_primary_projection(*_args, **_kwargs):
+        fallback_triggered['value'] = True
+        return None
+
     uv_optimize._call_uv_operator = cancel_unwrap
+    uv_optimize._project_face_planar_positive = fail_primary_projection
     forced_cuts = set()
     try:
         bm, uv_layer, _mirrored_count = (
@@ -267,10 +409,85 @@ def _test_face_projection_fallback():
         )
     finally:
         uv_optimize._call_uv_operator = original_call
+        uv_optimize._project_face_planar_positive = original_projection
+    assert fallback_triggered['value']
     local_charts = uv_optimize._uv_charts_for_faces(
         list(bm.faces), uv_layer)
-    assert len(local_charts) == len(bm.faces), len(local_charts)
+    assert len(local_charts) == 1, len(local_charts)
     _assert_locally_valid(bm, uv_layer)
+    bmesh.update_edit_mesh(
+        obj.data, loop_triangles=True, destructive=False)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    assert _topology_signature(obj.data) == before_topology
+
+
+def _test_multi_face_chart_is_not_fragmented_by_projection_fallback():
+    _clear_scene()
+    face_count = 38
+    obj = _make_connected_quad_strip(
+        "VUV_LocalRepairMultiFaceGuard", face_count)
+    before_topology = _topology_signature(obj.data)
+    bm, uv_layer = _enter_edit(obj)
+    _, charts = uv_optimize._uv_charts(bm, uv_layer)
+    problem, _mirrored = uv_optimize._classify_problem_charts(
+        charts, uv_layer, bm=bm)
+    assert len(problem) == 1
+    assert len(problem[0]) == face_count
+    saved_uv = uv_optimize._save_uv(list(bm.faces), uv_layer)
+    saved_seams = tuple(bool(edge.seam) for edge in bm.edges)
+    original_projection = uv_optimize._project_face_planar_positive
+
+    def projection_must_not_run(*_args, **_kwargs):
+        raise AssertionError("multi-face chart entered face projection fallback")
+
+    uv_optimize._project_face_planar_positive = projection_must_not_run
+    forced_cuts = set()
+    try:
+        valid, mirrored_count = uv_optimize._project_chart_faces_individually(
+            bm, uv_layer, problem[0], forced_cuts)
+    finally:
+        uv_optimize._project_face_planar_positive = original_projection
+    assert not valid and mirrored_count == 0
+    assert not forced_cuts
+    assert tuple(bool(edge.seam) for edge in bm.edges) == saved_seams
+    for face in bm.faces:
+        for loop, uv in zip(face.loops, saved_uv[face.index]):
+            assert (loop[uv_layer].uv - uv).length < 1.0e-12
+    local_charts = uv_optimize._uv_charts_for_faces(
+        list(bm.faces), uv_layer)
+    assert len(local_charts) == 1, len(local_charts)
+    bmesh.update_edit_mesh(
+        obj.data, loop_triangles=True, destructive=False)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    assert _topology_signature(obj.data) == before_topology
+
+
+def _test_single_concave_face_does_not_use_convex_fallback():
+    _clear_scene()
+    obj = _make_concave_ngon("VUV_LocalRepairConcaveGuard")
+    before_topology = _topology_signature(obj.data)
+    bm, uv_layer = _enter_edit(obj)
+    _, charts = uv_optimize._uv_charts(bm, uv_layer)
+    problem, _mirrored = uv_optimize._classify_problem_charts(
+        charts, uv_layer, bm=bm)
+    assert len(problem) == 1 and len(problem[0]) == 1
+    assert not uv_optimize._face_is_convex_for_projection_fallback(
+        bm.faces[0])
+
+    original_projection = uv_optimize._project_face_planar_positive
+
+    def projection_must_not_run(*_args, **_kwargs):
+        raise AssertionError("concave face entered convex projection fallback")
+
+    uv_optimize._project_face_planar_positive = projection_must_not_run
+    forced_cuts = set()
+    try:
+        valid, mirrored_count = uv_optimize._project_chart_faces_individually(
+            bm, uv_layer, problem[0], forced_cuts)
+    finally:
+        uv_optimize._project_face_planar_positive = original_projection
+    assert not valid and mirrored_count == 0
+    assert not forced_cuts
     bmesh.update_edit_mesh(
         obj.data, loop_triangles=True, destructive=False)
     bpy.ops.object.mode_set(mode='OBJECT')
@@ -442,6 +659,95 @@ def _test_skinny_ear_stabilization():
     assert shared_edge.seam
 
 
+def _test_welded_vertex_fan_stops_at_chart_cuts():
+    _clear_scene()
+    obj = _make_skinny_triangle("VUV_LocalRepairWeldedFan")
+    bm, uv_layer = _enter_edit(obj)
+    face = bm.faces[0]
+    neighbor = bm.faces[1]
+    start_loop = next(loop for loop in face.loops if loop.vert.index == 2)
+    shared_edge = next(
+        edge for edge in bm.edges
+        if {vert.index for vert in edge.verts} == {1, 2}
+    )
+
+    welded = uv_optimize._welded_chart_vertex_loops(
+        [face, neighbor], start_loop, uv_layer)
+    assert {loop.face.index for loop in welded} == {0, 1}
+
+    shared_edge.seam = True
+    cut_by_seam = uv_optimize._welded_chart_vertex_loops(
+        [face, neighbor], start_loop, uv_layer)
+    assert [loop.face.index for loop in cut_by_seam] == [0]
+
+    shared_edge.seam = False
+    neighbor_endpoint = next(
+        loop for loop in neighbor.loops if loop.vert.index == 1)
+    neighbor_endpoint[uv_layer].uv.x += 0.25
+    cut_by_uv_split = uv_optimize._welded_chart_vertex_loops(
+        [face, neighbor], start_loop, uv_layer)
+    assert [loop.face.index for loop in cut_by_uv_split] == [0]
+
+
+def _test_multi_face_local_repair_stabilizes_skinny_ear():
+    _clear_scene()
+    obj = _make_skinny_triangle("VUV_LocalRepairConnectedSkinnyEar")
+    before_topology = _topology_signature(obj.data)
+    bm, uv_layer = _enter_edit(obj)
+    _, charts = uv_optimize._uv_charts(bm, uv_layer)
+    problem, _mirrored = uv_optimize._classify_problem_charts(
+        charts, uv_layer, bm=bm)
+    assert len(problem) == 1 and len(problem[0]) == 2
+    partition_before = tuple(sorted(
+        tuple(sorted(face.index for face in chart))
+        for chart in uv_optimize._uv_charts_for_faces(
+            list(bm.faces), uv_layer)
+    ))
+
+    original_call = uv_optimize._call_uv_operator
+    original_projection = uv_optimize._project_chart_faces_individually
+
+    def keep_connected_skinny_uv(operator, _operator_name=None, **kwargs):
+        if _operator_name == 'unwrap':
+            return {'FINISHED'}
+        return original_call(
+            operator, _operator_name=_operator_name, **kwargs)
+
+    def projection_must_not_run(*_args, **_kwargs):
+        raise AssertionError(
+            "connected skinny-ear chart unexpectedly used projection fallback")
+
+    uv_optimize._call_uv_operator = keep_connected_skinny_uv
+    uv_optimize._project_chart_faces_individually = projection_must_not_run
+    forced_cuts = set()
+    try:
+        bm, uv_layer, _mirrored_count = (
+            uv_optimize._repair_remaining_problem_charts(
+                obj.data,
+                bm,
+                uv_layer,
+                problem,
+                SimpleNamespace(island_margin=0.002),
+                forced_cuts,
+            )
+        )
+    finally:
+        uv_optimize._call_uv_operator = original_call
+        uv_optimize._project_chart_faces_individually = original_projection
+
+    partition_after = tuple(sorted(
+        tuple(sorted(face.index for face in chart))
+        for chart in uv_optimize._uv_charts_for_faces(
+            list(bm.faces), uv_layer)
+    ))
+    assert partition_after == partition_before
+    _assert_locally_valid(bm, uv_layer)
+    bmesh.update_edit_mesh(
+        obj.data, loop_triangles=True, destructive=False)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    assert _topology_signature(obj.data) == before_topology
+
+
 def _test_refine_layout_does_not_reseed_valid_uv():
     _clear_scene()
     obj = _make_degenerate_cube("VUV_RefineExistingLayout")
@@ -521,7 +827,11 @@ def _test_refine_layout_does_not_reseed_valid_uv():
     assert _topology_signature(obj.data) == before_topology
 
 
-def _run_refine_fragment_pair(artist_seam, inflate_accepted_merge=1.0):
+def _run_refine_fragment_pair(
+        artist_seam,
+        inflate_accepted_merge=1.0,
+        preserve_seams=True,
+        structural_classes=False):
     _clear_scene()
     suffix = "Artist" if artist_seam else "Derived"
     obj, shared_edge_index = _make_small_fragment_pair(
@@ -534,7 +844,7 @@ def _run_refine_fragment_pair(artist_seam, inflate_accepted_merge=1.0):
     settings.initial_uv_mode = 'REFINE_LAYOUT'
     settings.uv_usage = 'UNIQUE'
     settings.max_merge_tests = 0
-    settings.preserve_seams = True
+    settings.preserve_seams = bool(preserve_seams)
     settings.respect_materials = True
     settings.hard_surface_respect_sharp = False
     settings.hard_surface_hidden_collapse = False
@@ -554,6 +864,8 @@ def _run_refine_fragment_pair(artist_seam, inflate_accepted_merge=1.0):
 
     def track_classifier(*args, **kwargs):
         constraints = original_classifier(*args, **kwargs)
+        if structural_classes:
+            constraints.face_classes.update({0: 'PANEL', 1: 'BEVEL'})
         classifications.append({
             'locked': set(constraints.locked_cuts),
             'forced': set(constraints.forced_cuts),
@@ -630,6 +942,23 @@ def _test_refine_derived_uv_cut_allows_safe_small_cleanup():
     assert not obj.data.edges[shared_edge_index].use_seam
 
 
+def _test_refine_unlocked_seam_allows_structural_cleanup():
+    obj, shared_edge_index, result, classification = (
+        _run_refine_fragment_pair(
+            artist_seam=True,
+            preserve_seams=False,
+            structural_classes=True,
+        )
+    )
+    assert shared_edge_index not in classification['locked'], classification
+    assert shared_edge_index not in classification['forced'], classification
+    assert result.small_cleanup_initial_charts == 2
+    assert result.small_cleanup_final_charts == 1
+    assert result.small_cleanup_merges == 1
+    assert result.small_cleanup_summary.get('accepted_structural', 0) == 1
+    assert not obj.data.edges[shared_edge_index].use_seam
+
+
 def _test_refine_cleanup_normalizes_unwrap_density_explosion():
     obj, shared_edge_index, result, _classification = (
         _run_refine_fragment_pair(
@@ -646,6 +975,57 @@ def _test_refine_cleanup_normalizes_unwrap_density_explosion():
     assert summary.get("rejected_texel_density", 0) == 0
     assert not obj.data.edges[shared_edge_index].use_seam
     uv_optimize._audit_unique_object_mesh(obj.data)
+
+
+def _test_structural_small_fragment_lane():
+    obj, shared_edge_index, result = _small_cleanup_fixture(
+        "VUV_StructuralPanelBevel")
+    assert result["accepted"] == 1, result
+    assert result["accepted_strict"] == 0, result
+    assert result["accepted_structural"] == 1, result
+    assert result["final_charts"] == 1, result
+    assert result["filter_funnel"].get("class_mismatch", 0) >= 1
+    assert result["filter_funnel"].get("structural_eligible", 0) >= 1
+    assert not obj.data.edges[shared_edge_index].use_seam
+
+
+def _test_structural_lane_keeps_hard_boundaries():
+    cases = (
+        ("Locked", {"locked": True}, "hard_cut"),
+        ("Forced", {"forced": True}, "hard_cut"),
+        (
+            "Material",
+            {"material_mismatch": True},
+            "boundary_material_mismatch",
+        ),
+        (
+            "CylinderCap",
+            {"face_classes": ("PANEL", "RADIAL_CAP")},
+            "structural_class_mismatch",
+        ),
+    )
+    for suffix, kwargs, reason in cases:
+        _obj, _edge_index, result = _small_cleanup_fixture(
+            "VUV_StructuralReject" + suffix,
+            **kwargs
+        )
+        assert result["accepted"] == 0, (suffix, result)
+        assert result["final_charts"] == 2, (suffix, result)
+        assert result["filter_funnel"].get(reason, 0) >= 1, (
+            suffix, result
+        )
+
+
+def _test_structural_lane_rolls_back_stretch_rejection():
+    obj, shared_edge_index, result = _small_cleanup_fixture(
+        "VUV_StructuralStretchRollback",
+        reject_stretch=True,
+    )
+    assert result["accepted"] == 0, result
+    assert result["rejected_stretch"] == 1, result
+    assert result["final_charts"] == 2, result
+    bm, _uv_layer = uv_optimize._refresh_edit_bmesh(obj.data)
+    assert bm.edges[shared_edge_index].seam
 
 
 def _test_final_pack_gate_repair():
@@ -694,6 +1074,89 @@ def _test_final_pack_gate_repair():
     assert fallback_calls['count'] >= 1
     assert result.safe_pack_retry
     assert result.repaired_charts >= 1
+    uv_optimize._audit_unique_object_mesh(obj.data)
+    assert _topology_signature(obj.data) == before_topology
+
+
+def _test_hard_surface_repair_reapplies_direction():
+    _clear_scene()
+    obj = _make_degenerate_cube("VUV_DirectedRepair")
+    before_topology = _topology_signature(obj.data)
+    _activate(obj)
+    settings = bpy.context.scene.vuv_settings
+    settings.initial_uv_mode = 'HARD_SURFACE'
+    settings.uv_usage = 'UNIQUE'
+    settings.max_merge_tests = 0
+    settings.preserve_seams = False
+    settings.small_cleanup_enabled = False
+    settings.uv_group_layout_enabled = False
+    settings.hard_surface_direction_lock = True
+    settings.uv_direction_space = 'OBJECT'
+    settings.uv_direction_axis = 'AUTO'
+
+    original_call = uv_optimize._call_uv_operator
+    original_fallback = uv_optimize._repair_remaining_problem_charts
+    original_align = uv_optimize.hard_surface.align_island_geometry
+    pack_calls = {'count': 0}
+    fallback_calls = {'count': 0}
+    repair_returned = {'value': False}
+    post_repair_reports = []
+
+    def inject_after_first_pack(operator, _operator_name=None, **kwargs):
+        result = original_call(
+            operator, _operator_name=_operator_name, **kwargs)
+        if _operator_name == 'pack_islands':
+            pack_calls['count'] += 1
+            if pack_calls['count'] == 1 and 'FINISHED' in result:
+                bm, uv_layer = uv_optimize._refresh_edit_bmesh(obj.data)
+                point = bm.faces[0].loops[0][uv_layer].uv.copy()
+                for loop in bm.faces[0].loops:
+                    loop[uv_layer].uv = point
+                bmesh.update_edit_mesh(
+                    obj.data, loop_triangles=False, destructive=False)
+        return result
+
+    def track_fallback(*args, **kwargs):
+        fallback_calls['count'] += 1
+        result = original_fallback(*args, **kwargs)
+        repair_returned['value'] = True
+        return result
+
+    def track_alignment(faces, uv_layer, **kwargs):
+        result = original_align(faces, uv_layer, **kwargs)
+        if repair_returned['value']:
+            report = uv_optimize.hard_surface.align_island_geometry_report(
+                faces,
+                uv_layer,
+                axis_priority=kwargs.get(
+                    'axis_priority',
+                    uv_optimize.hard_surface.DEFAULT_GEOMETRY_AXIS_PRIORITY,
+                ),
+                geometry_matrix=kwargs.get('geometry_matrix'),
+                write=False,
+            )
+            post_repair_reports.append(report)
+        return result
+
+    uv_optimize._call_uv_operator = inject_after_first_pack
+    uv_optimize._repair_remaining_problem_charts = track_fallback
+    uv_optimize.hard_surface.align_island_geometry = track_alignment
+    try:
+        result = uv_optimize.optimize_active_object(
+            bpy.context, obj, settings)
+    finally:
+        uv_optimize._call_uv_operator = original_call
+        uv_optimize._repair_remaining_problem_charts = original_fallback
+        uv_optimize.hard_surface.align_island_geometry = original_align
+
+    assert fallback_calls['count'] >= 1, fallback_calls
+    assert post_repair_reports, post_repair_reports
+    assert all(
+        report.selected_axis is not None
+        and abs(report.angle_delta) < math.radians(3.0)
+        for report in post_repair_reports
+    ), [report.to_dict() for report in post_repair_reports]
+    assert result.safe_pack_retry
     uv_optimize._audit_unique_object_mesh(obj.data)
     assert _topology_signature(obj.data) == before_topology
 
@@ -750,16 +1213,25 @@ def _test_outer_transaction_rollback():
 addon.register()
 try:
     _test_tree_cut_unwrap()
-    _test_face_projection_fallback()
+    _test_single_convex_face_projection_fallback()
+    _test_multi_face_chart_is_not_fragmented_by_projection_fallback()
+    _test_single_concave_face_does_not_use_convex_fallback()
     _test_best_effort_local_repair_accepts_connected_chart()
     _test_best_effort_local_repair_restores_rejection()
     _test_near_planar_ngon_strict_rejection()
     _test_skinny_ear_stabilization()
+    _test_welded_vertex_fan_stops_at_chart_cuts()
+    _test_multi_face_local_repair_stabilizes_skinny_ear()
     _test_refine_layout_does_not_reseed_valid_uv()
     _test_refine_artist_seam_blocks_small_cleanup()
     _test_refine_derived_uv_cut_allows_safe_small_cleanup()
+    _test_refine_unlocked_seam_allows_structural_cleanup()
     _test_refine_cleanup_normalizes_unwrap_density_explosion()
+    _test_structural_small_fragment_lane()
+    _test_structural_lane_keeps_hard_boundaries()
+    _test_structural_lane_rolls_back_stretch_rejection()
     _test_final_pack_gate_repair()
+    _test_hard_surface_repair_reapplies_direction()
     _test_outer_transaction_rollback()
 finally:
     if bpy.context.object is not None and bpy.context.object.mode != 'OBJECT':

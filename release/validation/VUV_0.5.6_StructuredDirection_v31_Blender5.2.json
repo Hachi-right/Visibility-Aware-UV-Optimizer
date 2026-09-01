@@ -1,0 +1,183 @@
+{
+  "schema": "vuv-structured-direction-v31-postflight-v1",
+  "blender_version": "5.2.0 LTS",
+  "blend": "C:\\Users\\SEASUN\\Documents\\ChatGPT\\绑骨\\release\\VUV_0.5.6_StructuredDirectionScene_v31\\拼接武器_VUV_结构连续方向统一_v31.blend",
+  "manifest": "C:\\Users\\SEASUN\\Documents\\ChatGPT\\绑骨\\release\\VUV_0.5.6_StructuredDirectionScene_v31\\拼接武器_VUV_结构连续方向统一_v31_manifest.json",
+  "objects": [
+    {
+      "object": "CMP_FINAL 06_WPN06_PART_00_KB06_R2B_REAR_DISPLAY_R2B RIFLE_SM_Model_Bullet",
+      "faces": 40,
+      "islands": 4,
+      "audit": {
+        "triangles": 80,
+        "positive": 80,
+        "negative": 0,
+        "degenerate": 0,
+        "finite": true,
+        "inside_tile": true,
+        "overlap": false,
+        "valid": true
+      },
+      "coverage": {
+        "tile_polygon_coverage": 0.5255913515525277,
+        "tile_aabb_coverage": 0.7498986417440768,
+        "aabb_fill": 0.7008831891335788
+      },
+      "direction": {
+        "resolved_islands": 4,
+        "unresolved_islands": 0,
+        "misaligned_islands": 0,
+        "opposite_islands": 0,
+        "quarter_turn_islands": 0,
+        "residual_p95_degrees": 3.066433537380598e-05,
+        "residual_max_degrees": 3.066433537380598e-05
+      },
+      "relations": {
+        "owner_child_relations": 0,
+        "owner_child_same_axis": 0,
+        "owner_child_same_axis_rate": 1.0,
+        "repeat_groups": 0,
+        "repeat_direction_valid_groups": 0,
+        "repeat_direction_pass_rate": 1.0,
+        "repeat_minimum_direction_dot": 1.0
+      },
+      "disconnected_islands": [],
+      "checks": {
+        "source_uv_unchanged": true,
+        "target_uv_reopened_exact": true,
+        "mesh_unchanged": true,
+        "connectivity_unchanged": true,
+        "seams_reopened_exact": true,
+        "partition_reopened_exact": true,
+        "islands_mesh_connected": true,
+        "uv_audit_valid": true,
+        "layout_quality_valid": true,
+        "direction_valid": true,
+        "direction_fully_resolved": true,
+        "direction_not_misaligned": true,
+        "direction_not_opposite": true,
+        "direction_not_quarter_turned": true,
+        "target_active": true,
+        "repeat_direction_valid": true
+      },
+      "pass": true
+    },
+    {
+      "object": "CMP_FINAL 06_WPN06_PART_00_KB06_R2B_REAR_DISPLAY_R2B RIFLE_SM_Model.Body",
+      "faces": 2663,
+      "islands": 508,
+      "audit": {
+        "triangles": 5169,
+        "positive": 5169,
+        "negative": 0,
+        "degenerate": 0,
+        "finite": true,
+        "inside_tile": true,
+        "overlap": false,
+        "valid": true
+      },
+      "coverage": {
+        "tile_polygon_coverage": 0.19452208089532408,
+        "tile_aabb_coverage": 0.8646286565622016,
+        "aabb_fill": 0.2249776009839319
+      },
+      "direction": {
+        "resolved_islands": 508,
+        "unresolved_islands": 0,
+        "misaligned_islands": 0,
+        "opposite_islands": 0,
+        "quarter_turn_islands": 0,
+        "residual_p95_degrees": 0.0011510947131846427,
+        "residual_max_degrees": 0.006014382460219829
+      },
+      "relations": {
+        "owner_child_relations": 425,
+        "owner_child_same_axis": 299,
+        "owner_child_same_axis_rate": 0.7035294117647058,
+        "repeat_groups": 60,
+        "repeat_direction_valid_groups": 60,
+        "repeat_direction_pass_rate": 1.0,
+        "repeat_minimum_direction_dot": 0.9999999990126354
+      },
+      "disconnected_islands": [],
+      "checks": {
+        "source_uv_unchanged": true,
+        "target_uv_reopened_exact": true,
+        "mesh_unchanged": true,
+        "connectivity_unchanged": true,
+        "seams_reopened_exact": true,
+        "partition_reopened_exact": true,
+        "islands_mesh_connected": true,
+        "uv_audit_valid": true,
+        "layout_quality_valid": true,
+        "direction_valid": true,
+        "direction_fully_resolved": true,
+        "direction_not_misaligned": true,
+        "direction_not_opposite": true,
+        "direction_not_quarter_turned": true,
+        "target_active": true,
+        "repeat_direction_valid": true
+      },
+      "pass": true
+    },
+    {
+      "object": "CMP_FINAL 06_WPN06_PART_00_KB06_R2B_REAR_DISPLAY_R2B RIFLE_SM_Model_Gun_Head.001",
+      "faces": 1719,
+      "islands": 160,
+      "audit": {
+        "triangles": 3216,
+        "positive": 3216,
+        "negative": 0,
+        "degenerate": 0,
+        "finite": true,
+        "inside_tile": true,
+        "overlap": false,
+        "valid": true
+      },
+      "coverage": {
+        "tile_polygon_coverage": 0.3488222614373144,
+        "tile_aabb_coverage": 0.970015720360944,
+        "aabb_fill": 0.3596047508462205
+      },
+      "direction": {
+        "resolved_islands": 160,
+        "unresolved_islands": 0,
+        "misaligned_islands": 0,
+        "opposite_islands": 0,
+        "quarter_turn_islands": 0,
+        "residual_p95_degrees": 0.0003822497325597141,
+        "residual_max_degrees": 0.002243875168829672
+      },
+      "relations": {
+        "owner_child_relations": 78,
+        "owner_child_same_axis": 74,
+        "owner_child_same_axis_rate": 0.9487179487179487,
+        "repeat_groups": 0,
+        "repeat_direction_valid_groups": 0,
+        "repeat_direction_pass_rate": 1.0,
+        "repeat_minimum_direction_dot": 1.0
+      },
+      "disconnected_islands": [],
+      "checks": {
+        "source_uv_unchanged": true,
+        "target_uv_reopened_exact": true,
+        "mesh_unchanged": true,
+        "connectivity_unchanged": true,
+        "seams_reopened_exact": true,
+        "partition_reopened_exact": true,
+        "islands_mesh_connected": true,
+        "uv_audit_valid": true,
+        "layout_quality_valid": true,
+        "direction_valid": true,
+        "direction_fully_resolved": true,
+        "direction_not_misaligned": true,
+        "direction_not_opposite": true,
+        "direction_not_quarter_turned": true,
+        "target_active": true,
+        "repeat_direction_valid": true
+      },
+      "pass": true
+    }
+  ],
+  "overall_pass": true
+}

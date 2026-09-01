@@ -169,6 +169,611 @@ def _test_repeat_anchor_order_and_packing():
     assert (centers[21] - centers[20]).length < (centers[21] - centers[10]).length
 
 
+def _test_structure_adjacency_builds_bounded_macro_group():
+    chain = (
+        _island(0, (0.0, 0.0, 0.0, 1.0, 1.0, 0.1)),
+        _island(1, (1.0, 0.0, 0.0, 2.0, 1.0, 0.1)),
+        _island(2, (2.0, 0.0, 0.0, 3.0, 1.0, 0.1)),
+    )
+    remote = _island(3, (15.0, 0.0, 0.0, 16.0, 1.0, 0.1))
+    adjacency = (
+        VUV.IslandAdjacency(0, 1, 1, 1.0, 1),
+        VUV.IslandAdjacency(1, 2, 1, 1.0, 1),
+    )
+    options = VUV.GroupLayoutOptions(
+        structure_group_enabled=True,
+        structure_group_max_members=4,
+        structure_group_max_diameter_ratio=0.20,
+    )
+    groups = VUV.build_layout_groups(
+        chain + (remote,),
+        (),
+        object_diagonal=16.0,
+        options=options,
+        adjacency=adjacency,
+    )
+    macro = next(group for group in groups if 0 in group.member_ids)
+    assert set(macro.member_ids) == {0, 1, 2}, macro.member_ids
+    assert macro.reason == "MACRO_ADJACENT", macro.reason
+    assert macro.affinity_pairs == ((0, 1), (1, 2)), macro.affinity_pairs
+    assert all(3 not in group.member_ids for group in groups if group is macro)
+
+    oriented = {
+        0: _rectangle(0, 1.0, 1.0),
+        1: _rectangle(10, 0.8, 1.6),
+        2: _rectangle(20, 1.2, 0.6),
+        3: _rectangle(30, 2.0, 2.0),
+    }
+    gap = 0.05
+    plan = VUV._pack_plan(
+        oriented,
+        groups,
+        gap=gap,
+        allow_group_quarter_turn=False,
+    )
+    bounds = {
+        island_id: VUV._uv_bounds(coordinates.values())
+        for island_id, coordinates in plan.coordinates.items()
+    }
+    for left_id, right_id in macro.affinity_pairs:
+        near_limit = max(
+            _bounds_diagonal(bounds[left_id]),
+            _bounds_diagonal(bounds[right_id]),
+        ) + 2.0 * gap
+        assert _bounds_distance(
+            bounds[left_id], bounds[right_id]
+        ) <= near_limit + 1.0e-9, (left_id, right_id, bounds)
+
+    disabled_groups = VUV.build_layout_groups(
+        chain + (remote,),
+        (),
+        object_diagonal=16.0,
+        options=VUV.GroupLayoutOptions(structure_group_enabled=False),
+        adjacency=adjacency,
+    )
+    assert len(disabled_groups) == 4, [
+        group.member_ids for group in disabled_groups
+    ]
+    assert all(not group.affinity_pairs for group in disabled_groups)
+
+
+def _test_repeat_micro_chain_does_not_merge_whole_asset():
+    owners = (
+        _island(0, (0.0, 0.0, 0.0, 1.0, 1.0, 0.1)),
+        _island(10, (10.0, 0.0, 0.0, 11.0, 1.0, 0.1)),
+        _island(20, (20.0, 0.0, 0.0, 21.0, 1.0, 0.1)),
+    )
+    fragments = (
+        _island(1, (1.01, 0.1, 0.0, 1.05, 0.15, 0.05), small=True, neighbors=(0,)),
+        _island(11, (9.95, 0.1, 0.0, 9.99, 0.15, 0.05), small=True, neighbors=(10,)),
+        _island(12, (11.01, 0.2, 0.0, 11.05, 0.25, 0.05), small=True, neighbors=(10,)),
+        _island(21, (19.95, 0.2, 0.0, 19.99, 0.25, 0.05), small=True, neighbors=(20,)),
+    )
+    repeats = (
+        VUV.RepeatGroup(0, (1, 11), "TRANSLATED", 0.99, "left-link"),
+        VUV.RepeatGroup(1, (12, 21), "TRANSLATED", 0.99, "right-link"),
+    )
+    groups = VUV.build_layout_groups(
+        owners + fragments,
+        repeats,
+        object_diagonal=21.0,
+        options=VUV.GroupLayoutOptions(
+            proximity_radius_ratio=0.01,
+            repeat_group_max_members=12,
+            repeat_group_max_diameter_ratio=0.20,
+        ),
+    )
+    assert not any(
+        {0, 10, 20}.issubset(set(group.anchor_ids)) for group in groups
+    ), [group.anchor_ids for group in groups]
+    assert max(len(group.anchor_ids) for group in groups) == 2
+
+
+def _test_small_topology_chain_records_owner_affinity():
+    # The middle fragments have no direct anchor edge.  Their real mesh
+    # chain must still resolve to the two repeated owners, and the owner pair
+    # (rather than the small ids) is what the rigid packer consumes.
+    left = _island(0, (0.0, 0.0, 0.0, 1.0, 1.0, 0.1))
+    right = _island(10, (4.0, 0.0, 0.0, 5.0, 1.0, 0.1))
+    first = _island(
+        1,
+        (1.01, 0.2, 0.0, 1.08, 0.27, 0.05),
+        small=True,
+        neighbors=(0, 2),
+    )
+    middle = _island(
+        2,
+        (2.35, 0.2, 0.0, 2.42, 0.27, 0.05),
+        small=True,
+        neighbors=(1, 3),
+    )
+    last = _island(
+        3,
+        (3.92, 0.2, 0.0, 3.99, 0.27, 0.05),
+        small=True,
+        neighbors=(2, 10),
+    )
+    adjacency = (
+        VUV.IslandAdjacency(0, 1, 1, 0.10, 0),
+        VUV.IslandAdjacency(1, 2, 1, 0.10, 0),
+        VUV.IslandAdjacency(2, 3, 1, 0.10, 0),
+        VUV.IslandAdjacency(3, 10, 1, 0.10, 0),
+    )
+    repeat = VUV.RepeatGroup(0, (0, 10), "TRANSLATED", 0.99, "owners")
+    groups = VUV.build_layout_groups(
+        (left, right, first, middle, last),
+        (repeat,),
+        object_diagonal=5.0,
+        options=VUV.GroupLayoutOptions(
+            proximity_radius_ratio=1.0,
+            structure_group_max_members=12,
+            structure_group_max_degree=2,
+            structure_group_max_diameter_ratio=0.20,
+        ),
+        adjacency=adjacency,
+    )
+    assert len(groups) == 1, [group.member_ids for group in groups]
+    group = groups[0]
+    assert set(group.member_ids) == {0, 1, 2, 3, 10}
+    assert (0, 10) in group.affinity_pairs, group.to_dict()
+    assert all(
+        small_id not in pair
+        for pair in group.affinity_pairs
+        for small_id in (1, 2, 3)
+    ), group.affinity_pairs
+
+    oriented = {
+        0: _rectangle(0, 0.8, 0.8),
+        1: _rectangle(10, 0.12, 0.10),
+        2: _rectangle(20, 0.12, 0.10),
+        3: _rectangle(30, 0.12, 0.10),
+        10: _rectangle(100, 0.8, 0.8),
+    }
+    plan = VUV._pack_plan(
+        oriented, groups, gap=0.04, allow_group_quarter_turn=False
+    )
+    bounds = {
+        island_id: VUV._uv_bounds(coordinates.values())
+        for island_id, coordinates in plan.coordinates.items()
+    }
+    assert _bounds_distance(bounds[0], bounds[10]) <= (
+        max(_bounds_diagonal(bounds[0]), _bounds_diagonal(bounds[10]))
+        + 2.0 * 0.04
+        + 1.0e-9
+    ), bounds
+
+
+def _test_topology_continuity_cross_group_merge_is_bounded():
+    left = _island(0, (0.0, 0.0, 0.0, 1.0, 1.0, 0.1))
+    right = _island(10, (1.5, 0.0, 0.0, 2.5, 1.0, 0.1))
+    left_small = _island(
+        1,
+        (1.01, 0.2, 0.0, 1.08, 0.27, 0.05),
+        small=True,
+        neighbors=(0, 2),
+    )
+    right_small = _island(
+        11,
+        (1.42, 0.2, 0.0, 1.49, 0.27, 0.05),
+        small=True,
+        neighbors=(1, 10),
+    )
+    adjacency = (
+        VUV.IslandAdjacency(0, 1, 1, 0.10, 0),
+        VUV.IslandAdjacency(1, 11, 1, 0.10, 0),
+        VUV.IslandAdjacency(11, 10, 1, 0.10, 0),
+    )
+    islands = (left, right, left_small, right_small)
+
+    merged = VUV.build_layout_groups(
+        islands,
+        (),
+        object_diagonal=3.0,
+        options=VUV.GroupLayoutOptions(
+            proximity_radius_ratio=1.0,
+            structure_group_max_members=4,
+            structure_group_max_diameter_ratio=1.0,
+        ),
+        adjacency=adjacency,
+    )
+    assert len(merged) == 1, [group.member_ids for group in merged]
+    assert merged[0].reason == "TOPOLOGY_CONTINUITY", merged[0].to_dict()
+    assert merged[0].affinity_pairs == ((0, 10),), merged[0].to_dict()
+
+    over_budget = VUV.build_layout_groups(
+        islands,
+        (),
+        object_diagonal=3.0,
+        options=VUV.GroupLayoutOptions(
+            proximity_radius_ratio=1.0,
+            structure_group_max_members=3,
+            structure_group_max_diameter_ratio=1.0,
+        ),
+        adjacency=adjacency,
+    )
+    assert len(over_budget) == 2, [group.member_ids for group in over_budget]
+    assert all(not group.affinity_pairs for group in over_budget)
+
+    over_diameter = VUV.build_layout_groups(
+        islands,
+        (),
+        object_diagonal=3.0,
+        options=VUV.GroupLayoutOptions(
+            proximity_radius_ratio=1.0,
+            structure_group_max_members=4,
+            structure_group_max_diameter_ratio=0.20,
+        ),
+        adjacency=adjacency,
+    )
+    assert len(over_diameter) == 2, [group.member_ids for group in over_diameter]
+    assert all(not group.affinity_pairs for group in over_diameter)
+
+
+def _test_geometry_continuity_blocks_are_bounded_and_packed_nearby():
+    # Exercise the coarser block pass directly with pre-existing layout groups
+    # so the earlier structure pass cannot consume the whole chain first.
+    islands = tuple(
+        _island(
+            island_id,
+            (
+                float(island_id), 0.0, 0.0,
+                float(island_id + 1), 1.0, 0.1,
+            ),
+        )
+        for island_id in range(8)
+    )
+    groups = [
+        {
+            "members": [island.island_id],
+            "anchors": [island.island_id],
+            "small": [],
+            "small_anchors": [],
+            "reason": "SINGLE_ANCHOR",
+            "affinity_pairs": [],
+        }
+        for island in islands
+    ]
+    adjacency = tuple(
+        VUV.IslandAdjacency(index, index + 1, 1, 1.0, 0)
+        for index in range(7)
+    )
+    settings = VUV.GroupLayoutOptions(
+        continuity_block_target_members=3,
+        continuity_block_max_members=4,
+        structure_group_max_diameter_ratio=1.0,
+    )
+    blocked = VUV._build_geometry_continuity_blocks(
+        groups,
+        islands,
+        adjacency,
+        object_diagonal=8.0,
+        settings=settings,
+    )
+    assert len(blocked) == 2, [item["members"] for item in blocked]
+    assert all(len(item["members"]) <= 4 for item in blocked), blocked
+    assert all(item.get("_continuity_component") for item in blocked), blocked
+    assert any(item.get("_continuity_peers") for item in blocked), blocked
+
+    key_to_id = {
+        int(item["_continuity_key"]): index
+        for index, item in enumerate(blocked)
+    }
+    layout_groups = []
+    for index, item in enumerate(blocked):
+        peers = tuple(sorted(
+            key_to_id[int(peer)]
+            for peer in item.get("_continuity_peers", ())
+            if int(peer) in key_to_id
+        ))
+        layout_groups.append(VUV.LayoutGroup(
+            group_id=index,
+            member_ids=tuple(item["members"]),
+            reason=item["reason"],
+            anchor_ids=tuple(item["anchors"]),
+            continuity_component=int(item["_continuity_component"]),
+            continuity_peers=peers,
+        ))
+    oriented = {
+        island.island_id: _rectangle(island.island_id * 10, 0.8, 0.5)
+        for island in islands
+    }
+    plan = VUV._pack_plan(
+        oriented,
+        layout_groups,
+        gap=0.04,
+        allow_group_quarter_turn=False,
+    )
+    placements = plan.group_placements
+    assert placements[0].x < placements[1].x or placements[0].y != placements[1].y
+    distance = VUV._placement_distance(placements[0], placements[1])
+    near_limit = max(
+        math.hypot(placements[0].width, placements[0].height),
+        math.hypot(placements[1].width, placements[1].height),
+    ) + 2.0 * 0.04
+    assert distance <= near_limit + 1.0e-9, (placements, distance, near_limit)
+
+
+def _test_continuity_block_uses_coarse_diameter_ratio():
+    """The second-layer continuity envelope is not locked to 0.20."""
+
+    islands = (
+        _island(0, (0.0, 0.0, 0.0, 1.0, 1.0, 0.1)),
+        _island(1, (1.5, 0.0, 0.0, 2.5, 1.0, 0.1)),
+    )
+    groups = [
+        {
+            "members": [island.island_id],
+            "anchors": [island.island_id],
+            "small": [],
+            "small_anchors": [],
+            "reason": "SINGLE_ANCHOR",
+            "affinity_pairs": [],
+        }
+        for island in islands
+    ]
+    adjacency = (VUV.IslandAdjacency(0, 1, 1, 1.0, 0),)
+    blocked = VUV._build_geometry_continuity_blocks(
+        groups,
+        islands,
+        adjacency,
+        object_diagonal=4.0,
+        settings=VUV.GroupLayoutOptions(
+            # The legacy owner envelope alone (0.20 * 4) is too small for
+            # this pair; the continuity envelope intentionally is not.
+            structure_group_max_diameter_ratio=0.20,
+            continuity_block_max_diameter_ratio=0.80,
+            continuity_block_target_members=2,
+            continuity_block_max_members=4,
+        ),
+    )
+    assert len(blocked) == 1, [item["members"] for item in blocked]
+    assert set(blocked[0]["members"]) == {0, 1}, blocked
+
+
+def _test_soft_topology_pairs_are_bounded_and_deterministic():
+    """Seam/material-separated contacts become one-shot layout pairs only."""
+
+    islands = (
+        _island(0, (0.0, 0.0, 0.0, 1.0, 1.0, 0.1), materials=(0,)),
+        _island(1, (1.2, 0.0, 0.0, 2.2, 1.0, 0.1), materials=(1,)),
+        _island(2, (4.0, 0.0, 0.0, 5.0, 1.0, 0.1), materials=(2,)),
+        _island(3, (5.2, 0.0, 0.0, 6.2, 1.0, 0.1), materials=(3,)),
+    )
+    groups = [
+        {
+            "members": [island.island_id],
+            "anchors": [island.island_id],
+            "small": [],
+            "small_anchors": [],
+            "reason": "SINGLE_ANCHOR",
+            "affinity_pairs": [],
+        }
+        for island in islands
+    ]
+    # Every edge is an all-seam boundary between different materials, so the
+    # strict structure score rejects it.  The relaxed score should still keep
+    # the two real local pairs together.
+    adjacency = (
+        VUV.IslandAdjacency(0, 1, 1, 0.20, 1),
+        VUV.IslandAdjacency(2, 3, 1, 0.20, 1),
+    )
+    settings = VUV.GroupLayoutOptions(
+        continuity_block_target_members=2,
+        continuity_block_max_members=4,
+        continuity_component_max_groups=2,
+        continuity_component_max_members=4,
+        continuity_block_max_diameter_ratio=0.80,
+    )
+    blocked = VUV._build_geometry_continuity_blocks(
+        groups,
+        islands,
+        adjacency,
+        object_diagonal=8.0,
+        settings=settings,
+    )
+    assert len(blocked) == 4, [item["members"] for item in blocked]
+    peer_pairs = {
+        tuple(sorted((int(item["_continuity_key"]), int(peer))))
+        for item in blocked
+        for peer in item.get("_continuity_peers", ())
+        if int(item["_continuity_key"]) < int(peer)
+    }
+    assert peer_pairs == {(0, 1), (2, 3)}, blocked
+    component_by_key = {
+        int(item["_continuity_key"]): int(item["_continuity_component"])
+        for item in blocked
+        if item.get("_continuity_component") is not None
+    }
+    assert len(component_by_key) == 4, blocked
+    assert len(set(component_by_key.values())) == 2, blocked
+
+    # The same soft relation is rejected when either component envelope is
+    # exceeded; no merge or affinity is allowed to bypass those limits.
+    rejected = VUV._build_geometry_continuity_blocks(
+        groups,
+        islands,
+        adjacency,
+        object_diagonal=8.0,
+        settings=VUV.GroupLayoutOptions(
+            continuity_block_target_members=2,
+            continuity_block_max_members=4,
+            continuity_component_max_groups=2,
+            continuity_component_max_members=2,
+            continuity_block_max_diameter_ratio=0.05,
+        ),
+    )
+    assert all(item.get("_continuity_component") is None for item in rejected), rejected
+    assert all(not item.get("_continuity_peers") for item in rejected), rejected
+
+
+def _test_cross_component_peer_uses_local_endpoint_bounds():
+    """A local boundary to a rigid block is retained after component gating."""
+
+    islands = tuple(
+        _island(
+            island_id,
+            (float(island_id) * 1.2, 0.0, 0.0,
+             float(island_id) * 1.2 + 1.0, 1.0, 0.1),
+        )
+        for island_id in range(5)
+    )
+    # The first two pre-existing groups form a strong two-block component;
+    # the final group is adjacent to its right endpoint but remains outside
+    # the full component AABB.  The soft peer must use endpoints 3/4 rather
+    # than rejecting the relation because of the distant member 0.
+    groups = [
+        {
+            "members": [0, 1],
+            "anchors": [0, 1],
+            "small": [],
+            "small_anchors": [],
+            "reason": "SINGLE_ANCHOR",
+            "affinity_pairs": [],
+        },
+        {
+            "members": [2, 3],
+            "anchors": [2, 3],
+            "small": [],
+            "small_anchors": [],
+            "reason": "SINGLE_ANCHOR",
+            "affinity_pairs": [],
+        },
+        {
+            "members": [4],
+            "anchors": [4],
+            "small": [],
+            "small_anchors": [],
+            "reason": "SINGLE_ANCHOR",
+            "affinity_pairs": [],
+        },
+    ]
+    adjacency = (
+        VUV.IslandAdjacency(1, 2, 1, 1.0, 0),
+        VUV.IslandAdjacency(3, 4, 1, 1.0, 0),
+    )
+    blocked = VUV._build_geometry_continuity_blocks(
+        groups,
+        islands,
+        adjacency,
+        object_diagonal=6.0,
+        settings=VUV.GroupLayoutOptions(
+            continuity_block_target_members=2,
+            continuity_block_max_members=2,
+            continuity_component_max_groups=2,
+            continuity_component_max_members=4,
+            continuity_block_max_diameter_ratio=0.80,
+            structure_group_max_diameter_ratio=0.80,
+        ),
+    )
+    by_key = {int(item["_continuity_key"]): item for item in blocked}
+    assert by_key[0].get("_continuity_component") is not None, blocked
+    assert by_key[1].get("_continuity_component") == by_key[0].get(
+        "_continuity_component"
+    ), blocked
+    assert by_key[2].get("_continuity_component") is None, blocked
+    assert 2 in set(by_key[1].get("_continuity_peers", ())), blocked
+    assert 1 in set(by_key[2].get("_continuity_peers", ())), blocked
+
+    key_to_id = {
+        int(item["_continuity_key"]): index
+        for index, item in enumerate(blocked)
+    }
+    layout_groups = []
+    for index, item in enumerate(blocked):
+        peers = tuple(sorted(
+            key_to_id[int(peer)]
+            for peer in item.get("_continuity_peers", ())
+            if int(peer) in key_to_id
+        ))
+        layout_groups.append(VUV.LayoutGroup(
+            group_id=index,
+            member_ids=tuple(item["members"]),
+            reason=item["reason"],
+            anchor_ids=tuple(item["anchors"]),
+            continuity_component=item.get("_continuity_component"),
+            continuity_peers=peers,
+        ))
+    oriented = {
+        island.island_id: _rectangle(island.island_id * 10, 0.7, 0.45)
+        for island in islands
+    }
+    plan = VUV._pack_plan(
+        oriented,
+        layout_groups,
+        gap=0.03,
+        allow_group_quarter_turn=False,
+    )
+    left = plan.group_placements[1]
+    right = plan.group_placements[2]
+    distance = VUV._placement_distance(left, right)
+    near_limit = max(
+        math.hypot(left.width, left.height),
+        math.hypot(right.width, right.height),
+    ) + 2.0 * 0.03
+    assert distance <= near_limit + 1.0e-9, (
+        distance,
+        near_limit,
+        plan.group_placements,
+    )
+
+
+def _test_continuity_component_uses_centroid_ordered_rigid_grid():
+    """Continuity groups form one ordered, translation-only top-level block."""
+
+    groups = tuple(
+        VUV.LayoutGroup(
+            group_id=index,
+            member_ids=(index,),
+            reason="TOPOLOGY_CONTINUITY",
+            anchor_ids=(index,),
+            continuity_component=17,
+        )
+        for index in range(3)
+    )
+    oriented = {
+        0: _rectangle(0, 0.90, 0.35),
+        1: _rectangle(10, 0.45, 0.80),
+        2: _rectangle(20, 0.60, 0.55),
+    }
+    # Deliberately make source ids disagree with model-space order.
+    centroids = {
+        0: Vector((10.0, 0.0, 0.0)),
+        1: Vector((20.0, 0.0, 0.0)),
+        2: Vector((-5.0, 0.0, 0.0)),
+    }
+    gap = 0.03
+    plan = VUV._pack_plan(
+        oriented,
+        groups,
+        gap=gap,
+        allow_group_quarter_turn=True,
+        group_model_centroids=centroids,
+    )
+    placements = plan.group_placements
+    assert set(placements) == {0, 1, 2}
+    assert all(not item.quarter_turn for item in placements.values()), placements
+    expected_sizes = {0: (0.90, 0.35), 1: (0.45, 0.80), 2: (0.60, 0.55)}
+    for group_id, placement in placements.items():
+        width, height = expected_sizes[group_id]
+        assert abs(placement.width - width) <= 1.0e-6, placements
+        assert abs(placement.height - height) <= 1.0e-6, placements
+    # The regular grid is row-major in the supplied centroid order.  A
+    # top-level translation must not change that order.
+    grid_order = tuple(sorted(
+        placements,
+        key=lambda group_id: (
+            round(placements[group_id].y, 10),
+            round(placements[group_id].x, 10),
+        ),
+    ))
+    assert grid_order == (2, 0, 1), (grid_order, placements)
+    for left_index, left_id in enumerate(sorted(placements)):
+        for right_id in sorted(placements)[left_index + 1:]:
+            assert VUV._placements_clear(
+                placements[left_id], placements[right_id], gap
+            ), (left_id, right_id, placements)
+
+
 def _polygon_object(name, polygons, uv_polygons):
     vertices = []
     faces = []
@@ -177,6 +782,20 @@ def _polygon_object(name, polygons, uv_polygons):
         vertices.extend(polygon)
         faces.append(tuple(range(start, start + len(polygon))))
 
+    mesh = bpy.data.meshes.new(name + "Mesh")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    for face, uv_points in zip(mesh.polygons, uv_polygons):
+        assert len(face.loop_indices) == len(uv_points)
+        for loop_index, uv in zip(face.loop_indices, uv_points):
+            uv_layer.data[loop_index].uv = uv
+    mesh.update()
+    return obj, mesh
+
+
+def _topology_object(name, vertices, faces, uv_polygons):
     mesh = bpy.data.meshes.new(name + "Mesh")
     mesh.from_pydata(vertices, [], faces)
     mesh.update()
@@ -741,6 +1360,158 @@ def _test_owner_cells_keep_many_fragments_local():
         ) <= near_limit + 1.0e-9
 
 
+def _test_owner_attachment_rack_follows_model_centroids_without_rotation():
+    owner = _island(500, (0.0, 0.0, 0.0, 2.0, 2.0, 0.2))
+    centroid_order = (509, 503, 511, 502, 507, 505)
+    fragments = tuple(
+        _island(
+            island_id,
+            (
+                2.05 + position * 0.02,
+                0.1 + position * 0.03,
+                0.0,
+                2.06 + position * 0.02,
+                0.11 + position * 0.03,
+                0.05,
+            ),
+            small=True,
+            neighbors=(500,),
+        )
+        for position, island_id in enumerate(centroid_order)
+    )
+    shuffled = (
+        fragments[4],
+        owner,
+        fragments[1],
+        fragments[5],
+        fragments[0],
+        fragments[3],
+        fragments[2],
+    )
+    options = VUV.GroupLayoutOptions(proximity_radius_ratio=1.0)
+    first = VUV.build_layout_groups(
+        shuffled,
+        (),
+        object_diagonal=3.0,
+        options=options,
+    )
+    second = VUV.build_layout_groups(
+        tuple(reversed(shuffled)),
+        (),
+        object_diagonal=3.0,
+        options=options,
+    )
+    first_group = next(group for group in first if 500 in group.anchor_ids)
+    second_group = next(group for group in second if 500 in group.anchor_ids)
+    assert first_group.small_member_ids == centroid_order, first_group.to_dict()
+    assert second_group.small_member_ids == centroid_order, second_group.to_dict()
+
+    sizes = {
+        509: (0.19, 0.11),
+        503: (0.13, 0.17),
+        511: (0.21, 0.09),
+        502: (0.15, 0.14),
+        507: (0.12, 0.19),
+        505: (0.18, 0.10),
+    }
+    oriented = {500: _rectangle(5000, 1.0, 1.0)}
+    for island_id in centroid_order:
+        oriented[island_id] = _rectangle(
+            island_id * 10,
+            sizes[island_id][0],
+            sizes[island_id][1],
+        )
+    plan = VUV._pack_plan(
+        oriented,
+        first,
+        gap=0.04,
+        allow_group_quarter_turn=False,
+    )
+    bounds = {
+        island_id: VUV._uv_bounds(coordinates.values())
+        for island_id, coordinates in plan.coordinates.items()
+    }
+    owner_bounds = bounds[500]
+    all_right = all(
+        bounds[island_id][0] >= owner_bounds[2] + 0.04 - 1.0e-6
+        for island_id in centroid_order
+    )
+    all_above = all(
+        bounds[island_id][1] >= owner_bounds[3] + 0.04 - 1.0e-6
+        for island_id in centroid_order
+    )
+    assert all_right or all_above, bounds
+
+    rack_order = tuple(sorted(
+        centroid_order,
+        key=lambda island_id: (
+            round(bounds[island_id][1], 9),
+            round(bounds[island_id][0], 9),
+        ),
+    ))
+    assert rack_order == centroid_order, (rack_order, centroid_order, bounds)
+    for island_id in centroid_order:
+        width = bounds[island_id][2] - bounds[island_id][0]
+        height = bounds[island_id][3] - bounds[island_id][1]
+        assert abs(width - sizes[island_id][0]) < 1.0e-6
+        assert abs(height - sizes[island_id][1]) < 1.0e-6
+
+
+def _test_regular_owner_attachment_grid_preserves_order_and_density():
+    """A compact regular rack may replace a ragged shelf without rotation."""
+
+    rectangles = tuple(
+        VUV._Rect(index, 0.04, 0.04, index)
+        for index in range(3)
+    )
+    gap = 0.003
+    shelf, shelf_width, shelf_height = VUV._best_shelf_pack(
+        rectangles,
+        gap,
+        allow_rotate=False,
+        preserve_order=True,
+    )
+    chosen, chosen_width, chosen_height = VUV._select_owner_attachment_rack(
+        0.15,
+        0.15,
+        rectangles,
+        gap,
+    )
+    tolerance = max(gap * 1.0e-4, 1.0e-8)
+    shelf_alignment = VUV._rack_boundary_alignment(shelf, tolerance)
+    chosen_alignment = VUV._rack_boundary_alignment(chosen, tolerance)
+    assert chosen_alignment >= shelf_alignment + 0.10
+    shelf_extent = VUV._owner_cell_extent(
+        0.15,
+        0.15,
+        shelf_width,
+        shelf_height,
+        gap,
+    )
+    chosen_extent = VUV._owner_cell_extent(
+        0.15,
+        0.15,
+        chosen_width,
+        chosen_height,
+        gap,
+    )
+    assert chosen_extent[0] <= shelf_extent[0] + 1.0e-9
+    assert chosen_extent[1] <= shelf_extent[1] + 1.0e-9
+    assert all(not placement.quarter_turn for placement in chosen.values())
+    # Row-major insertion order is retained, so a UV editor can read the rack
+    # in model-centroid order after the regularization pass.
+    ordered = sorted(
+        chosen.values(),
+        key=lambda placement: (
+            round(float(placement.y), 9),
+            round(float(placement.x), 9),
+        ),
+    )
+    assert tuple(placement.x for placement in ordered) == tuple(
+        chosen[index].x for index in sorted(chosen, key=lambda value: value)
+    )
+
+
 def _test_repeat_owner_cohorts_stay_near_in_large_component():
     anchor_ids = (70, 80, 90, 100, 110, 120)
     anchors = tuple(
@@ -788,7 +1559,14 @@ def _test_repeat_owner_cohorts_stay_near_in_large_component():
         anchors + tuple(fragments),
         tuple(repeats),
         object_diagonal=60.0,
-        options=VUV.GroupLayoutOptions(proximity_radius_ratio=0.01),
+        options=VUV.GroupLayoutOptions(
+            proximity_radius_ratio=0.01,
+            # This test deliberately exercises one full-asset affinity graph.
+            # Production defaults use a smaller bound to reject transitive
+            # repeat chains; opt in here so the solver regression keeps its
+            # original scope.
+            repeat_group_max_diameter_ratio=1.0,
+        ),
     )
     group = next(item for item in groups if 70 in item.anchor_ids)
     assert set(group.anchor_ids) == set(anchor_ids), group.anchor_ids
@@ -1242,6 +2020,569 @@ def _test_quantized_winding_stabilization_and_audit_fields():
         _remove_object_and_mesh(obj, mesh)
 
 
+def _map_similarity(point, source_a, source_b, target_a, target_b):
+    source_delta = source_b - source_a
+    target_delta = target_b - target_a
+    denominator = source_delta.length_squared
+    real = source_delta.dot(target_delta) / denominator
+    imaginary = (
+        source_delta.x * target_delta.y
+        - source_delta.y * target_delta.x
+    ) / denominator
+    relative = point - source_a
+    return target_a + Vector((
+        relative.x * real - relative.y * imaginary,
+        relative.x * imaginary + relative.y * real,
+    ))
+
+
+def _quantized_welded_strip(name, face_count, geometry, source_uv, post_uv):
+    vertices = [Vector(point) for point in geometry]
+    source_points = [Vector(point) for point in source_uv]
+    post_points = [Vector(point) for point in post_uv]
+    faces = [(0, 1, 2)]
+    edge = source_points[1] - source_points[0]
+    direction = edge.normalized()
+    left = Vector((-direction.y, direction.x))
+    cross = (
+        edge.x * (source_points[2] - source_points[0]).y
+        - edge.y * (source_points[2] - source_points[0]).x
+    )
+    outward = left * (-1.0 if cross > 0.0 else 1.0)
+    previous_left, previous_right = 0, 1
+    for row in range(1, (face_count - 2) // 2 + 1):
+        left_index = len(vertices)
+        right_index = left_index + 1
+        vertices.extend((
+            vertices[0] + Vector((0.025 * row, 0.0, 0.0)),
+            vertices[1] + Vector((0.025 * row, 0.0, 0.0)),
+        ))
+        source_points.extend((
+            source_points[0] + outward * (0.0025 * row),
+            source_points[1] + outward * (0.0025 * row),
+        ))
+        for index in (left_index, right_index):
+            post_points.append(_map_similarity(
+                source_points[index],
+                source_points[0],
+                source_points[1],
+                post_points[0],
+                post_points[1],
+            ))
+        faces.extend((
+            (previous_right, previous_left, left_index),
+            (previous_right, left_index, right_index),
+        ))
+        previous_left, previous_right = left_index, right_index
+
+    cap_index = len(vertices)
+    vertices.append(
+        (vertices[previous_left] + vertices[previous_right]) * 0.5
+        + Vector((0.025, 0.0, 0.0))
+    )
+    source_points.append(
+        (source_points[previous_left] + source_points[previous_right]) * 0.5
+        + outward * 0.0025
+    )
+    post_points.append(_map_similarity(
+        source_points[cap_index],
+        source_points[0],
+        source_points[1],
+        post_points[0],
+        post_points[1],
+    ))
+    faces.append((previous_right, previous_left, cap_index))
+    assert len(faces) == face_count
+    obj, mesh = _topology_object(
+        name,
+        vertices,
+        faces,
+        [tuple(post_points[index] for index in face) for face in faces],
+    )
+    source_loops = [
+        source_points[int(loop.vertex_index)].copy() for loop in mesh.loops
+    ]
+    return obj, mesh, source_loops
+
+
+def _welded_by_loop(groups):
+    return {
+        int(loop_index): tuple(int(value) for value in members)
+        for members in groups.values()
+        for loop_index in members
+    }
+
+
+def _test_welded_quantized_repair_preserves_real_chart_forms():
+    fixtures = (
+        (
+            40,
+            (
+                (0.26565274596214294, -1.0228915214538574, 0.13709914684295654),
+                (0.26565274596214294, -0.7888550758361816, 0.13709914684295654),
+                (0.26565274596214294, -0.7611002922058105, 0.13709938526153564),
+            ),
+            (
+                (0.19679389894008636, 0.33462753891944885),
+                (0.23845897614955902, 0.33463042974472046),
+                (0.24340012669563293, 0.3346308171749115),
+            ),
+            (
+                (0.41963106393814087, 0.8920152187347412),
+                (0.4337378442287445, 0.8920161724090576),
+                (0.4354107975959778, 0.8920162320137024),
+            ),
+        ),
+        (
+            42,
+            (
+                (-0.2786858379840851, -0.7611002922058105, 0.13709962368011475),
+                (-0.2786858379840851, -0.7888550758361816, 0.13709938526153564),
+                (-0.2786858379840851, -1.0228915214538574, 0.13709962368011475),
+            ),
+            (
+                (0.4363405406475067, 0.18813258409500122),
+                (0.4410538077354431, 0.18813206255435944),
+                (0.4807974696159363, 0.1881280541419983),
+            ),
+            (
+                (0.469956636428833, 0.8852251172065735),
+                (0.47155243158340454, 0.8852249979972839),
+                (0.4850086569786072, 0.8852236270904541),
+            ),
+        ),
+    )
+    for face_count, geometry, source_uv, post_uv in fixtures:
+        obj, mesh, source = _quantized_welded_strip(
+            "VUV_Quantized_Welded_{}".format(face_count),
+            face_count,
+            geometry,
+            source_uv,
+            post_uv,
+        )
+        try:
+            uv_layer = mesh.uv_layers.active
+            face_map = tuple(0 for _face in mesh.polygons)
+            assert len(VUV._nonpositive_winding_records(
+                mesh, uv_layer, face_map
+            )) == 1
+            before = [item.uv.copy() for item in uv_layer.data]
+            groups, _loop_faces = VUV._source_welded_loop_groups(
+                mesh, source, face_map, 1.0e-6
+            )
+            direction_checks = []
+            repaired = VUV._try_welded_quantized_winding_repair(
+                mesh,
+                uv_layer,
+                0,
+                {index: point.copy() for index, point in enumerate(before)},
+                face_map,
+                source,
+                _welded_by_loop(groups),
+                1.0e-6,
+                direction_validator=lambda: direction_checks.append(True) or True,
+            )
+            assert repaired is not None, face_count
+            assert direction_checks, face_count
+            assert not VUV._nonpositive_winding_records(
+                mesh, uv_layer, face_map
+            )
+            VUV._validate_source_island_partition(
+                mesh, uv_layer, face_map, 1.0e-6
+            )
+            moved = [
+                index for index, point in enumerate(before)
+                if (uv_layer.data[index].uv - point).length_squared > 0.0
+            ]
+            assert len(moved) >= 2, (face_count, moved)
+            assert {
+                int(mesh.loops[index].vertex_index) for index in moved
+            } == {1}, (face_count, moved)
+        finally:
+            _remove_object_and_mesh(obj, mesh)
+
+
+def _test_welded_repair_boundaries_and_full_rollback():
+    vertices = (
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (1.0, 1.0, 0.0),
+    )
+    faces = ((0, 1, 2), (1, 3, 2))
+    by_vertex = tuple(Vector((point[0], point[1])) for point in vertices)
+    obj, mesh = _topology_object(
+        "VUV_Welded_Repair_Boundaries",
+        vertices,
+        faces,
+        [tuple(by_vertex[index] for index in face) for face in faces],
+    )
+    try:
+        source = [
+            by_vertex[int(loop.vertex_index)].copy() for loop in mesh.loops
+        ]
+
+        def loop_for(face_index, vertex_index):
+            return next(
+                int(index) for index in mesh.polygons[face_index].loop_indices
+                if int(mesh.loops[index].vertex_index) == vertex_index
+            )
+
+        left, right = loop_for(0, 1), loop_for(1, 1)
+
+        def joined(source_uvs, face_map):
+            groups, _loop_faces = VUV._source_welded_loop_groups(
+                mesh, source_uvs, face_map, 1.0e-6
+            )
+            lookup = _welded_by_loop(groups)
+            return lookup[left] == lookup[right]
+
+        assert joined(source, (0, 0))
+        shared = next(
+            edge for edge in mesh.edges
+            if set(map(int, edge.vertices)) == {1, 2}
+        )
+        shared.use_seam = True
+        assert not joined(source, (0, 0))
+        shared.use_seam = False
+        split = [point.copy() for point in source]
+        split[right] += Vector((0.01, 0.0))
+        assert not joined(split, (0, 0))
+        assert not joined(source, (0, 1))
+    finally:
+        _remove_object_and_mesh(obj, mesh)
+
+    geometry = (
+        (-0.2786858379840851, -0.7611002922058105, 0.13709962368011475),
+        (-0.2786858379840851, -0.7888550758361816, 0.13709938526153564),
+        (-0.2786858379840851, -1.0228915214538574, 0.13709962368011475),
+    )
+    source_uv = (
+        (0.4363405406475067, 0.18813258409500122),
+        (0.4410538077354431, 0.18813206255435944),
+        (0.4807974696159363, 0.1881280541419983),
+    )
+    post_uv = (
+        (0.469956636428833, 0.8852251172065735),
+        (0.47155243158340454, 0.8852249979972839),
+        (0.4850086569786072, 0.8852236270904541),
+    )
+    obj, mesh, source = _quantized_welded_strip(
+        "VUV_Welded_Repair_Rollback",
+        42,
+        geometry,
+        source_uv,
+        post_uv,
+    )
+    try:
+        uv_layer = mesh.uv_layers.active
+        face_map = tuple(0 for _face in mesh.polygons)
+        before = [item.uv.copy() for item in uv_layer.data]
+        groups, _loop_faces = VUV._source_welded_loop_groups(
+            mesh, source, face_map, 1.0e-6
+        )
+        direction_checks = []
+        repaired = VUV._try_welded_quantized_winding_repair(
+            mesh,
+            uv_layer,
+            0,
+            {index: point.copy() for index, point in enumerate(before)},
+            face_map,
+            source,
+            _welded_by_loop(groups),
+            1.0e-6,
+            direction_validator=lambda: direction_checks.append(True) and False,
+        )
+        assert repaired is None
+        assert direction_checks
+        assert all(
+            (item.uv - point).length_squared == 0.0
+            for item, point in zip(uv_layer.data, before)
+        )
+    finally:
+        _remove_object_and_mesh(obj, mesh)
+
+
+def _test_writeback_snap_preserves_source_island_count():
+    obj, mesh = _topology_object(
+        "VUV_Writeback_Continuity",
+        (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (2.0, 0.0, 0.0),
+            (2.0, 1.0, 0.0),
+        ),
+        ((0, 1, 2, 3), (1, 4, 5, 2)),
+        (
+            ((0.0, 0.0), (0.4, 0.0), (0.4, 0.4), (0.0, 0.4)),
+            ((0.4, 0.0), (0.8, 0.0), (0.8, 0.4), (0.4, 0.4)),
+        ),
+    )
+    options = VUV.GroupLayoutOptions(
+        uv_epsilon=1.0e-7,
+        align_geometry_direction=False,
+        align_non_repeat_cardinal=False,
+        small_island_scale_boost=1.0,
+    )
+    original_plan = VUV._plan_with_margin
+    try:
+        source = VUV.analyze_active_uv(obj, options)
+        assert len(source.islands) == 1, source.to_dict()
+        shared_right_loops = [
+            int(loop_index)
+            for loop_index in mesh.polygons[1].loop_indices
+            if int(mesh.loops[loop_index].vertex_index) in {1, 2}
+        ]
+        assert len(shared_right_loops) == 2, shared_right_loops
+
+        def perturbed_plan(*args, **kwargs):
+            plan, fitted, scale = original_plan(*args, **kwargs)
+            for loop_index in shared_right_loops:
+                fitted[0][loop_index] = (
+                    fitted[0][loop_index] + Vector((2.5e-7, 0.0))
+                )
+            return plan, fitted, scale
+
+        VUV._plan_with_margin = perturbed_plan
+        result = VUV.layout_active_uv(obj, options)
+        replay, _face_map, _adjacency, _diagonal = (
+            VUV.compute_active_uv_islands(obj, options)
+        )
+        assert len(replay) == len(result.analysis.islands) == 1, (
+            len(replay), len(result.analysis.islands)
+        )
+    finally:
+        VUV._plan_with_margin = original_plan
+        _remove_object_and_mesh(obj, mesh)
+
+
+def _test_writeback_snap_skips_seams_and_non_manifold_edges():
+    def exercise(name, vertices, faces, uv_polygons, mark_seam=False):
+        obj, mesh = _topology_object(name, vertices, faces, uv_polygons)
+        try:
+            source = [item.uv.copy() for item in mesh.uv_layers.active.data]
+            face_to_island = tuple(0 for _face in mesh.polygons)
+            fitted = {0: {
+                int(loop.index): source[int(loop.index)].copy()
+                for loop in mesh.loops
+            }}
+            shared_edge = next(
+                edge for edge in mesh.edges
+                if set(map(int, edge.vertices)) == {0, 1}
+            )
+            shared_edge.use_seam = bool(mark_seam)
+            incident = []
+            for polygon in mesh.polygons:
+                for loop_index in polygon.loop_indices:
+                    if int(mesh.loops[loop_index].vertex_index) == 0:
+                        incident.append(int(loop_index))
+                        fitted[0][int(loop_index)] += Vector((
+                            len(incident) * 1.0e-4, 0.0
+                        ))
+                        break
+            before = [fitted[0][index].copy() for index in incident]
+            snapped = VUV._snap_source_continuous_loops(
+                mesh, source, fitted, face_to_island, 1.0e-6
+            )
+            after = [fitted[0][index].copy() for index in incident]
+            assert snapped == 0, snapped
+            assert after == before, (before, after)
+        finally:
+            _remove_object_and_mesh(obj, mesh)
+
+    seam_vertices = (
+        (0.0, 0.0, 0.0), (1.0, 0.0, 0.0),
+        (0.5, 1.0, 0.0), (0.5, -1.0, 0.0),
+    )
+    seam_uv = (
+        ((0.0, 0.0), (1.0, 0.0), (0.5, 1.0)),
+        ((1.0, 0.0), (0.0, 0.0), (0.5, -1.0)),
+    )
+    exercise(
+        "VUV_Writeback_Seam",
+        seam_vertices,
+        ((0, 1, 2), (1, 0, 3)),
+        seam_uv,
+        mark_seam=True,
+    )
+
+    non_manifold_vertices = seam_vertices + ((0.5, 0.0, 1.0),)
+    exercise(
+        "VUV_Writeback_NonManifold",
+        non_manifold_vertices,
+        ((0, 1, 2), (1, 0, 3), (0, 1, 4)),
+        seam_uv + (((0.0, 0.0), (1.0, 0.0), (0.5, 1.0)),),
+    )
+
+
+def _test_rotated_shared_boundary_uses_semantic_uv_epsilon():
+    """Ignore float32 edge-touch noise without hiding real overlap."""
+
+    angle = math.radians(31.7)
+    origin = Vector((0.0, 0.0))
+    offset = Vector((0.37, 0.21))
+
+    def transformed(points):
+        return tuple(
+            VUV._rotate_point(Vector(point), origin, angle) * 0.23 + offset
+            for point in points
+        )
+
+    left_quad = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+    # Two topology-adjacent quads have independently stored UV loops.  Their
+    # shared edge intrudes by 5e-7 before scale and float32 storage, matching
+    # the edge-touch noise seen after rigidly rotating Gun Head.
+    edge_noise_quad = (
+        (1.0 - 5.0e-7, 0.0),
+        (2.0, 0.0),
+        (2.0, 1.0),
+        (1.0 - 5.0e-7, 1.0),
+    )
+    left_triangle = ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))
+    real_overlap = (
+        (1.0 - 5.0e-3, 0.0),
+        (1.0, 1.0),
+        (0.0, 1.0 - 5.0e-3),
+    )
+
+    noisy_obj, noisy_mesh = _topology_object(
+        "VUV_Rotated_Edge_Noise",
+        (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (2.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (2.0, 1.0, 0.0),
+        ),
+        ((0, 1, 4, 3), (1, 2, 5, 4)),
+        (transformed(left_quad), transformed(edge_noise_quad)),
+    )
+    overlap_obj, overlap_mesh = _polygon_object(
+        "VUV_Rotated_Real_Overlap",
+        (
+            ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+            ((1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)),
+        ),
+        (transformed(left_triangle), transformed(real_overlap)),
+    )
+    try:
+        strict_noise = VUV.audit_active_uv(
+            noisy_obj, (0, 0), epsilon=1.0e-7
+        )
+        semantic_noise = VUV.audit_active_uv(
+            noisy_obj, (0, 0), epsilon=1.0e-6
+        )
+        semantic_overlap = VUV.audit_active_uv(
+            overlap_obj, (0, 1), epsilon=1.0e-6
+        )
+        assert strict_noise["overlap"], strict_noise
+        assert not semantic_noise["overlap"], semantic_noise
+        assert semantic_noise["valid"], semantic_noise
+        assert semantic_overlap["overlap"], semantic_overlap
+        assert not semantic_overlap["valid"], semantic_overlap
+
+        options = VUV.GroupLayoutOptions(
+            uv_epsilon=1.0e-6,
+            align_geometry_direction=False,
+            small_island_scale_boost=1.0,
+        )
+        islands, face_map, _adjacency, _diagonal = (
+            VUV.compute_active_uv_islands(noisy_obj, options)
+        )
+        assert len(islands) == 1, [item.face_indices for item in islands]
+        assert tuple(face_map) == (0, 0), face_map
+        result = VUV.layout_active_uv(noisy_obj, options)
+        assert not result.before_audit["overlap"], result.before_audit
+        assert not result.after_audit["overlap"], result.after_audit
+        VUV._validate_result_audit(result.after_audit)
+    finally:
+        _remove_object_and_mesh(noisy_obj, noisy_mesh)
+        _remove_object_and_mesh(overlap_obj, overlap_mesh)
+
+
+def _test_adaptive_replay_reaudits_committed_coordinates():
+    model = (
+        (0.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0),
+        (2.0, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+    )
+    uv = ((0.1, 0.1), (0.6, 0.1), (0.6, 0.35), (0.1, 0.35))
+    obj, mesh = _polygon_object("VUV_Adaptive_Replay_Audit", (model,), (uv,))
+    options = VUV.GroupLayoutOptions(
+        align_geometry_direction=True,
+        small_island_scale_boost=1.0,
+    )
+    source = [item.uv.copy() for item in mesh.uv_layers.active.data]
+    original_quality = VUV.evaluate_layout_quality
+    calls = {"count": 0}
+
+    def fail_only_replay(*args, **kwargs):
+        calls["count"] += 1
+        result = original_quality(*args, **kwargs)
+        if calls["count"] == 3:
+            result = dict(result)
+            result["valid"] = False
+        return result
+
+    VUV.evaluate_layout_quality = fail_only_replay
+    try:
+        try:
+            VUV.layout_active_uv_adaptive(obj, options)
+        except RuntimeError as exc:
+            assert "replay failed final quality audit" in str(exc), str(exc)
+        else:
+            raise AssertionError("Invalid adaptive replay was committed")
+    finally:
+        VUV.evaluate_layout_quality = original_quality
+    assert calls["count"] == 3, calls
+    after = [item.uv.copy() for item in mesh.uv_layers.active.data]
+    assert all((left - right).length <= 1.0e-12 for left, right in zip(source, after))
+    _remove_object_and_mesh(obj, mesh)
+
+
+def _test_adaptive_replay_exception_restores_source():
+    model = (
+        (0.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0),
+        (2.0, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+    )
+    uv = ((0.1, 0.1), (0.6, 0.1), (0.6, 0.35), (0.1, 0.35))
+    obj, mesh = _polygon_object("VUV_Adaptive_Replay_Exception", (model,), (uv,))
+    options = VUV.GroupLayoutOptions(
+        align_geometry_direction=True,
+        small_island_scale_boost=1.0,
+    )
+    source = [item.uv.copy() for item in mesh.uv_layers.active.data]
+    original_quality = VUV.evaluate_layout_quality
+    calls = {"count": 0}
+
+    def raise_only_replay(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 3:
+            raise RuntimeError("synthetic replay evaluator failure")
+        return original_quality(*args, **kwargs)
+
+    VUV.evaluate_layout_quality = raise_only_replay
+    try:
+        try:
+            VUV.layout_active_uv_adaptive(obj, options)
+        except RuntimeError as exc:
+            assert "synthetic replay evaluator failure" in str(exc), str(exc)
+        else:
+            raise AssertionError("Exceptional adaptive replay was committed")
+    finally:
+        VUV.evaluate_layout_quality = original_quality
+    assert calls["count"] == 3, calls
+    after = [item.uv.copy() for item in mesh.uv_layers.active.data]
+    assert all((left - right).length <= 1.0e-12 for left, right in zip(source, after))
+    _remove_object_and_mesh(obj, mesh)
+
+
 def _analysis(islands, repeat_groups=(), layout_groups=()):
     return VUV.UVLayoutAnalysis(
         object_name="Regression",
@@ -1610,6 +2951,70 @@ def _test_shelf_order_ensemble_closes_blank_space_without_scale_loss():
             assert VUV._placements_clear(left, right, gap), improved[0]
 
 
+def _test_rigid_maxrects_is_deterministic_and_never_rotates():
+    rectangles = tuple(
+        VUV._Rect(index, width, height, index)
+        for index, (width, height) in enumerate((
+            (0.62, 0.38),
+            (0.38, 0.62),
+            (0.36, 0.24),
+            (0.24, 0.36),
+            (0.17, 0.11),
+        ))
+    )
+    gap = 0.013
+    first = VUV._best_rigid_maxrects_pack(
+        rectangles, gap, baseline_width=1.0
+    )
+    second = VUV._best_rigid_maxrects_pack(
+        rectangles, gap, baseline_width=1.0
+    )
+    assert first is not None
+    assert first == second, (first, second)
+    placements, width, height = first
+    assert VUV._rigid_pack_is_valid(
+        rectangles, placements, width, height, gap
+    )
+    by_id = {rect.key: rect for rect in rectangles}
+    for key, placement in placements.items():
+        assert not placement.quarter_turn
+        assert abs(placement.width - by_id[key].width) < 1.0e-12
+        assert abs(placement.height - by_id[key].height) < 1.0e-12
+
+
+def _test_rigid_maxrects_longest_edge_gate_falls_back_to_shelf():
+    rectangles = (
+        VUV._Rect(0, 0.40, 0.20, 0),
+        VUV._Rect(1, 0.30, 0.20, 1),
+    )
+    gap = 0.01
+    shelf = VUV._best_shelf_pack(
+        rectangles,
+        gap,
+        allow_rotate=False,
+        preserve_order=False,
+    )
+    deliberately_worse = (
+        {
+            0: VUV._Placement(0.0, 0.0, 0.40, 0.20, False),
+            1: VUV._Placement(2.0, 0.0, 0.30, 0.20, False),
+        },
+        2.30,
+        0.20,
+    )
+    assert VUV._rigid_pack_is_valid(
+        rectangles, deliberately_worse[0], deliberately_worse[1],
+        deliberately_worse[2], gap,
+    )
+    original = VUV._best_rigid_maxrects_pack
+    VUV._best_rigid_maxrects_pack = lambda *_args, **_kwargs: deliberately_worse
+    try:
+        selected = VUV._prefer_rigid_maxrects_pack(rectangles, gap, shelf)
+    finally:
+        VUV._best_rigid_maxrects_pack = original
+    assert selected is shelf
+
+
 def _test_low_anisotropy_boundary_edge_snaps_cardinal():
     angle = math.radians(30.0)
     base = (
@@ -1638,18 +3043,691 @@ def _test_low_anisotropy_boundary_edge_snaps_cardinal():
         assert island.dominant_edge_confidence >= 0.15
         angles = VUV._orientation_angles(
             analysis,
-            VUV.GroupLayoutOptions(),
+            VUV.GroupLayoutOptions(align_geometry_direction=False),
         )
         # The long boundary edge is at 30 degrees, so cardinal snapping uses
         # the negative 30-degree correction even though PCA is isotropic.
         assert abs(angles[island.island_id] + angle) < 1.0e-6, angles
         disabled = VUV._orientation_angles(
             analysis,
-            VUV.GroupLayoutOptions(align_non_repeat_cardinal=False),
+            VUV.GroupLayoutOptions(
+                align_non_repeat_cardinal=False,
+                align_geometry_direction=False,
+            ),
         )
         assert abs(disabled[island.island_id]) < 1.0e-12, disabled
     finally:
         _remove_object_and_mesh(obj, mesh)
+
+
+def _test_geometry_direction_removes_standalone_180_flip():
+    model = (
+        (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 0.0, 2.0),
+            (0.0, 0.0, 2.0),
+        ),
+        (
+            (3.0, 0.0, 0.0),
+            (4.0, 0.0, 0.0),
+            (4.0, 0.0, 2.0),
+            (3.0, 0.0, 2.0),
+        ),
+    )
+    upright = (
+        (0.05, 0.05),
+        (0.25, 0.05),
+        (0.25, 0.45),
+        (0.05, 0.45),
+    )
+    upside_down = (
+        (0.75, 0.45),
+        (0.55, 0.45),
+        (0.55, 0.05),
+        (0.75, 0.05),
+    )
+    obj, mesh = _polygon_object(
+        "VUV_Directed_180", model, (upright, upside_down)
+    )
+    settings = VUV.GroupLayoutOptions(
+        align_geometry_direction=True,
+        direction_space="OBJECT",
+        direction_axis="AUTO",
+        allow_group_quarter_turn=True,
+        small_island_scale_boost=1.0,
+    )
+    try:
+        analysis = VUV.analyze_active_uv(obj, settings)
+        assert len(analysis.islands) == 2
+        assert {
+            island.geometry_axis_name for island in analysis.islands
+        } == {"Z"}
+        source_rotations = sorted(
+            abs(VUV._angle_wrap(island.geometry_rotation_angle))
+            for island in analysis.islands
+        )
+        assert source_rotations[0] < 1.0e-6, source_rotations
+        assert abs(source_rotations[1] - math.pi) < 1.0e-6, source_rotations
+
+        result = VUV.layout_active_uv(obj, settings)
+        directed = result.quality_metrics["directed_geometry"]
+        assert result.group_quarter_turn is False
+        assert directed["resolved_islands"] == 2, directed
+        assert directed["misaligned_islands"] == 0, directed
+        assert directed["opposite_islands"] == 0, directed
+        assert directed["quarter_turn_islands"] == 0, directed
+        assert directed["residual_max_degrees"] < 1.0e-3, directed
+    finally:
+        _remove_object_and_mesh(obj, mesh)
+
+
+def _test_geometry_direction_auto_axis_falls_back_on_horizontal_cap():
+    model = ((
+        (0.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0),
+        (2.0, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+    ),)
+    uv = (((0.1, 0.1), (0.9, 0.1), (0.9, 0.5), (0.1, 0.5)),)
+    obj, mesh = _polygon_object("VUV_Directed_Cap", model, uv)
+    try:
+        automatic = VUV.analyze_active_uv(
+            obj,
+            VUV.GroupLayoutOptions(
+                align_geometry_direction=True,
+                direction_axis="AUTO",
+            ),
+        ).islands[0]
+        assert automatic.geometry_axis_name == "X", automatic.to_dict()
+        assert abs(
+            VUV._angle_wrap(automatic.geometry_rotation_angle - math.pi * 0.5)
+        ) < 1.0e-6, automatic.to_dict()
+
+        explicit_normal = VUV.analyze_active_uv(
+            obj,
+            VUV.GroupLayoutOptions(
+                align_geometry_direction=True,
+                direction_axis="Z",
+            ),
+        ).islands[0]
+        assert explicit_normal.geometry_axis_name is None
+        assert explicit_normal.geometry_direction_confidence < 0.35
+    finally:
+        _remove_object_and_mesh(obj, mesh)
+
+
+def _test_geometry_direction_auto_rejects_bimodal_preferred_axis():
+    large = (
+        (0.0, 0.0, 0.0),
+        (3.0, 0.0, 0.0),
+        (3.0, 0.0, 1.0),
+        (0.0, 0.0, 1.0),
+    )
+    small = (
+        (4.0, 0.0, 0.0),
+        (6.0, 0.0, 0.0),
+        (6.0, 0.0, 1.0),
+        (4.0, 0.0, 1.0),
+    )
+    large_uv = tuple((point[0], point[2]) for point in large)
+    small_uv = tuple((point[0], -point[2]) for point in small)
+    obj, mesh = _polygon_object(
+        "VUV_Directed_Bimodal_Auto",
+        (large, small),
+        (large_uv, small_uv),
+    )
+    try:
+        uv_layer = mesh.uv_layers.active
+        automatic = VUV._geometry_direction_record(
+            obj,
+            mesh,
+            uv_layer,
+            (0, 1),
+            axis="AUTO",
+            min_projection=VUV._GEOMETRY_AXIS_RELATIVE_EPSILON,
+        )
+        explicit = VUV._geometry_direction_record(
+            obj,
+            mesh,
+            uv_layer,
+            (0, 1),
+            axis="Z",
+            min_projection=VUV._GEOMETRY_AXIS_RELATIVE_EPSILON,
+        )
+        replay_fixed = VUV._geometry_direction_record(
+            obj,
+            mesh,
+            uv_layer,
+            (0, 1),
+            axis="AUTO",
+            min_projection=VUV._GEOMETRY_AXIS_RELATIVE_EPSILON,
+            fixed_axis_name="Z",
+        )
+        assert automatic[0] == "X", automatic
+        assert explicit[0] == "Z", explicit
+        assert replay_fixed[0] == "Z", replay_fixed
+    finally:
+        _remove_object_and_mesh(obj, mesh)
+
+
+def _test_structure_group_binds_one_signed_geometry_axis():
+    vertices = (
+        (0.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0),
+        (2.0, 0.0, 1.0),
+        (0.0, 0.0, 1.0),
+        (0.0, 1.0, 0.0),
+        (2.0, 1.0, 0.0),
+    )
+    faces = (
+        (0, 1, 2, 3),
+        (0, 4, 5, 1),
+    )
+    uv_polygons = (
+        ((0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (0.0, 1.0)),
+        ((3.0, 0.0), (5.0, 0.0), (5.0, 1.0), (3.0, 1.0)),
+    )
+    obj, mesh = _topology_object(
+        "VUV_Structure_Common_Axis", vertices, faces, uv_polygons
+    )
+    settings = VUV.GroupLayoutOptions(
+        align_geometry_direction=True,
+        direction_axis="AUTO",
+        structure_group_enabled=True,
+        structure_group_max_diameter_ratio=1.0,
+        small_island_scale_boost=1.0,
+    )
+    try:
+        uv_layer = mesh.uv_layers.active
+        independent = [
+            VUV._geometry_direction_record(
+                obj,
+                mesh,
+                uv_layer,
+                (face_index,),
+                axis="AUTO",
+                min_projection=settings.direction_axis_min_projection,
+            )[0]
+            for face_index in (0, 1)
+        ]
+        assert independent == ["Z", "X"], independent
+
+        analysis = VUV.analyze_active_uv(obj, settings)
+        assert len(analysis.islands) == 2, analysis.to_dict()
+        assert {
+            island.geometry_axis_name for island in analysis.islands
+        } == {"X"}, analysis.to_dict()
+        assert any(
+            item["source"] == "STRUCTURE_AFFINITY"
+            and item["selected_axis"] == "X"
+            and item["previous_axes"] == ["Z", "X"]
+            for item in analysis.geometry_axis_groups
+        ), analysis.geometry_axis_groups
+
+        result = VUV.layout_active_uv(obj, settings)
+        assert result.group_quarter_turn is False
+        committed = VUV.analyze_active_uv(obj, settings)
+        assert {
+            island.geometry_axis_name for island in committed.islands
+        } == {"X"}, committed.to_dict()
+        for island in committed.islands:
+            direction = island.geometry_direction_vector
+            assert abs(float(direction.x)) < 1.0e-5, island.to_dict()
+            assert float(direction.y) > 1.0 - 1.0e-5, island.to_dict()
+    finally:
+        _remove_object_and_mesh(obj, mesh)
+
+
+def _owner_child_direction_fixture(name, include_second_child=False):
+    vertices = [
+        (0.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0),
+        (2.0, 0.0, 1.0),
+        (0.0, 0.0, 1.0),
+        (2.005, 0.0, 0.50),
+        (2.015, 0.0, 0.50),
+        (2.015, 0.01, 0.50),
+        (2.005, 0.01, 0.50),
+    ]
+    faces = [(0, 1, 2, 3), (4, 5, 6, 7)]
+    uv_polygons = [
+        ((0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (0.0, 1.0)),
+        ((3.0, 0.0), (3.01, 0.0), (3.01, 0.01), (3.0, 0.01)),
+    ]
+    if include_second_child:
+        vertices.extend((
+            (1.90, 0.005, 0.50),
+            (1.90, 0.015, 0.50),
+            (1.90, 0.015, 0.51),
+            (1.90, 0.005, 0.51),
+        ))
+        faces.append((8, 9, 10, 11))
+        uv_polygons.append((
+            (3.02, 0.0),
+            (3.03, 0.0),
+            (3.03, 0.01),
+            (3.02, 0.01),
+        ))
+    obj, mesh = _topology_object(name, vertices, faces, uv_polygons)
+    settings = VUV.GroupLayoutOptions(
+        align_geometry_direction=True,
+        direction_axis="AUTO",
+        structure_group_enabled=False,
+        small_area_ratio=0.01,
+        small_uv_area_ratio=0.01,
+        proximity_radius_ratio=1.0,
+        small_island_scale_boost=1.0,
+    )
+    return obj, mesh, settings
+
+
+def _test_owner_child_uses_one_shared_signed_geometry_axis():
+    obj, mesh, settings = _owner_child_direction_fixture(
+        "VUV_Owner_Child_Common_Axis"
+    )
+    try:
+        uv_layer = mesh.uv_layers.active
+        independent = [
+            VUV._geometry_direction_record(
+                obj,
+                mesh,
+                uv_layer,
+                (face_index,),
+                axis="AUTO",
+                min_projection=settings.direction_axis_min_projection,
+            )[0]
+            for face_index in (0, 1)
+        ]
+        assert independent == ["Z", "X"], independent
+
+        analysis = VUV.analyze_active_uv(obj, settings)
+        by_id = {island.island_id: island for island in analysis.islands}
+        assert not by_id[0].is_small and by_id[1].is_small
+        owner_group = next(
+            group for group in analysis.layout_groups if 0 in group.anchor_ids
+        )
+        assert dict(zip(
+            owner_group.small_member_ids,
+            owner_group.small_anchor_ids,
+        )) == {1: 0}, owner_group.to_dict()
+        assert {by_id[index].geometry_axis_name for index in (0, 1)} == {"X"}
+        assert any(
+            item["source"] == "OWNER_ATTACHMENT"
+            and item["selected_axis"] == "X"
+            and set(item["members"]) == {0, 1}
+            and item["resolved"]
+            and not item["compatibility_split"]
+            for item in analysis.geometry_axis_groups
+        ), analysis.geometry_axis_groups
+
+        result = VUV.layout_active_uv(obj, settings)
+        assert result.candidate_valid, result.to_dict()
+        committed = VUV.analyze_active_uv(obj, settings)
+        for island in committed.islands:
+            assert island.geometry_axis_name == "X", island.to_dict()
+            assert abs(float(island.geometry_direction_vector.x)) < 1.0e-5
+            assert float(island.geometry_direction_vector.y) > 1.0 - 1.0e-5
+    finally:
+        _remove_object_and_mesh(obj, mesh)
+
+
+def _test_owner_axis_seeds_incompatible_child_partition():
+    obj, mesh, settings = _owner_child_direction_fixture(
+        "VUV_Owner_Child_Split_Axes", include_second_child=True
+    )
+    try:
+        uv_layer = mesh.uv_layers.active
+        independent = [
+            VUV._geometry_direction_record(
+                obj,
+                mesh,
+                uv_layer,
+                (face_index,),
+                axis="AUTO",
+                min_projection=settings.direction_axis_min_projection,
+            )[0]
+            for face_index in (0, 1, 2)
+        ]
+        assert independent == ["Z", "X", "Z"], independent
+
+        analysis = VUV.analyze_active_uv(obj, settings)
+        by_id = {island.island_id: island for island in analysis.islands}
+        assert by_id[0].geometry_axis_name == "Z", analysis.to_dict()
+        assert by_id[2].geometry_axis_name == "Z", analysis.to_dict()
+        records = [
+            item for item in analysis.geometry_axis_groups
+            if item["source"] == "OWNER_ATTACHMENT"
+        ]
+        assert len(records) >= 2, analysis.geometry_axis_groups
+        assert all(item["compatibility_split"] for item in records), records
+        owner_record = next(item for item in records if 0 in item["members"])
+        assert owner_record["selected_axis"] == "Z", owner_record
+        assert {0, 2}.issubset(set(owner_record["members"])), owner_record
+        assert any(
+            1 in item["members"] and item["selected_axis"] != "Z"
+            for item in records
+        ), records
+
+        result = VUV.layout_active_uv(obj, settings)
+        assert result.candidate_valid, result.to_dict()
+        committed = VUV.analyze_active_uv(obj, settings)
+        committed_by_id = {
+            island.island_id: island for island in committed.islands
+        }
+        assert committed_by_id[0].geometry_axis_name == "Z"
+        assert committed_by_id[2].geometry_axis_name == "Z"
+    finally:
+        _remove_object_and_mesh(obj, mesh)
+
+
+def _test_common_axis_uses_weakest_member_stability_before_priority():
+    # This models the diagnosed Body cohort: Z is technically coherent for
+    # every member, but one member sits at the 0.50 effective-fraction gate.
+    # X has a robust margin on all members and must remain selected if float32
+    # replay nudges that weak Z member below the gate.
+    candidates = (
+        {
+            "Z": {"coherent": True, "stability": 0.6667, "confidence": 0.3414},
+            "X": {"coherent": True, "stability": 0.7631, "confidence": 0.4843},
+        },
+        {
+            "Z": {"coherent": True, "stability": 0.4994, "confidence": 0.0195},
+            "X": {"coherent": True, "stability": 1.0, "confidence": 0.7068},
+        },
+        {
+            "Z": {"coherent": True, "stability": 0.9563, "confidence": 0.6784},
+            "X": {"coherent": True, "stability": 0.9574, "confidence": 0.7237},
+        },
+    )
+    selected = VUV._select_common_geometry_axis(
+        candidates, ("Z", "X", "Y")
+    )
+    assert selected == "X", selected
+
+    replay = tuple(dict(values) for values in candidates)
+    replay[1]["Z"] = dict(replay[1]["Z"], coherent=False)
+    replay_selected = VUV._select_common_geometry_axis(
+        replay, ("Z", "X", "Y")
+    )
+    assert replay_selected == selected == "X", (selected, replay_selected)
+    assert VUV._select_common_geometry_axis(
+        candidates, ("Z", "X", "Y"), preferred_axis="Z"
+    ) == "Z"
+
+    symmetric = (
+        {
+            "Z": {"coherent": True, "stability": 0.99995, "confidence": 0.70709},
+            "X": {"coherent": True, "stability": 1.0, "confidence": 0.70713},
+        },
+        {
+            "Z": {"coherent": True, "stability": 1.0, "confidence": 0.70713},
+            "X": {"coherent": True, "stability": 0.99995, "confidence": 0.70709},
+        },
+    )
+    assert VUV._select_common_geometry_axis(
+        symmetric, ("Z", "X", "Y")
+    ) == "Z"
+
+
+def _test_structure_group_splits_incompatible_auto_axes_deterministically():
+    vertices = (
+        (-1.0, -1.0, -1.0),
+        (1.0, -1.0, -1.0),
+        (1.0, 1.0, -1.0),
+        (-1.0, 1.0, -1.0),
+        (-1.0, -1.0, 1.0),
+        (1.0, -1.0, 1.0),
+        (1.0, 1.0, 1.0),
+        (-1.0, 1.0, 1.0),
+    )
+    faces = (
+        (0, 3, 2, 1),
+        (4, 5, 6, 7),
+        (0, 1, 5, 4),
+        (1, 2, 6, 5),
+        (2, 3, 7, 6),
+        (3, 0, 4, 7),
+    )
+    uv_polygons = tuple(
+        tuple(
+            (column * 0.30 + x * 0.20, row * 0.40 + y * 0.20)
+            for x, y in ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+        )
+        for row in range(2)
+        for column in range(3)
+    )
+    obj, mesh = _topology_object(
+        "VUV_Structure_Split_Axes", vertices, faces, uv_polygons
+    )
+    settings = VUV.GroupLayoutOptions(
+        align_geometry_direction=True,
+        direction_axis="AUTO",
+        structure_group_enabled=True,
+        structure_group_max_members=12,
+        structure_group_max_degree=4,
+        structure_group_min_contact_ratio=0.06,
+        structure_group_max_diameter_ratio=1.0,
+        structure_group_max_normal_angle=math.radians(100.0),
+        small_island_scale_boost=1.0,
+    )
+    try:
+        analysis = VUV.analyze_active_uv(obj, settings)
+        assert len(analysis.islands) == 6, analysis.to_dict()
+        records = [
+            item for item in analysis.geometry_axis_groups
+            if item["source"] == "STRUCTURE_AFFINITY"
+        ]
+        assert len(records) >= 2, analysis.geometry_axis_groups
+        assert all(item["resolved"] for item in records), records
+        assert all(item["compatibility_split"] for item in records), records
+        assert {
+            island_id for item in records for island_id in item["members"]
+        } == set(range(6)), records
+        assert len({item["selected_axis"] for item in records}) >= 2, records
+        assert max(len(item["members"]) for item in records) >= 2, records
+
+        by_id = {island.island_id: island for island in analysis.islands}
+        for item in records:
+            assert {
+                by_id[island_id].geometry_axis_name
+                for island_id in item["members"]
+            } == {item["selected_axis"]}, (item, analysis.to_dict())
+
+        result = VUV.layout_active_uv(obj, settings)
+        directed = result.quality_metrics["directed_geometry"]
+        assert result.candidate_valid, result.to_dict()
+        assert result.quality_metrics["directed_geometry_valid"], directed
+        assert directed["resolved_islands"] == 6, directed
+        assert directed["unresolved_islands"] == 0, directed
+        assert directed["misaligned_islands"] == 0, directed
+
+        committed = VUV.analyze_active_uv(obj, settings)
+        committed_by_id = {
+            island.island_id: island for island in committed.islands
+        }
+        committed_records = [
+            item for item in committed.geometry_axis_groups
+            if item["source"] == "STRUCTURE_AFFINITY" and item["resolved"]
+        ]
+        assert len(committed_records) >= 2, committed.geometry_axis_groups
+        for item in committed_records:
+            for island_id in item["members"]:
+                island = committed_by_id[island_id]
+                assert island.geometry_axis_name == item["selected_axis"]
+                assert abs(float(island.geometry_direction_vector.x)) < 1.0e-5
+                assert float(island.geometry_direction_vector.y) > 1.0 - 1.0e-5
+    finally:
+        _remove_object_and_mesh(obj, mesh)
+
+
+def _test_geometry_direction_is_scale_invariant_for_tiny_islands():
+    model = ((
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (1.0, 0.0, 2.0),
+        (0.0, 0.0, 2.0),
+    ),)
+    records = []
+    cases = (
+        (1.0, 0.0),
+        (1.0e-4, 0.3),
+        (1.0e-6, 0.7),
+        (1.0e-7, 0.0),
+    )
+    for index, (scale, offset) in enumerate(cases):
+        uv = (((
+            (offset, offset),
+            (offset + scale, offset),
+            (offset + scale, offset + 2.0 * scale),
+            (offset, offset + 2.0 * scale),
+        )),)
+        obj, mesh = _polygon_object(
+            "VUV_Directed_Tiny_{}".format(index), model, uv
+        )
+        try:
+            island = VUV.analyze_active_uv(
+                obj,
+                VUV.GroupLayoutOptions(
+                    align_geometry_direction=True,
+                    direction_axis="AUTO",
+                ),
+            ).islands[0]
+            records.append((
+                island.geometry_axis_name,
+                island.geometry_rotation_angle,
+                island.geometry_direction_confidence,
+            ))
+        finally:
+            _remove_object_and_mesh(obj, mesh)
+    assert all(axis == "Z" for axis, _angle, _confidence in records), records
+    assert max(abs(angle) for _axis, angle, _confidence in records) < 1.0e-4, records
+    confidences = [confidence for _axis, _angle, confidence in records]
+    assert max(confidences) - min(confidences) < 0.03, records
+
+
+def _test_direction_resolution_gate_distinguishes_auto_and_explicit_axis():
+    cap_model = ((
+        (0.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0),
+        (2.0, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+    ),)
+    vertical_model = ((
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (1.0, 0.0, 2.0),
+        (0.0, 0.0, 2.0),
+    ),)
+    uv = (((0.1, 0.1), (0.8, 0.1), (0.8, 0.6), (0.1, 0.6)),)
+    cap_obj, cap_mesh = _polygon_object("VUV_Direction_Unresolved_Cap", cap_model, uv)
+    vertical_obj, vertical_mesh = _polygon_object(
+        "VUV_Direction_Required_Axis", vertical_model, uv
+    )
+    explicit = VUV.GroupLayoutOptions(
+        align_geometry_direction=True,
+        direction_axis="Z",
+    )
+    automatic = VUV.GroupLayoutOptions(
+        align_geometry_direction=True,
+        direction_axis="AUTO",
+    )
+    try:
+        cap_analysis = VUV.analyze_active_uv(cap_obj, explicit)
+        assert cap_analysis.islands[0].geometry_axis_name is None
+        vertical_analysis = VUV.analyze_active_uv(vertical_obj, explicit)
+        assert vertical_analysis.islands[0].geometry_axis_name == "Z"
+
+        original_record = VUV._geometry_direction_record
+        replay_analysis = VUV.analyze_active_uv(vertical_obj, explicit)
+        replay_analysis.islands[0].geometry_axis_name = "X"
+        captured_axes = []
+
+        def traced_record(*args, **kwargs):
+            captured_axes.append(kwargs.get("fixed_axis_name"))
+            return original_record(*args, **kwargs)
+
+        VUV._geometry_direction_record = traced_record
+        try:
+            rebound = VUV._rebind_geometry_axis_contract(
+                vertical_obj,
+                vertical_mesh,
+                vertical_mesh.uv_layers.active,
+                replay_analysis,
+                vertical_analysis,
+                explicit,
+            )
+        finally:
+            VUV._geometry_direction_record = original_record
+        assert captured_axes == ["Z"], captured_axes
+        assert rebound.islands[0].geometry_axis_name == "Z"
+
+        def unresolved(*args, **kwargs):
+            return None, Vector((0.0, 0.0)), 0.0, 0.0
+
+        VUV._geometry_direction_record = unresolved
+        try:
+            auto_metrics = VUV.evaluate_layout_quality(
+                cap_obj,
+                analysis=cap_analysis,
+                face_to_island=cap_analysis.face_to_island,
+                options=automatic,
+            )
+            explicit_cap_metrics = VUV.evaluate_layout_quality(
+                cap_obj,
+                analysis=cap_analysis,
+                face_to_island=cap_analysis.face_to_island,
+                options=explicit,
+            )
+            explicit_lost_metrics = VUV.evaluate_layout_quality(
+                vertical_obj,
+                analysis=vertical_analysis,
+                face_to_island=vertical_analysis.face_to_island,
+                options=explicit,
+            )
+        finally:
+            VUV._geometry_direction_record = original_record
+
+        assert auto_metrics["directed_geometry_unresolved_islands"] == 1
+        assert not auto_metrics["directed_geometry_valid"], auto_metrics
+        assert explicit_cap_metrics["directed_geometry_unresolved_islands"] == 1
+        assert explicit_cap_metrics["directed_geometry_required_unresolved_islands"] == 0
+        assert explicit_cap_metrics["directed_geometry_valid"], explicit_cap_metrics
+        assert explicit_lost_metrics[
+            "directed_geometry_required_unresolved_islands"
+        ] == 1
+        assert not explicit_lost_metrics["directed_geometry_valid"], (
+            explicit_lost_metrics
+        )
+    finally:
+        _remove_object_and_mesh(cap_obj, cap_mesh)
+        _remove_object_and_mesh(vertical_obj, vertical_mesh)
+
+
+def _test_replay_identity_includes_unresolved_explicit_axis_islands():
+    bounds = (0.0, 0.0, 0.0, 1.0, 1.0, 0.1)
+    expected_resolved = _island(1, bounds)
+    expected_resolved.geometry_axis_name = "Z"
+    expected_unresolved = _island(2, bounds)
+    expected = _analysis((expected_resolved, expected_unresolved))
+
+    replay_resolved = _island(1, bounds)
+    replay_resolved.geometry_axis_name = "Z"
+    replay_changed_unresolved = _island(3, bounds)
+    replay = _analysis((replay_resolved, replay_changed_unresolved))
+    try:
+        VUV._rebind_geometry_axis_contract(
+            None,
+            None,
+            None,
+            replay,
+            expected,
+            VUV.GroupLayoutOptions(direction_axis="Z"),
+        )
+    except RuntimeError as exc:
+        assert "changed island identity" in str(exc), str(exc)
+    else:
+        raise AssertionError("Unresolved replay island identity drift passed")
 
 
 def _test_margin_correction_with_one_iteration():
@@ -1739,6 +3817,7 @@ def _test_area_aware_quality_metrics_use_polygon_area():
             obj,
             analysis=analysis,
             face_to_island=analysis.face_to_island,
+            options=VUV.GroupLayoutOptions(align_geometry_direction=False),
         )
         assert abs(metrics["polygon_area"] - 0.48) < 1.0e-6, metrics
         assert abs(metrics["tile_aabb_area"] - 0.64) < 1.0e-6, metrics
@@ -1838,7 +3917,85 @@ def _test_area_score_balances_aabb_fill_and_coverage():
     assert fuller_score > strip_score, (fuller_score, strip_score)
 
 
+def _geometry_stub(
+    island_id,
+    rotation,
+    *,
+    axis="Z",
+    area=1.0,
+    confidence=0.9,
+):
+    island = _island(
+        island_id,
+        (float(island_id) * 2.0, 0.0, 0.0,
+         float(island_id) * 2.0 + 1.0, 1.0, 1.0),
+    )
+    island.area_3d = area
+    island.geometry_axis_name = axis
+    island.geometry_direction_space = "OBJECT"
+    island.geometry_direction_vector = Vector((0.0, 1.0))
+    island.geometry_direction_confidence = confidence
+    island.geometry_rotation_angle = rotation
+    return island
+
+
+def _test_same_axis_geometry_cohort_uses_stable_common_angle():
+    first = _geometry_stub(0, math.radians(10.0), area=4.0)
+    second = _geometry_stub(1, math.radians(11.5), area=1.0)
+    group = VUV.LayoutGroup(
+        group_id=0,
+        member_ids=(0, 1),
+        reason="TOPOLOGY_BLOCK",
+        anchor_ids=(0, 1),
+        affinity_pairs=((0, 1),),
+    )
+    analysis = _analysis((first, second), layout_groups=(group,))
+    settings = VUV.GroupLayoutOptions(
+        align_geometry_direction=True,
+        direction_residual_tolerance=math.radians(3.0),
+    )
+    angles = VUV._orientation_angles(analysis, settings)
+    # The larger panel is the deterministic weighted anchor.  Sharing its
+    # correction removes the visible 1.5-degree checker drift while remaining
+    # inside the strict three-degree geometry residual contract.
+    assert abs(VUV._angle_wrap(angles[0] - first.geometry_rotation_angle)) < 1.0e-12
+    assert abs(VUV._angle_wrap(angles[1] - angles[0])) < 1.0e-12
+    assert abs(VUV._angle_wrap(angles[1] - second.geometry_rotation_angle)) < math.radians(3.0)
+    assert VUV._geometry_angle_cohorts(analysis, settings)
+
+
+def _test_geometry_cohort_rejects_real_turn_or_axis_mix():
+    first = _geometry_stub(0, 0.0, axis="Z")
+    quarter = _geometry_stub(1, math.radians(90.0), axis="Z")
+    cross_axis = _geometry_stub(2, math.radians(0.5), axis="X")
+    group = VUV.LayoutGroup(
+        group_id=0,
+        member_ids=(0, 1, 2),
+        reason="ROTATIONAL",
+        anchor_ids=(0, 1, 2),
+        affinity_pairs=((0, 1), (1, 2)),
+    )
+    analysis = _analysis((first, quarter, cross_axis), layout_groups=(group,))
+    settings = VUV.GroupLayoutOptions(align_geometry_direction=True)
+    angles = VUV._orientation_angles(analysis, settings)
+    # A true quarter-turn and an incompatible tangent axis are kept as
+    # separate contracts; neither is silently flattened into the Z anchor.
+    assert abs(VUV._angle_wrap(angles[0])) < 1.0e-12
+    assert abs(VUV._angle_wrap(angles[1] - quarter.geometry_rotation_angle)) < 1.0e-12
+    assert abs(VUV._angle_wrap(angles[2] - cross_axis.geometry_rotation_angle)) < 1.0e-12
+    assert not VUV._geometry_angle_cohorts(analysis, settings)
+
+
 _test_repeat_anchor_order_and_packing()
+_test_structure_adjacency_builds_bounded_macro_group()
+_test_repeat_micro_chain_does_not_merge_whole_asset()
+_test_small_topology_chain_records_owner_affinity()
+_test_topology_continuity_cross_group_merge_is_bounded()
+_test_geometry_continuity_blocks_are_bounded_and_packed_nearby()
+_test_continuity_block_uses_coarse_diameter_ratio()
+_test_soft_topology_pairs_are_bounded_and_deterministic()
+_test_cross_component_peer_uses_local_endpoint_bounds()
+_test_continuity_component_uses_centroid_ordered_rigid_grid()
 _test_small_island_requires_small_model_and_uv_area()
 _test_directed_u_repeats_use_360_orientation()
 _test_directed_repeats_resolve_positive_negative_angle()
@@ -1851,6 +4008,8 @@ _test_model_distance_precedes_material_for_small_owner()
 _test_topology_owner_is_not_rejected_by_fallback_capacity()
 _test_fallback_capacity_is_independent_per_owner()
 _test_owner_cells_keep_many_fragments_local()
+_test_owner_attachment_rack_follows_model_centroids_without_rotation()
+_test_regular_owner_attachment_grid_preserves_order_and_density()
 _test_repeat_owner_cohorts_stay_near_in_large_component()
 _test_split_weapon_repeat_owner_graph_is_solved()
 _test_split_weapon_dual_domain_owner_graph_is_solved()
@@ -1858,6 +4017,13 @@ _test_affinity_search_budget_is_shared_by_component()
 _test_centrosymmetric_repeats_remain_180_equivalent()
 _test_tiny_float32_similarity_tolerance()
 _test_quantized_winding_stabilization_and_audit_fields()
+_test_welded_quantized_repair_preserves_real_chart_forms()
+_test_welded_repair_boundaries_and_full_rollback()
+_test_writeback_snap_preserves_source_island_count()
+_test_writeback_snap_skips_seams_and_non_manifold_edges()
+_test_rotated_shared_boundary_uses_semantic_uv_epsilon()
+_test_adaptive_replay_reaudits_committed_coordinates()
+_test_adaptive_replay_exception_restores_source()
 _test_non_repeat_cardinal_switch()
 _test_incompatible_directed_repeat_downgrades_to_cardinal_geometry()
 _test_directed_repeat_can_disable_cardinal_compatibility_gate()
@@ -1865,11 +4031,26 @@ _test_post_layout_owner_partition_reapplies_direction_policy()
 _test_small_island_boost_is_uniform_and_bounded()
 _test_square_pack_bias_improves_tile_utilization()
 _test_shelf_order_ensemble_closes_blank_space_without_scale_loss()
+_test_rigid_maxrects_is_deterministic_and_never_rotates()
+_test_rigid_maxrects_longest_edge_gate_falls_back_to_shelf()
 _test_low_anisotropy_boundary_edge_snaps_cardinal()
+_test_geometry_direction_removes_standalone_180_flip()
+_test_geometry_direction_auto_axis_falls_back_on_horizontal_cap()
+_test_geometry_direction_auto_rejects_bimodal_preferred_axis()
+_test_structure_group_binds_one_signed_geometry_axis()
+_test_owner_child_uses_one_shared_signed_geometry_axis()
+_test_owner_axis_seeds_incompatible_child_partition()
+_test_common_axis_uses_weakest_member_stability_before_priority()
+_test_structure_group_splits_incompatible_auto_axes_deterministically()
+_test_geometry_direction_is_scale_invariant_for_tiny_islands()
+_test_direction_resolution_gate_distinguishes_auto_and_explicit_axis()
+_test_replay_identity_includes_unresolved_explicit_axis_islands()
 _test_margin_correction_with_one_iteration()
 _test_loose_vertex_does_not_change_radius()
 _test_area_aware_quality_metrics_use_polygon_area()
 _test_area_score_prioritizes_small_island_tail()
 _test_area_score_falls_back_without_small_islands()
 _test_area_score_balances_aabb_fill_and_coverage()
+_test_same_axis_geometry_cohort_uses_stable_common_angle()
+_test_geometry_cohort_rejects_real_turn_or_axis_mix()
 print("VUV_GROUP_LAYOUT_REGRESSION_OK")

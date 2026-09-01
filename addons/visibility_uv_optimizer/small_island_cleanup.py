@@ -14,6 +14,7 @@ CYLINDER_CLASSES = {"CYLINDER_SIDE", "CYLINDER"}
 PANEL_CLASSES = {"PLANAR_PANEL", "PANEL"}
 BAND_CLASSES = {"BEVEL_STRIP", "BEVEL", "QUAD_STRIP", "STRIP"}
 GENERAL_CLASSES = {"GENERAL"}
+STRUCTURAL_CLASSES = PANEL_CLASSES | BAND_CLASSES | GENERAL_CLASSES
 
 
 def _setting(settings, name, default):
@@ -159,6 +160,23 @@ def _angle_limit(settings, family):
     return float(_setting(settings, name, default))
 
 
+def _structural_family(small_classes, target_classes):
+    """Admit only panel/bevel/general combinations to the relaxed lane."""
+
+    combined = set(small_classes) | set(target_classes)
+    if not combined or not combined <= STRUCTURAL_CLASSES:
+        return None
+    return "STRUCTURAL"
+
+
+def _structural_angle_limit(settings):
+    return max(float(_setting(
+        settings,
+        "small_structural_angle",
+        math.radians(60.0),
+    )), 0.0)
+
+
 def _candidate_records(
     bm,
     uv_layer,
@@ -173,6 +191,7 @@ def _candidate_records(
     settings,
     helpers,
     funnel,
+    allow_structural=True,
 ):
     boundaries = defaultdict(list)
     for edge in bm.edges:
@@ -191,7 +210,17 @@ def _candidate_records(
     boundary_ratio_limit = max(
         float(_setting(settings, "small_boundary_ratio", 0.25)), 0.0
     )
-    candidates = []
+    structural_enabled = bool(allow_structural) and bool(_setting(
+        settings, "small_structural_cleanup_enabled", True
+    ))
+    structural_boundary_ratio = min(
+        boundary_ratio_limit,
+        max(float(_setting(
+            settings, "small_structural_boundary_ratio", 0.08
+        )), 0.0),
+    )
+    strict_candidates = []
+    structural_candidates = []
     for (left_id, right_id), boundary in boundaries.items():
         funnel["uv_adjacent_pairs"] += 1
         signature = frozenset(edge.index for edge in boundary)
@@ -262,32 +291,31 @@ def _candidate_records(
             face_classes.get(face.index, "GENERAL") for face in target_chart
         }
         family = _compatible_family(small_classes, target_classes)
-        if family is None:
-            funnel["class_mismatch"] += 1
-            continue
 
         lengths = [max(edge.calc_length(), 1.0e-12) for edge in boundary]
         shared_length = sum(lengths)
         shared_ratio = shared_length / max(
             _perimeter_length(small_chart), 1.0e-12
         )
-        if shared_ratio < boundary_ratio_limit:
-            funnel["shared_ratio"] += 1
-            continue
         weighted_angle = sum(
             edge.calc_face_angle(0.0) * length
             for edge, length in zip(boundary, lengths)
         ) / shared_length
-        if weighted_angle > _angle_limit(settings, family):
-            funnel["angle"] += 1
-            continue
 
         combined = small_chart + target_chart
         if not helpers._is_disk(combined):
             funnel["topology"] += 1
             continue
-        funnel["eligible"] += 1
-        candidates.append({
+
+        strict_rejection = None
+        if family is None:
+            strict_rejection = "class_mismatch"
+        elif shared_ratio < boundary_ratio_limit:
+            strict_rejection = "shared_ratio"
+        elif weighted_angle > _angle_limit(settings, family):
+            strict_rejection = "angle"
+
+        record = {
             "small_id": small_id,
             "target_id": target_id,
             "faces": combined,
@@ -299,15 +327,50 @@ def _candidate_records(
             "small_mesh_area_ratio": small_area / max(total_area, 1.0e-12),
             "small_uv_area_ratio": small_uv_area / max(total_uv_area, 1.0e-12),
             "family": family,
-        })
+        }
+        if strict_rejection is None:
+            record["lane"] = "STRICT"
+            funnel["eligible"] += 1
+            funnel["strict_eligible"] += 1
+            strict_candidates.append(record)
+            continue
 
-    candidates.sort(key=lambda item: (
+        funnel[strict_rejection] += 1
+        if not structural_enabled:
+            continue
+        structural_family = _structural_family(
+            small_classes, target_classes
+        )
+        if structural_family is None:
+            funnel["structural_class_mismatch"] += 1
+            continue
+        if shared_ratio < structural_boundary_ratio:
+            funnel["structural_shared_ratio"] += 1
+            continue
+        if weighted_angle > _structural_angle_limit(settings):
+            funnel["structural_angle"] += 1
+            continue
+
+        record["family"] = structural_family
+        record["lane"] = "STRUCTURAL"
+        funnel["eligible"] += 1
+        funnel["structural_eligible"] += 1
+        structural_candidates.append(record)
+
+    sort_key = lambda item: (
         -item["shared_ratio"],
         item["angle"],
         -item["target_area"],
         min(item["signature"], default=-1),
-    ))
-    return candidates
+    )
+    strict_candidates.sort(key=sort_key)
+    structural_candidates.sort(key=sort_key)
+    if strict_candidates:
+        funnel["structural_deferred_for_strict"] += len(
+            structural_candidates
+        )
+        return strict_candidates
+    return structural_candidates
 
 
 def _restore_candidate(
@@ -362,6 +425,8 @@ def stitch_small_islands(
         "final_charts": len(initial_charts),
         "tests": 0,
         "accepted": 0,
+        "accepted_strict": 0,
+        "accepted_structural": 0,
         "rejected_operator": 0,
         "rejected_chart_delta": 0,
         "rejected_texel_density": 0,
@@ -373,6 +438,9 @@ def stitch_small_islands(
     }
     max_tests = max(int(_setting(settings, "small_cleanup_tests", 300)), 0)
     max_accepted = max(int(_setting(settings, "small_cleanup_max_merges", 120)), 0)
+    max_structural = max(int(_setting(
+        settings, "small_structural_max_merges", 160
+    )), 0)
     blocked = set()
     funnel = defaultdict(int)
 
@@ -409,6 +477,7 @@ def stitch_small_islands(
                 settings,
                 helpers,
                 funnel,
+                result["accepted_structural"] < max_structural,
             )
             if not candidates:
                 break
@@ -497,6 +566,10 @@ def stitch_small_islands(
                 blocked.add(candidate["signature"])
                 continue
             result["accepted"] += 1
+            if str(candidate.get("lane", "STRICT")).upper() == "STRUCTURAL":
+                result["accepted_structural"] += 1
+            else:
+                result["accepted_strict"] += 1
             bmesh.update_edit_mesh(
                 obj.data,
                 loop_triangles=False,

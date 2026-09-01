@@ -9,11 +9,11 @@ loop.  It has four deliberately small responsibilities:
 * classify edges as locked constraints or preferred cut locations;
 * grow material/normal-coherent region seeds from those constraints;
 * generate a deterministic planar projection for one region; and
-* rotate an existing UV island to a cardinal (0/90 degree) orientation.
+* rotate an existing UV island to a cardinal or directed geometry orientation.
 
 All functions are BMesh-oriented and work in Blender 3.3 through 5.2.  No
 operator, mode switch, seam write, or UV write is implicit.  Callers must
-pass ``write=True`` to the two UV helpers when they want to mutate loops.
+pass ``write=True`` to UV report helpers when they want to mutate loops.
 Angles are radians, matching Blender's API and ``VUVSettings``.
 """
 
@@ -34,6 +34,22 @@ DEFAULT_BEVEL_MAX_ANGLE = math.radians(80.0)
 DEFAULT_HARD_ANGLE = math.radians(80.0)
 DEFAULT_REGION_ANGLE = math.radians(15.0)
 DEFAULT_CARDINAL_ANGLES = (0.0, math.pi * 0.5)
+DEFAULT_GEOMETRY_AXIS_PRIORITY = ("Z", "X", "Y")
+# Blender stores mesh and UV coordinates as float32.  Below this relative
+# tangent-plane signal, an axis direction is not stable after UV writeback.
+GEOMETRY_AXIS_RELATIVE_EPSILON = 1.0e-4
+# AUTO axis resolution uses per-triangle direction statistics in addition to
+# the aggregate Jacobian.  These gates deliberately only affect multi-axis
+# (AUTO) resolution; an explicit X/Y/Z request keeps the historical behavior.
+DEFAULT_GEOMETRY_AXIS_MIN_COHERENCE = 0.70
+DEFAULT_GEOMETRY_AXIS_MIN_EFFECTIVE_FRACTION = 0.50
+# Per-face direction audits intentionally use stricter defaults than the
+# alignment transform itself.  A chart can have a perfectly valid aggregate
+# direction while individual triangles point in opposite directions; these
+# thresholds expose that case without changing the existing alignment API.
+DEFAULT_DIRECTION_AUDIT_UNSTABLE_ANGLE = math.radians(45.0)
+DEFAULT_DIRECTION_AUDIT_MIN_CONCENTRATION = 0.85
+DEFAULT_DIRECTION_AUDIT_MIN_EFFECTIVE_FRACTION = 0.50
 # A neighbouring side face on a low-poly cylinder can turn more than the
 # default region normal gate.  This is only used after the stricter geometric
 # cylinder detector has identified a closed radial face component.
@@ -1372,6 +1388,168 @@ class AlignmentResult:
         }
 
 
+@dataclass
+class GeometryAlignmentResult:
+    """Diagnostics for directed, geometry-derived UV island alignment.
+
+    ``loop_uvs`` uses ``(face.index, vertex.index)`` when both indices are
+    valid.  Dirty BMesh elements use deterministic negative ordinal keys.
+    """
+
+    face_indices: Tuple[int, ...]
+    centroid: Vector
+    axis_priority: Tuple[str, ...]
+    selected_axis: Optional[str]
+    angle_delta: float
+    derivative_u: Vector
+    derivative_v: Vector
+    axis_strength: float
+    bounds_before: Tuple[float, float, float, float]
+    bounds_after: Tuple[float, float, float, float]
+    loop_uvs: Dict[Tuple[int, int], Vector]
+    axis_strengths: Dict[str, float] = field(default_factory=dict)
+    triangle_count: int = 0
+    skipped_triangle_count: int = 0
+    written: bool = False
+    degenerate: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "faces": list(self.face_indices),
+            "centroid": [round(value, 6) for value in self.centroid],
+            "axis_priority": list(self.axis_priority),
+            "selected_axis": self.selected_axis,
+            "angle_delta": round(self.angle_delta, 6),
+            "derivative_u": [round(value, 6) for value in self.derivative_u],
+            "derivative_v": [round(value, 6) for value in self.derivative_v],
+            "axis_strength": round(self.axis_strength, 6),
+            "axis_strengths": {
+                axis: round(strength, 6)
+                for axis, strength in self.axis_strengths.items()
+            },
+            "bounds_before": [round(value, 6) for value in self.bounds_before],
+            "bounds_after": [round(value, 6) for value in self.bounds_after],
+            "loop_count": len(self.loop_uvs),
+            "triangle_count": self.triangle_count,
+            "skipped_triangle_count": self.skipped_triangle_count,
+            "written": self.written,
+            "degenerate": self.degenerate,
+        }
+
+
+@dataclass
+class FaceDirectionAuditResult:
+    """Read-only per-triangle audit of a directed geometry contract.
+
+    ``selected_axis`` follows the same ordered, signed axis contract as
+    :func:`align_island_geometry_report`.  The aggregate projection used to
+    select that axis is deliberately kept separate from the per-triangle
+    angle distribution.  This distinction catches a folded chart whose
+    opposite triangles cancel in neither the old island-level average nor its
+    final modulo-360 residual.
+
+    Angles and residuals are stored in radians.  ``records`` is a tuple of
+    plain dictionaries so callers can inspect the individual fan triangles
+    without retaining BMesh references or mutating the source mesh.
+    """
+
+    face_indices: Tuple[int, ...]
+    axis_priority: Tuple[str, ...]
+    selected_axis: Optional[str]
+    axis_projection: Dict[str, Dict[str, float]]
+    triangle_count: int
+    valid_triangle_count: int
+    skipped_triangle_count: int
+    low_signal_triangle_count: int
+    negative_triangle_count: int
+    unstable_triangle_count: int
+    angle_mean: Optional[float]
+    angle_p50: Optional[float]
+    angle_p95: Optional[float]
+    angle_max_residual: Optional[float]
+    circular_concentration: float
+    effective_triangle_fraction: float
+    concentration_stable: bool
+    resolved: bool
+    min_projection: float
+    unstable_angle: float
+    min_concentration: float
+    min_effective_fraction: float
+    records: Tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
+
+    @staticmethod
+    def _degrees(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        return round(math.degrees(float(value)), 6)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-safe diagnostic mapping."""
+
+        projection = {}
+        for axis, values in self.axis_projection.items():
+            projection[str(axis)] = {
+                str(key): round(float(value), 9)
+                for key, value in values.items()
+            }
+        records = []
+        for record in self.records:
+            item = {}
+            for key, value in record.items():
+                if isinstance(value, Vector):
+                    item[str(key)] = [
+                        round(float(component), 9) for component in value
+                    ]
+                elif isinstance(value, float):
+                    item[str(key)] = round(float(value), 9)
+                else:
+                    item[str(key)] = value
+            if "angle" in item and item["angle"] is not None:
+                item["angle_degrees"] = round(
+                    math.degrees(float(record["angle"])), 6
+                )
+            if "residual" in item and item["residual"] is not None:
+                item["residual_degrees"] = round(
+                    math.degrees(float(record["residual"])), 6
+                )
+            records.append(item)
+        return {
+            "faces": list(self.face_indices),
+            "axis_priority": list(self.axis_priority),
+            "selected_axis": self.selected_axis,
+            "axis_projection": projection,
+            "triangle_count": int(self.triangle_count),
+            "valid_triangle_count": int(self.valid_triangle_count),
+            "skipped_triangle_count": int(self.skipped_triangle_count),
+            "low_signal_triangle_count": int(self.low_signal_triangle_count),
+            "negative_triangle_count": int(self.negative_triangle_count),
+            "unstable_triangle_count": int(self.unstable_triangle_count),
+            "angle_mean_degrees": self._degrees(self.angle_mean),
+            "angle_p50_degrees": self._degrees(self.angle_p50),
+            "angle_p95_degrees": self._degrees(self.angle_p95),
+            "angle_max_residual_degrees": self._degrees(
+                self.angle_max_residual
+            ),
+            "circular_concentration": round(
+                float(self.circular_concentration), 6
+            ),
+            "effective_triangle_fraction": round(
+                float(self.effective_triangle_fraction), 6
+            ),
+            "concentration_stable": bool(self.concentration_stable),
+            "resolved": bool(self.resolved),
+            "min_projection": round(float(self.min_projection), 9),
+            "unstable_angle_degrees": round(
+                math.degrees(float(self.unstable_angle)), 6
+            ),
+            "min_concentration": round(float(self.min_concentration), 6),
+            "min_effective_fraction": round(
+                float(self.min_effective_fraction), 6
+            ),
+            "records": records,
+        }
+
+
 def _wrap_line_angle(angle: float) -> float:
     """Wrap an unoriented line angle to [-pi/2, pi/2)."""
 
@@ -1481,23 +1659,768 @@ def align_island_cardinal(
         return False
 
 
+def _geometry_axis_priority(axis_priority: Sequence[str]) -> Tuple[str, ...]:
+    if axis_priority is None:
+        return DEFAULT_GEOMETRY_AXIS_PRIORITY
+    if isinstance(axis_priority, str):
+        # Configuration properties commonly store a compact order such as
+        # ``"YZX"``.  Treat it as three axis tokens while retaining support
+        # for a single explicit axis string.
+        compact = axis_priority.replace(",", "").replace(" ", "")
+        values = tuple(compact) if len(compact) > 1 else (compact,)
+    else:
+        values = tuple(axis_priority)
+    normalized: List[str] = []
+    for value in values:
+        axis = str(value).upper()
+        if axis not in {"X", "Y", "Z"}:
+            raise ValueError("axis_priority may only contain X, Y, and Z")
+        if axis not in normalized:
+            normalized.append(axis)
+    if not normalized:
+        raise ValueError("axis_priority must contain at least one axis")
+    return tuple(normalized)
+
+
+def _geometry_uv_derivatives(
+    faces: Sequence[Any],
+    uv_layer: Any,
+    geometry_matrix: Any = None,
+) -> Tuple[Vector, Vector, int, int]:
+    """Return Blender-style area-weighted dP/du and dP/dv accumulators.
+
+    ``geometry_matrix`` transforms edge differences, not points.  Passing an
+    object's world 3x3 matrix therefore supports the WORLD direction contract
+    without introducing translation into the UV Jacobian.
+    """
+
+    derivative_u = Vector((0.0, 0.0, 0.0))
+    derivative_v = Vector((0.0, 0.0, 0.0))
+    triangle_count = 0
+    skipped_triangle_count = 0
+    for face in faces:
+        loops = list(face.loops)
+        for fan in range(2, len(loops)):
+            root = loops[0]
+            first = loops[fan - 1]
+            second = loops[fan]
+            delta_uv0 = first[uv_layer].uv - root[uv_layer].uv
+            delta_uv1 = second[uv_layer].uv - root[uv_layer].uv
+            determinant = (
+                float(delta_uv0.x) * float(delta_uv1.y)
+                - float(delta_uv0.y) * float(delta_uv1.x)
+            )
+            uv_product = math.sqrt(
+                max(float(delta_uv0.length_squared), 0.0)
+                * max(float(delta_uv1.length_squared), 0.0)
+            )
+            delta_co0 = first.vert.co - root.vert.co
+            delta_co1 = second.vert.co - root.vert.co
+            if geometry_matrix is not None:
+                delta_co0 = geometry_matrix @ delta_co0
+                delta_co1 = geometry_matrix @ delta_co1
+            area_weight = float(delta_co0.cross(delta_co1).length)
+            geometry_product = math.sqrt(
+                max(float(delta_co0.length_squared), 0.0)
+                * max(float(delta_co1.length_squared), 0.0)
+            )
+            if (
+                not math.isfinite(determinant)
+                or not math.isfinite(uv_product)
+                or uv_product <= 0.0
+                or abs(determinant) <= EPSILON * uv_product
+                or not math.isfinite(area_weight)
+                or not math.isfinite(geometry_product)
+                or geometry_product <= 0.0
+                or area_weight <= EPSILON * geometry_product
+            ):
+                skipped_triangle_count += 1
+                continue
+
+            inverse_00 = float(delta_uv1.y) / determinant
+            inverse_01 = -float(delta_uv0.y) / determinant
+            inverse_10 = -float(delta_uv1.x) / determinant
+            inverse_11 = float(delta_uv0.x) / determinant
+            triangle_u = delta_co0 * inverse_00 + delta_co1 * inverse_01
+            triangle_v = delta_co0 * inverse_10 + delta_co1 * inverse_11
+            weighted_u = triangle_u * area_weight
+            weighted_v = triangle_v * area_weight
+            if not all(
+                math.isfinite(float(component))
+                for component in tuple(weighted_u) + tuple(weighted_v)
+            ):
+                skipped_triangle_count += 1
+                continue
+            derivative_u += weighted_u
+            derivative_v += weighted_v
+            triangle_count += 1
+    return derivative_u, derivative_v, triangle_count, skipped_triangle_count
+
+
+def _wrap_directed_angle(angle: float) -> float:
+    """Wrap a signed angle to ``[-pi, pi)`` without relying on bpy helpers."""
+
+    while angle >= math.pi:
+        angle -= math.pi * 2.0
+    while angle < -math.pi:
+        angle += math.pi * 2.0
+    return angle
+
+
+def _finite_quantile(values: Sequence[float], fraction: float) -> Optional[float]:
+    """Return a deterministic nearest-rank quantile for finite values."""
+
+    finite = sorted(
+        float(value)
+        for value in values
+        if math.isfinite(float(value))
+    )
+    if not finite:
+        return None
+    fraction = max(0.0, min(1.0, float(fraction)))
+    index = int(round((len(finite) - 1) * fraction))
+    return finite[max(0, min(len(finite) - 1, index))]
+
+
+def _geometry_uv_triangle_records(
+    faces: Sequence[Any],
+    uv_layer: Any,
+    geometry_matrix: Any = None,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """Collect one immutable-ish Jacobian record per triangle fan.
+
+    The returned records contain no BMesh objects.  ``triangle_count`` counts
+    all fan triangles encountered, while ``skipped_count`` counts triangles
+    rejected for a non-finite, zero-area, or near-singular UV/geometry basis.
+    Keeping this collector separate from the existing aggregate derivative
+    function lets the alignment transform remain byte-for-byte compatible
+    while consumers opt into a more detailed audit.
+    """
+
+    records: List[Dict[str, Any]] = []
+    triangle_count = 0
+    skipped_count = 0
+    for face_position, face in enumerate(faces):
+        loops = list(face.loops)
+        for fan in range(2, len(loops)):
+            triangle_count += 1
+            root = loops[0]
+            first = loops[fan - 1]
+            second = loops[fan]
+            delta_uv0 = first[uv_layer].uv - root[uv_layer].uv
+            delta_uv1 = second[uv_layer].uv - root[uv_layer].uv
+            determinant = (
+                float(delta_uv0.x) * float(delta_uv1.y)
+                - float(delta_uv0.y) * float(delta_uv1.x)
+            )
+            uv_product = math.sqrt(
+                max(float(delta_uv0.length_squared), 0.0)
+                * max(float(delta_uv1.length_squared), 0.0)
+            )
+            delta_co0 = first.vert.co - root.vert.co
+            delta_co1 = second.vert.co - root.vert.co
+            if geometry_matrix is not None:
+                delta_co0 = geometry_matrix @ delta_co0
+                delta_co1 = geometry_matrix @ delta_co1
+            area_weight = float(delta_co0.cross(delta_co1).length)
+            geometry_product = math.sqrt(
+                max(float(delta_co0.length_squared), 0.0)
+                * max(float(delta_co1.length_squared), 0.0)
+            )
+            if (
+                not math.isfinite(determinant)
+                or not math.isfinite(uv_product)
+                or uv_product <= 0.0
+                or abs(determinant) <= EPSILON * uv_product
+                or not math.isfinite(area_weight)
+                or not math.isfinite(geometry_product)
+                or geometry_product <= 0.0
+                or area_weight <= EPSILON * geometry_product
+            ):
+                skipped_count += 1
+                continue
+
+            inverse_00 = float(delta_uv1.y) / determinant
+            inverse_01 = -float(delta_uv0.y) / determinant
+            inverse_10 = -float(delta_uv1.x) / determinant
+            inverse_11 = float(delta_uv0.x) / determinant
+            derivative_u = (
+                delta_co0 * inverse_00 + delta_co1 * inverse_01
+            )
+            derivative_v = (
+                delta_co0 * inverse_10 + delta_co1 * inverse_11
+            )
+            values = tuple(derivative_u) + tuple(derivative_v)
+            if not all(math.isfinite(float(value)) for value in values):
+                skipped_count += 1
+                continue
+            basis = math.hypot(
+                float(derivative_u.length), float(derivative_v.length)
+            )
+            if not math.isfinite(basis) or basis <= EPSILON:
+                skipped_count += 1
+                continue
+            records.append({
+                "face_index": int(getattr(face, "index", face_position)),
+                "fan_index": int(fan),
+                "area_weight": area_weight,
+                "derivative_u": derivative_u.copy(),
+                "derivative_v": derivative_v.copy(),
+                "basis": basis,
+                "determinant": determinant,
+            })
+    return records, triangle_count, skipped_count
+
+
+def _geometry_axis_candidate_statistics(
+    triangle_records: Sequence[Mapping[str, Any]],
+    axis_vectors: Mapping[str, Vector],
+    aggregate_basis: float,
+    min_projection: float,
+) -> Dict[str, Dict[str, float]]:
+    """Compute aggregate and per-triangle stability for each model axis.
+
+    The aggregate Jacobian is useful for finding a tangent signal, but it can
+    hide a bimodal chart when opposite triangles cancel.  This companion
+    statistic keeps the same signed projection while measuring circular
+    concentration and the fraction of triangles with a usable projection.
+    Values are plain floats so callers can persist them in diagnostics.
+    """
+
+    statistics: Dict[str, Dict[str, float]] = {}
+    total_area = sum(
+        max(float(record.get("area_weight", 0.0)), 0.0)
+        for record in triangle_records
+    )
+    total_count = len(triangle_records)
+    for axis, vector in axis_vectors.items():
+        sum_u = 0.0
+        sum_v = 0.0
+        signal_sum = 0.0
+        stable_count = 0
+        circular_sin = 0.0
+        circular_cos = 0.0
+        circular_weight = 0.0
+        for record in triangle_records:
+            derivative_u = record["derivative_u"]
+            derivative_v = record["derivative_v"]
+            component_u = float(derivative_u.dot(vector))
+            component_v = float(derivative_v.dot(vector))
+            signal = math.hypot(component_u, component_v)
+            basis = max(float(record.get("basis", 0.0)), EPSILON)
+            local_signal = max(0.0, min(1.0, signal / basis))
+            weight = max(float(record.get("area_weight", 0.0)), 0.0)
+            sum_u += weight * component_u
+            sum_v += weight * component_v
+            signal_sum += weight * local_signal
+            if local_signal < min_projection:
+                continue
+            stable_count += 1
+            angle = math.atan2(component_u, component_v)
+            contribution = weight * max(local_signal, min_projection)
+            circular_weight += contribution
+            circular_sin += contribution * math.sin(angle)
+            circular_cos += contribution * math.cos(angle)
+        strength = math.hypot(sum_u, sum_v)
+        normalized_strength = strength / max(float(aggregate_basis), EPSILON)
+        if circular_weight > EPSILON:
+            concentration = min(
+                1.0,
+                max(0.0, math.hypot(circular_sin, circular_cos) / circular_weight),
+            )
+        else:
+            concentration = 0.0
+        effective_fraction = stable_count / max(total_count, 1)
+        mean_local_signal = signal_sum / max(total_area, EPSILON)
+        statistics[axis] = {
+            "sum_u": sum_u,
+            "sum_v": sum_v,
+            "strength": strength,
+            "normalized_strength": normalized_strength,
+            "mean_local_signal": mean_local_signal,
+            "concentration": concentration,
+            "effective_fraction": effective_fraction,
+            "stability_score": concentration * effective_fraction,
+        }
+    return statistics
+
+
+def _select_geometry_axis(
+    priority: Sequence[str],
+    statistics: Mapping[str, Mapping[str, float]],
+    strength_threshold: float,
+    *,
+    min_coherence: float = DEFAULT_GEOMETRY_AXIS_MIN_COHERENCE,
+    min_effective_fraction: float = DEFAULT_GEOMETRY_AXIS_MIN_EFFECTIVE_FRACTION,
+) -> Optional[str]:
+    """Resolve a directed axis, using coherence only for AUTO priorities.
+
+    A single-axis priority is an explicit user choice and therefore follows
+    the legacy aggregate-strength rule.  For AUTO (two or more candidates),
+    a candidate must have a usable tangent signal; the first coherent axis
+    wins, otherwise the candidate with the strongest stable signal wins.  The
+    ordered priority remains the final tie-breaker, making the result fully
+    deterministic.
+    """
+
+    candidates = [
+        axis for axis in priority
+        if axis in statistics
+        and math.isfinite(float(statistics[axis].get("strength", 0.0)))
+        and float(statistics[axis].get("strength", 0.0)) > strength_threshold
+    ]
+    if not candidates:
+        return None
+    if len(tuple(priority)) == 1:
+        return candidates[0]
+
+    first = candidates[0]
+    first_stats = statistics[first]
+    first_coherent = (
+        float(first_stats.get("concentration", 0.0)) + EPSILON >= min_coherence
+        and float(first_stats.get("effective_fraction", 0.0)) + EPSILON
+        >= min_effective_fraction
+    )
+    if first_coherent:
+        return first
+
+    coherent = [
+        axis for axis in candidates
+        if float(statistics[axis].get("concentration", 0.0)) + EPSILON
+        >= min_coherence
+        and float(statistics[axis].get("effective_fraction", 0.0)) + EPSILON
+        >= min_effective_fraction
+    ]
+    pool = coherent or candidates
+    priority_index = {axis: index for index, axis in enumerate(priority)}
+    return max(
+        pool,
+        key=lambda axis: (
+            float(statistics[axis].get("stability_score", 0.0))
+            * float(statistics[axis].get("normalized_strength", 0.0)),
+            float(statistics[axis].get("normalized_strength", 0.0)),
+            -priority_index.get(axis, len(priority)),
+        ),
+    )
+
+
+def audit_island_geometry_direction(
+    faces: Any,
+    uv_layer: Any,
+    *,
+    axis_priority: Sequence[str] = DEFAULT_GEOMETRY_AXIS_PRIORITY,
+    geometry_matrix: Any = None,
+    min_projection: float = GEOMETRY_AXIS_RELATIVE_EPSILON,
+    unstable_angle: float = DEFAULT_DIRECTION_AUDIT_UNSTABLE_ANGLE,
+    min_concentration: float = DEFAULT_DIRECTION_AUDIT_MIN_CONCENTRATION,
+    min_effective_fraction: float = DEFAULT_DIRECTION_AUDIT_MIN_EFFECTIVE_FRACTION,
+) -> FaceDirectionAuditResult:
+    """Audit signed direction coherence for every triangle in an island.
+
+    ``min_projection`` is relative to each triangle's Jacobian basis, so a
+    uniformly scaled chart produces the same result.  Axis resolution still
+    follows the explicit priority order; only the first axis whose aggregate
+    tangent signal clears the threshold is selected.  Per-triangle angles are
+    then weighted by 3D area and local axis signal.  A negative triangle has a
+    projection opposite the circular mean (dot product < 0); an unstable
+    triangle exceeds ``unstable_angle`` from that mean.  Low-signal triangles
+    are reported separately and do not contaminate the circular statistics.
+
+    The function is strictly read-only: it copies UV/geometry derivatives and
+    never writes to loops, seams, mesh attributes, or selection state.
+    """
+
+    face_list = _coerce_faces(faces)
+    if not face_list:
+        raise ValueError("faces must contain at least one face")
+    if uv_layer is None:
+        raise ValueError("uv_layer is required")
+    priority = _geometry_axis_priority(axis_priority)
+    min_projection = float(min_projection)
+    unstable_angle = float(unstable_angle)
+    min_concentration = float(min_concentration)
+    min_effective_fraction = float(min_effective_fraction)
+    if (
+        not math.isfinite(min_projection)
+        or not 0.0 <= min_projection <= 1.0
+    ):
+        raise ValueError("min_projection must be finite and in [0, 1]")
+    if (
+        not math.isfinite(unstable_angle)
+        or not 0.0 <= unstable_angle <= math.pi
+    ):
+        raise ValueError("unstable_angle must be finite and in [0, pi]")
+    if (
+        not math.isfinite(min_concentration)
+        or not 0.0 <= min_concentration <= 1.0
+    ):
+        raise ValueError("min_concentration must be finite and in [0, 1]")
+    if (
+        not math.isfinite(min_effective_fraction)
+        or not 0.0 <= min_effective_fraction <= 1.0
+    ):
+        raise ValueError(
+            "min_effective_fraction must be finite and in [0, 1]"
+        )
+
+    triangle_records, triangle_count, skipped_count = (
+        _geometry_uv_triangle_records(
+            face_list,
+            uv_layer,
+            geometry_matrix=geometry_matrix,
+        )
+    )
+    axis_vectors = {
+        "X": Vector((1.0, 0.0, 0.0)),
+        "Y": Vector((0.0, 1.0, 0.0)),
+        "Z": Vector((0.0, 0.0, 1.0)),
+    }
+    aggregate_basis = sum(
+        float(record["area_weight"]) * float(record["basis"])
+        for record in triangle_records
+    )
+    axis_projection = _geometry_axis_candidate_statistics(
+        triangle_records,
+        axis_vectors,
+        aggregate_basis,
+        min_projection,
+    )
+    # Keep the audit's historical resolver (first aggregate signal) so stored
+    # diagnostics remain comparable across plugin versions.  The mutating
+    # alignment path below uses the coherence-aware AUTO resolver.
+    selected_axis = next(
+        (
+            axis for axis in priority
+            if math.isfinite(float(axis_projection[axis]["normalized_strength"]))
+            and float(axis_projection[axis]["normalized_strength"]) >= min_projection
+        ),
+        None,
+    )
+
+    low_signal_count = 0
+    negative_count = 0
+    unstable_count = 0
+    selected_records: List[Dict[str, Any]] = []
+    if selected_axis is not None:
+        axis_vector = axis_vectors[selected_axis]
+        for record in triangle_records:
+            derivative_u = record["derivative_u"]
+            derivative_v = record["derivative_v"]
+            component_u = float(derivative_u.dot(axis_vector))
+            component_v = float(derivative_v.dot(axis_vector))
+            signal = math.hypot(component_u, component_v)
+            local_signal = signal / max(float(record["basis"]), EPSILON)
+            local_signal = max(0.0, min(1.0, local_signal))
+            record["axis_projection_u"] = component_u
+            record["axis_projection_v"] = component_v
+            record["axis_signal"] = local_signal
+            if local_signal < min_projection:
+                record["low_signal"] = True
+                low_signal_count += 1
+                continue
+            angle = math.atan2(component_u, component_v)
+            record["angle"] = angle
+            # The circular pass below adds the residual and classifications.
+            selected_records.append(record)
+
+    sum_sin = 0.0
+    sum_cos = 0.0
+    for record in selected_records:
+        weight = float(record["area_weight"]) * max(
+            float(record["axis_signal"]), min_projection
+        )
+        record["circular_weight"] = weight
+        sum_sin += weight * math.sin(float(record["angle"]))
+        sum_cos += weight * math.cos(float(record["angle"]))
+    circular_weight = sum(
+        float(record.get("circular_weight", 0.0))
+        for record in selected_records
+    )
+    if circular_weight > EPSILON:
+        angle_mean = math.atan2(sum_sin, sum_cos)
+        concentration = min(
+            1.0,
+            max(0.0, math.hypot(sum_sin, sum_cos) / circular_weight),
+        )
+    else:
+        angle_mean = None
+        concentration = 0.0
+
+    residuals: List[float] = []
+    if angle_mean is not None:
+        for record in selected_records:
+            residual = abs(_wrap_directed_angle(
+                float(record["angle"]) - angle_mean
+            ))
+            negative = math.cos(
+                float(record["angle"]) - angle_mean
+            ) < 0.0
+            unstable = residual > unstable_angle
+            record["residual"] = residual
+            record["negative"] = bool(negative)
+            record["unstable"] = bool(unstable)
+            residuals.append(residual)
+            negative_count += int(negative)
+            unstable_count += int(unstable)
+
+    valid_count = len(triangle_records)
+    effective_fraction = len(selected_records) / max(valid_count, 1)
+    concentration_stable = bool(
+        selected_records and concentration + EPSILON >= min_concentration
+    )
+    resolved = bool(
+        selected_axis is not None
+        and selected_records
+        and effective_fraction + EPSILON >= min_effective_fraction
+        and concentration_stable
+    )
+    return FaceDirectionAuditResult(
+        face_indices=tuple(sorted(
+            int(getattr(face, "index", index))
+            for index, face in enumerate(face_list)
+        )),
+        axis_priority=priority,
+        selected_axis=selected_axis,
+        axis_projection=axis_projection,
+        triangle_count=triangle_count,
+        valid_triangle_count=valid_count,
+        skipped_triangle_count=skipped_count,
+        low_signal_triangle_count=low_signal_count,
+        negative_triangle_count=negative_count,
+        unstable_triangle_count=unstable_count,
+        angle_mean=angle_mean,
+        angle_p50=_finite_quantile(residuals, 0.50),
+        angle_p95=_finite_quantile(residuals, 0.95),
+        angle_max_residual=max(residuals, default=None),
+        circular_concentration=concentration,
+        effective_triangle_fraction=effective_fraction,
+        concentration_stable=concentration_stable,
+        resolved=resolved,
+        min_projection=min_projection,
+        unstable_angle=unstable_angle,
+        min_concentration=min_concentration,
+        min_effective_fraction=min_effective_fraction,
+        records=tuple(dict(record) for record in triangle_records),
+    )
+
+
+def align_island_geometry_report(
+    faces: Any,
+    uv_layer: Any,
+    *,
+    axis_priority: Sequence[str] = DEFAULT_GEOMETRY_AXIS_PRIORITY,
+    geometry_matrix: Any = None,
+    write: bool = False,
+) -> GeometryAlignmentResult:
+    """Align a model-space positive axis to UV +V without a 180-degree ambiguity.
+
+    This follows Blender's Geometry alignment method: each polygon is split
+    into a triangle fan, its UV Jacobian is inverted, and the resulting
+    ``dP/du`` and ``dP/dv`` vectors are accumulated by 3D triangle area.
+    Explicit axes keep priority semantics.  AUTO also rejects a preferred axis
+    whose per-triangle directions are incoherent, then chooses the strongest
+    stable fallback axis.
+    """
+
+    face_list = _coerce_faces(faces)
+    if not face_list:
+        raise ValueError("faces must contain at least one face")
+    if uv_layer is None:
+        raise ValueError("uv_layer is required")
+    priority = _geometry_axis_priority(axis_priority)
+    before: Dict[Tuple[int, int], Vector] = {}
+    loop_keys: List[Tuple[Any, Tuple[int, int]]] = []
+    used_keys: Set[Tuple[int, int]] = set()
+    for face_position, face in enumerate(face_list):
+        face_index = int(face.index)
+        for loop_position, loop in enumerate(face.loops):
+            uv = loop[uv_layer].uv.copy()
+            if not all(math.isfinite(float(component)) for component in uv):
+                raise ValueError("faces contain non-finite UV coordinates")
+            key = (face_index, int(loop.vert.index))
+            if key[0] < 0 or key[1] < 0 or key in used_keys:
+                key = (-(face_position + 1), -(loop_position + 1))
+            used_keys.add(key)
+            before[key] = uv
+            loop_keys.append((loop, key))
+    if not before:
+        raise ValueError("faces contain no loops")
+
+    bounds_before = _bounds_2d(before.values())
+    centroid = Vector((
+        (bounds_before[0] + bounds_before[2]) * 0.5,
+        (bounds_before[1] + bounds_before[3]) * 0.5,
+    ))
+    triangle_records, triangle_count, skipped_count = (
+        _geometry_uv_triangle_records(
+            face_list,
+            uv_layer,
+            geometry_matrix=geometry_matrix,
+        )
+    )
+    derivative_u = sum(
+        (record["derivative_u"] * float(record["area_weight"])
+         for record in triangle_records),
+        Vector((0.0, 0.0, 0.0)),
+    )
+    derivative_v = sum(
+        (record["derivative_v"] * float(record["area_weight"])
+         for record in triangle_records),
+        Vector((0.0, 0.0, 0.0)),
+    )
+    axis_vectors = {
+        "X": Vector((1.0, 0.0, 0.0)),
+        "Y": Vector((0.0, 1.0, 0.0)),
+        "Z": Vector((0.0, 0.0, 1.0)),
+    }
+    derivative_scale = math.hypot(
+        float(derivative_u.length),
+        float(derivative_v.length),
+    )
+    # BMesh coordinates and mathutils vectors are float32.  A merely non-zero
+    # projection can therefore be round-off from an axis that is actually
+    # normal to the island; use the module's length-scale tolerance here.
+    strength_threshold = GEOMETRY_AXIS_RELATIVE_EPSILON * derivative_scale
+    aggregate_basis = sum(
+        float(record["area_weight"]) * float(record["basis"])
+        for record in triangle_records
+    )
+    axis_projection = _geometry_axis_candidate_statistics(
+        triangle_records,
+        axis_vectors,
+        aggregate_basis,
+        GEOMETRY_AXIS_RELATIVE_EPSILON,
+    )
+    axis_strengths = {
+        axis: float(values["strength"])
+        for axis, values in axis_projection.items()
+        if axis in priority
+    }
+    selected_axis = _select_geometry_axis(
+        priority,
+        axis_projection,
+        strength_threshold,
+    )
+    selected_u = 0.0
+    selected_v = 0.0
+    if selected_axis is not None:
+        selected_u = float(axis_projection[selected_axis]["sum_u"])
+        selected_v = float(axis_projection[selected_axis]["sum_v"])
+
+    degenerate = triangle_count == 0 or selected_axis is None
+    if degenerate:
+        return GeometryAlignmentResult(
+            face_indices=tuple(sorted(int(face.index) for face in face_list)),
+            centroid=centroid,
+            axis_priority=priority,
+            selected_axis=None,
+            angle_delta=0.0,
+            derivative_u=derivative_u,
+            derivative_v=derivative_v,
+            axis_strength=0.0,
+            bounds_before=bounds_before,
+            bounds_after=bounds_before,
+            loop_uvs={key: value.copy() for key, value in before.items()},
+            axis_strengths=axis_strengths,
+            triangle_count=triangle_count,
+            skipped_triangle_count=skipped_count,
+            written=False,
+            degenerate=True,
+        )
+
+    delta = math.atan2(selected_u, selected_v)
+    cosine = math.cos(delta)
+    sine = math.sin(delta)
+    transformed: Dict[Tuple[int, int], Vector] = {}
+    for key, point in before.items():
+        relative = point - centroid
+        transformed[key] = Vector((
+            centroid.x + relative.x * cosine - relative.y * sine,
+            centroid.y + relative.x * sine + relative.y * cosine,
+        ))
+    written = False
+    if write:
+        for loop, key in loop_keys:
+            loop[uv_layer].uv = transformed[key]
+        written = bool(loop_keys)
+    return GeometryAlignmentResult(
+        face_indices=tuple(sorted(int(face.index) for face in face_list)),
+        centroid=centroid,
+        axis_priority=priority,
+        selected_axis=selected_axis,
+        angle_delta=delta,
+        derivative_u=derivative_u,
+        derivative_v=derivative_v,
+        axis_strength=axis_strengths[selected_axis],
+        bounds_before=bounds_before,
+        bounds_after=_bounds_2d(transformed.values()),
+        loop_uvs=transformed,
+        axis_strengths=axis_strengths,
+        triangle_count=triangle_count,
+        skipped_triangle_count=skipped_count,
+        written=written,
+        degenerate=False,
+    )
+
+
+def align_island_geometry(
+    faces: Any,
+    uv_layer: Any,
+    *,
+    axis_priority: Sequence[str] = DEFAULT_GEOMETRY_AXIS_PRIORITY,
+    geometry_matrix: Any = None,
+) -> bool:
+    """Write directed Geometry alignment and return whether it succeeded."""
+
+    try:
+        face_list = _coerce_faces(faces)
+        if not face_list or uv_layer is None:
+            return False
+        report = align_island_geometry_report(
+            face_list,
+            uv_layer,
+            axis_priority=axis_priority,
+            geometry_matrix=geometry_matrix,
+            write=True,
+        )
+        return bool(report.written and report.loop_uvs and not report.degenerate)
+    except Exception:
+        return False
+
+
 # Explicit aliases for callers that prefer the longer name in reports.
 align_uv_island_cardinal = align_island_cardinal
 align_uv_island_cardinal_report = align_island_cardinal_report
+align_uv_island_geometry = align_island_geometry
+align_uv_island_geometry_report = align_island_geometry_report
 
 
 __all__ = [
     "AlignmentResult",
+    "DEFAULT_GEOMETRY_AXIS_PRIORITY",
+    "DEFAULT_GEOMETRY_AXIS_MIN_COHERENCE",
+    "DEFAULT_GEOMETRY_AXIS_MIN_EFFECTIVE_FRACTION",
+    "DEFAULT_DIRECTION_AUDIT_MIN_CONCENTRATION",
+    "DEFAULT_DIRECTION_AUDIT_MIN_EFFECTIVE_FRACTION",
+    "DEFAULT_DIRECTION_AUDIT_UNSTABLE_ANGLE",
     "EdgeConstraint",
     "EdgeConstraintOptions",
     "EdgeConstraints",
+    "FaceDirectionAuditResult",
+    "GeometryAlignmentResult",
+    "GEOMETRY_AXIS_RELATIVE_EPSILON",
     "ProjectionResult",
     "RegionSeed",
     "RegionSeedOptions",
     "align_island_cardinal",
     "align_island_cardinal_report",
+    "align_island_geometry",
+    "align_island_geometry_report",
     "align_uv_island_cardinal",
     "align_uv_island_cardinal_report",
+    "align_uv_island_geometry",
+    "align_uv_island_geometry_report",
+    "audit_island_geometry_direction",
     "build_region_seed_records",
     "build_region_seeds",
     "can_merge_classes",
