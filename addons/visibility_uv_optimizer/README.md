@@ -1,4 +1,4 @@
-# Visibility Aware UV Optimizer 0.5.6
+# Visibility Aware UV Optimizer 0.5.7
 
 Blender 3.3 through 5.2 add-on for visibility analysis and conservative UV
 generation. Version 0.5.6 adds a signed geometry-direction contract on top of

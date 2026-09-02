@@ -2,7 +2,7 @@
 
 面向 Blender 硬表面游戏资产的可见性分析与保守自动 UV 插件。
 
-当前试验版本：`0.5.6`
+当前试验版本：`0.5.7`
 
 版本记录与后续计划：
 
@@ -11,7 +11,13 @@
 
 ## 下载与安装
 
-- [Visibility_Aware_UV_Optimizer_0.5.6_HardSurface.zip](release/Visibility_Aware_UV_Optimizer_0.5.6_HardSurface.zip)
+- [Visibility_Aware_UV_Optimizer_0.5.7_HardSurface.zip](release/Visibility_Aware_UV_Optimizer_0.5.7_HardSurface.zip)
+
+## 0.5.7 布局改进
+
+- 明显长矩形默认竖向摆放，主对称轴吸附到 UV `V` 方向；主轴仍严格保持在 UV `U/V` 基数方向。
+- 几何方向锁定、方向重复件和连续结构不会被竖向偏好破坏；近似正方形不做无意义的 90 度旋转。
+- 顶层矩形排布增加确定性候选顺序和利用率评分，减少横向长条与空白区域，同时保留最长边、无重叠和统一缩放约束。
 
 在 Blender 中打开 `Edit > Preferences > Add-ons > Install`，选择 ZIP 并启用
 `Visibility Aware UV Optimizer`。面板位于：
@@ -123,6 +129,7 @@
 
 - [0.5.4 使用说明与 0.5.5 增量](docs/Visibility_Aware_UV_Optimizer_硬表面使用说明_0.5.4.md)
 - [0.5.6 方向一致性与验证记录](docs/Visibility_Aware_UV_Optimizer_方向一致性_0.5.6.md)
+- [0.5.7 布局改进记录](docs/Visibility_Aware_UV_Optimizer_布局改进_0.5.7.md)
 - [0.5.5 验证记录](docs/Visibility_Aware_UV_Optimizer_验证记录_0.5.5.md)
 - [0.5.4 验证记录](docs/Visibility_Aware_UV_Optimizer_验证记录_0.5.4.md)
 - [0.5.2 历史教程](docs/Visibility_Aware_UV_Optimizer_使用教程.md)

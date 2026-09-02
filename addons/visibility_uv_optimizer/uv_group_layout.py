@@ -179,6 +179,12 @@ class GroupLayoutOptions:
     # filling only one strip of the 0-1 tile.  It never changes island scale
     # independently, so texel density remains uniform.
     square_pack_bias: float = 0.35
+    # Elongated charts are presented upright whenever they are free of a
+    # signed Geometry/repeat direction contract.  Keeping this as an option
+    # makes the visual preference explicit while preserving the strict
+    # direction lock for checker/arrow assets.
+    prefer_vertical_long_rectangles: bool = True
+    long_rectangle_min_aspect: float = 1.35
     # PCA is deliberately conservative for round-ish pieces.  A clear long
     # boundary edge is a safer orientation cue for hard-surface panels.
     min_cardinal_edge_confidence: float = 0.15
@@ -363,6 +369,14 @@ class GroupLayoutOptions:
             self.square_pack_bias
         ) <= 1.0:
             raise ValueError("square_pack_bias must be finite and in [0, 1]")
+        if (
+            not math.isfinite(float(self.long_rectangle_min_aspect))
+            or float(self.long_rectangle_min_aspect) < 1.0
+            or float(self.long_rectangle_min_aspect) > 20.0
+        ):
+            raise ValueError(
+                "long_rectangle_min_aspect must be finite and in [1, 20]"
+            )
         if (
             not math.isfinite(float(self.directed_cardinal_tolerance))
             or not 0.0 <= float(self.directed_cardinal_tolerance) <= math.pi * 0.5
@@ -1235,6 +1249,43 @@ def _orientation_reference_angle(
     ):
         return _line_angle_wrap(float(edge_angle))
     return None
+
+
+def _is_long_rectangle(
+    island: IslandRecord,
+    minimum_aspect: float = 1.35,
+) -> bool:
+    """Return whether an island's source AABB is clearly elongated.
+
+    The AABB test is deliberately conservative.  It avoids rotating nearly
+    square panels merely to satisfy a presentation preference, while still
+    catching the rectangular hard-surface charts that otherwise tend to land
+    as wide horizontal strips in the final atlas.
+    """
+
+    try:
+        width = abs(float(island.uv_width))
+        height = abs(float(island.uv_height))
+        threshold = max(float(minimum_aspect), 1.0)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in (width, height, threshold)):
+        return False
+    shortest = min(width, height)
+    if shortest <= _EPSILON:
+        return False
+    return max(width, height) / shortest + _EPSILON >= threshold
+
+
+def _vertical_cardinal_target(
+    island: IslandRecord,
+    minimum_aspect: float,
+) -> Optional[float]:
+    """Return the upright target line for an elongated chart."""
+
+    if not _is_long_rectangle(island, minimum_aspect):
+        return None
+    return math.pi * 0.5
 
 
 def _uv_cardinal_reference(
@@ -7626,6 +7677,13 @@ def _apply_orientation_policy(
             else "modulo_360"
         ),
         "fallback_alignment": "center_symmetric_modulo_180",
+        "long_rectangle_presentation": (
+            "vertical_cardinal" if settings.prefer_vertical_long_rectangles
+            else "disabled"
+        ),
+        "long_rectangle_min_aspect": round(
+            float(settings.long_rectangle_min_aspect), 6
+        ),
         "directed_cardinal_tolerance_degrees": round(
             math.degrees(settings.directed_cardinal_tolerance), 6
         ),
@@ -7712,6 +7770,22 @@ def _orientation_angles(
             settings,
         )
         directed_group = direction_policy == "directed"
+        # Center-symmetric rectangular cohorts have no signed heading to
+        # preserve.  Give the whole cohort one shared upright target so the
+        # long axis is parallel to UV V; this keeps repeated panels coherent
+        # instead of verticalizing members independently.
+        if (
+            settings.prefer_vertical_long_rectangles
+            and not directed_group
+            and not any(island_id in constrained for island_id in member_ids)
+            and all(
+                _is_long_rectangle(
+                    by_id[island_id], settings.long_rectangle_min_aspect
+                )
+                for island_id in member_ids
+            )
+        ):
+            target = math.pi * 0.5
         for island_id in member_ids:
             if island_id in constrained:
                 continue
@@ -7749,11 +7823,21 @@ def _orientation_angles(
                 min_pca_anisotropy=settings.min_pca_anisotropy,
                 min_edge_confidence=settings.min_cardinal_edge_confidence,
             )
-            angles[island.island_id] = (
-                0.0
-                if reference is None
-                else _nearest_cardinal_delta(reference)
-            )
+            if reference is None:
+                angles[island.island_id] = 0.0
+            elif (
+                settings.prefer_vertical_long_rectangles
+                and _is_long_rectangle(
+                    island, settings.long_rectangle_min_aspect
+                )
+            ):
+                # A long rectangle gets a vertical principal line.  The
+                # modulo-180 correction keeps this safe for mirrored charts.
+                angles[island.island_id] = _line_angle_wrap(
+                    math.pi * 0.5 - reference
+                )
+            else:
+                angles[island.island_id] = _nearest_cardinal_delta(reference)
         else:
             angles[island.island_id] = 0.0
     return angles
@@ -8017,7 +8101,7 @@ def _best_shelf_pack(
     small_batch_search = bool(
         not preserve_order
         and allow_rotate
-        and len(rectangles) <= 4
+        and len(rectangles) <= 8
         and square_pack_bias > 1.0e-12
     )
     bounded_small_search = bool(
@@ -10328,6 +10412,8 @@ def _pack_layout_group_rectangles(
     continuity_group_member_counts: Optional[Mapping[int, int]] = None,
     continuity_target_members: Optional[int] = None,
     continuity_max_members: Optional[int] = None,
+    prefer_vertical_long_rectangles: bool = False,
+    long_rectangle_min_aspect: float = 1.35,
 ) -> Tuple[Dict[int, _Placement], float, float]:
     """Pack layout groups as nearby blocks without merging their owners.
 
@@ -10524,6 +10610,13 @@ def _pack_layout_group_rectangles(
         for component_id, component in enumerate(components)
         if len(component) >= 2
     }
+    if prefer_vertical_long_rectangles and allow_rotate:
+        for rectangle in component_rectangles:
+            if (
+                rectangle.key not in component_rotation_locks
+                and rectangle.width > rectangle.height * float(long_rectangle_min_aspect)
+            ):
+                component_rotation_locks[rectangle.key] = True
     shelf_pack = _best_shelf_pack(
         component_rectangles,
         gap,
@@ -10583,6 +10676,8 @@ def _pack_plan(
     group_model_centroids: Optional[Mapping[int, Sequence[float]]] = None,
     continuity_target_members: Optional[int] = None,
     continuity_max_members: Optional[int] = None,
+    prefer_vertical_long_rectangles: bool = False,
+    long_rectangle_min_aspect: float = 1.35,
 ) -> _PackedPlan:
     island_local: Dict[int, Dict[int, Vector]] = {}
     island_sizes: Dict[int, Tuple[float, float]] = {}
@@ -10842,6 +10937,8 @@ def _pack_plan(
         continuity_group_member_counts=continuity_group_member_counts,
         continuity_target_members=continuity_target_members,
         continuity_max_members=continuity_max_members,
+        prefer_vertical_long_rectangles=prefer_vertical_long_rectangles,
+        long_rectangle_min_aspect=long_rectangle_min_aspect,
     )
     _validate_repeat_group_rotation_parity(groups, repeat_groups, placements)
     final_coordinates: Dict[int, Dict[int, Vector]] = {}
@@ -11855,6 +11952,8 @@ def _plan_with_margin(
             group_model_centroids,
             settings.continuity_block_target_members,
             settings.continuity_block_max_members,
+            settings.prefer_vertical_long_rectangles,
+            settings.long_rectangle_min_aspect,
         )
 
     gap = 0.0

@@ -968,7 +968,7 @@ def _test_near_180_directed_conflict_uses_line_equivalence():
         island_b.principal_angle + rotations[48]
     )
     assert abs(VUV._line_angle_wrap(resolved_a - resolved_b)) < 1.0e-6
-    assert abs(resolved_a) < 1.0e-6
+    assert abs(VUV._line_angle_wrap(resolved_a - math.pi * 0.5)) < 1.0e-6
 
 
 def _test_mixed_direction_confidence_uses_group_line_fallback():
@@ -992,8 +992,16 @@ def _test_mixed_direction_confidence_uses_group_line_fallback():
         _analysis((island_a, island_b), (repeat,)),
         VUV.GroupLayoutOptions(),
     )
-    assert abs(rotations[42] + angle) < 1.0e-12
-    assert abs(rotations[43] - angle) < 1.0e-12
+    assert abs(
+        VUV._line_angle_wrap(
+            angle + rotations[42] - math.pi * 0.5
+        )
+    ) < 1.0e-12
+    assert abs(
+        VUV._line_angle_wrap(
+            -angle + rotations[43] - math.pi * 0.5
+        )
+    ) < 1.0e-12
 
 
 def _test_owner_cohort_uses_one_directed_orientation():
@@ -2612,7 +2620,11 @@ def _test_non_repeat_cardinal_switch():
     enabled_angles = VUV._orientation_angles(
         _analysis((non_repeat,)), VUV.GroupLayoutOptions()
     )
-    assert abs(enabled_angles[1] + angle_30) < 1.0e-12, enabled_angles[1]
+    assert abs(
+        VUV._line_angle_wrap(
+            angle_30 + enabled_angles[1] - math.pi * 0.5
+        )
+    ) < 1.0e-12, enabled_angles[1]
 
     repeat_other = _island(
         2,
@@ -2626,6 +2638,63 @@ def _test_non_repeat_cardinal_switch():
     target_a = VUV._line_angle_wrap(angle_30 + repeat_angles[1])
     target_b = VUV._line_angle_wrap(-angle_30 + repeat_angles[2])
     assert abs(VUV._line_angle_wrap(target_a - target_b)) < 1.0e-12
+
+
+def _test_long_rectangles_prefer_vertical_cardinal_axis():
+    long_panel = _island(
+        901,
+        (0.0, 0.0, 0.0, 2.0, 0.5, 0.1),
+        principal_angle=math.radians(22.0),
+    )
+    square = _island(
+        902,
+        (3.0, 0.0, 0.0, 4.0, 1.0, 0.1),
+        principal_angle=math.radians(22.0),
+    )
+    square.uv_bounds = (0.0, 0.0, 1.0, 1.0)
+    settings = VUV.GroupLayoutOptions()
+    analysis = _analysis((long_panel, square))
+    angles = VUV._orientation_angles(analysis, settings)
+    long_axis = VUV._line_angle_wrap(
+        long_panel.principal_angle + angles[long_panel.island_id]
+    )
+    square_axis = VUV._line_angle_wrap(
+        square.principal_angle + angles[square.island_id]
+    )
+    assert abs(VUV._line_angle_wrap(long_axis - math.pi * 0.5)) < 1.0e-12
+    assert abs(square_axis) < 1.0e-12
+
+    rectangles = (
+        VUV._Rect(0, 0.8, 0.25, 0),
+        VUV._Rect(1, 0.25, 0.8, 1),
+        VUV._Rect(2, 0.35, 0.30, 2),
+    )
+    placements, width, height = VUV._pack_layout_group_rectangles(
+        rectangles,
+        repeat_cohorts=(),
+        gap=0.01,
+        allow_rotate=True,
+        prefer_vertical_long_rectangles=True,
+    )
+    values = tuple(placements.values())
+    for index, left in enumerate(values):
+        for right in values[index + 1:]:
+            assert VUV._placements_clear(left, right, 0.01)
+    assert placements[0].quarter_turn
+    assert not placements[1].quarter_turn
+
+
+def _test_vertical_preference_can_be_disabled():
+    panel = _island(
+        903,
+        (0.0, 0.0, 0.0, 2.0, 0.5, 0.1),
+        principal_angle=0.0,
+    )
+    settings = VUV.GroupLayoutOptions(
+        prefer_vertical_long_rectangles=False,
+    )
+    angles = VUV._orientation_angles(_analysis((panel,)), settings)
+    assert abs(angles[panel.island_id]) < 1.0e-12
 
 
 def _test_incompatible_directed_repeat_downgrades_to_cardinal_geometry():
@@ -2666,7 +2735,10 @@ def _test_incompatible_directed_repeat_downgrades_to_cardinal_geometry():
         VUV._line_angle_wrap(island.principal_angle + angles[island.island_id])
         for island in analysis.islands
     ]
-    assert all(abs(line) < 1.0e-12 for line in final_lines), final_lines
+    assert all(
+        abs(VUV._line_angle_wrap(line - math.pi * 0.5)) < 1.0e-12
+        for line in final_lines
+    ), final_lines
 
     # A generous tolerance keeps the original directed behavior available for
     # genuinely directional parts whose landmark and geometric axis agree
@@ -4097,6 +4169,8 @@ _test_rotated_shared_boundary_uses_semantic_uv_epsilon()
 _test_adaptive_replay_reaudits_committed_coordinates()
 _test_adaptive_replay_exception_restores_source()
 _test_non_repeat_cardinal_switch()
+_test_long_rectangles_prefer_vertical_cardinal_axis()
+_test_vertical_preference_can_be_disabled()
 _test_incompatible_directed_repeat_downgrades_to_cardinal_geometry()
 _test_directed_repeat_can_disable_cardinal_compatibility_gate()
 _test_post_layout_owner_partition_reapplies_direction_policy()
