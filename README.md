@@ -4,6 +4,11 @@
 
 当前试验版本：`0.5.6`
 
+版本记录与后续计划：
+
+- [CHANGELOG.md](CHANGELOG.md)：版本更新日志与已知限制
+- [ROADMAP.md](ROADMAP.md)：改进方向、验收门槛和发布计划
+
 ## 下载与安装
 
 - [Visibility_Aware_UV_Optimizer_0.5.6_HardSurface.zip](release/Visibility_Aware_UV_Optimizer_0.5.6_HardSurface.zip)

@@ -45,6 +45,16 @@ _GEOMETRY_AXIS_MIN_EFFECTIVE_FRACTION = 0.50
 # differences as a tie so symmetric repeat cohorts cannot switch X/Z merely
 # because packing changed the final rounding phase.
 _GEOMETRY_AXIS_GROUP_TIE_EPSILON = 1.0e-4
+# Detached hard-surface charts that share an (unsigned) model normal are
+# treated as one presentation domain.  Keep this angular bucket deliberately
+# narrow: it catches coplanar/repeated panels without merging adjacent faces
+# on a curved shell into one axis contract.
+_GEOMETRY_AXIS_CONSENSUS_NORMAL_ANGLE = math.radians(12.0)
+# A common axis is useful only when it covers a meaningful part of a normal
+# domain.  The selected axis may still be inherited by a smaller member when
+# its own Jacobian is numerically valid; that member is reported as a bounded
+# consensus downgrade rather than silently making a second cohort.
+_GEOMETRY_AXIS_CONSENSUS_MIN_COVERAGE = 0.60
 # A repeated/owner cohort may share one writeback angle only when all of its
 # members already agree within this small signed window.  Larger differences
 # usually mean a real quarter-turn, a mirrored tangent, or a different model
@@ -63,6 +73,13 @@ _GEOMETRY_LONG_EDGE_MAX_SPREAD = math.radians(45.0)
 _GEOMETRY_FRAME_MIN_CONCENTRATION = 0.60
 _GEOMETRY_FRAME_MIN_EFFECTIVE_FRACTION = 0.50
 _GEOMETRY_FRAME_MIN_PARITY_CONFIDENCE = 0.75
+# Robust frame aggregation rejects a small bevel/UV-shear mode only when the
+# dominant local frame still carries most of the weighted chart area.  These
+# gates are intentionally stricter than a visual heading heuristic: a frame
+# that cannot explain the majority of a chart must fall back to the strict
+# single-axis +V correction.
+_GEOMETRY_FRAME_ROBUST_TRIM_ANGLE = math.radians(35.0)
+_GEOMETRY_FRAME_MIN_INLIER_WEIGHT = 0.60
 _TAU = math.pi * 2.0
 _AFFINITY_SEARCH_POLICIES = (
     (4, 96, 25000),
@@ -176,6 +193,48 @@ class GroupLayoutOptions:
     # Z -> X -> Y behavior; elongated weapon bodies can opt into Y -> Z -> X
     # without changing the explicit ``direction_axis`` contract.
     direction_auto_priority: str = "ZXY"
+    # Optional hard-surface AUTO resolver bias.  A positive value lets a
+    # candidate model axis win when its rigid +V correction also leaves the
+    # chart's dominant long edge horizontal/vertical.  Zero preserves the
+    # historical priority/stability-only resolver used by older callers.
+    direction_auto_cardinal_bias: float = 0.0
+    # Ignore weak/ambiguous long-edge cues when applying the AUTO bias.  The
+    # cue is never allowed to replace a candidate below the strict geometric
+    # projection threshold.
+    direction_auto_cardinal_min_confidence: float = 0.15
+    # Optional common-axis presentation preference for hard-surface cohorts.
+    # This is intentionally separate from the per-island AUTO resolver: a
+    # long-edge cue may influence a shared structural axis only after every
+    # member has a valid candidate.  The default keeps legacy AUTO selection
+    # byte-for-byte stable for callers that do not opt in.
+    prefer_geometry_axis_cardinal: bool = False
+    # Minimum reduction in the weighted long-edge cardinal error (radians)
+    # required before a lower-stability common axis can replace the baseline.
+    geometry_axis_cardinal_min_gain: float = math.radians(5.0)
+    # Maximum loss in the weakest candidate stability accepted for that visual
+    # improvement.  Stability is the same bounded metric used by the legacy
+    # common-axis resolver, so this threshold is scale independent.
+    geometry_axis_cardinal_max_quality_loss: float = 0.15
+    # Resolve otherwise independent AUTO charts from a model-space normal
+    # domain before falling back to the UV-Jacobian winner.  This is an
+    # opt-in presentation contract: structure/repeat/owner cohorts are still
+    # authoritative, while singleton panels use the configured axis priority
+    # against their actual tangent plane instead of their arbitrary source-UV
+    # rotation.  It prevents a checker pattern from changing heading merely
+    # because an unwrap happened to rotate one detached chart.
+    cohere_auto_geometry_axis: bool = False
+    # Minimum geometric tangent projection required for a priority axis to be
+    # considered in the normal-domain resolver.  A value near 0.70 accepts
+    # ordinary bevels while rejecting axes that are effectively the face
+    # normal.  Candidates must also pass the existing UV Jacobian confidence
+    # gate, so this setting cannot invent a direction on a degenerate chart.
+    geometry_axis_consensus_min_tangent: float = 0.70
+    # Reporting threshold for UV-Jacobian confidence in the normal-domain
+    # resolver.  It is intentionally separate from
+    # ``direction_axis_min_projection``: a numerically valid low-confidence
+    # member may inherit the domain axis and is reported as downgraded instead
+    # of being split into a second orientation cohort.
+    geometry_axis_consensus_min_confidence: float = 0.30
     # Only a numerically normal axis may trigger the next fallback.  A
     # perceptual threshold here can make successive pipeline stages choose
     # different axes and introduce a deterministic 180-degree flip.
@@ -209,10 +268,22 @@ class GroupLayoutOptions:
     preserve_source_layout: bool = False
     source_layout_row_quantum: float = 0.025
     source_layout_row_weight: float = 0.15
+    # Placement order for the source-atlas repair pass.  ROW_MAJOR keeps the
+    # artist's existing rows/columns as the primary scaffold; AREA is retained
+    # for legacy callers that intentionally place the largest charts first.
+    source_layout_order: str = "ROW_MAJOR"
     # Weight for keeping linked source-layout charts on a common translation.
     # This is a layout-only affinity and never changes island ownership or
     # seam data.  A zero default preserves the historical source-row behavior.
     source_layout_affinity_weight: float = 0.0
+    # Source-cell packing keeps nearby structural charts in a small rigid
+    # rack before the atlas-level collision pass.  The limits are expressed
+    # in source-UV space so a semantic chain cannot pull distant regions into
+    # one giant block (the failure mode of the old macro packer).
+    source_layout_cell_enabled: bool = True
+    source_layout_cell_max_members: int = 12
+    source_layout_cell_diameter_ratio: float = 0.16
+    source_layout_cell_link_radius_ratio: float = 0.12
     # Small mechanical details are easy to lose at bake resolution.  This is
     # a bounded *uniform* boost applied only to islands classified as small;
     # it does not shear or stretch an island and can be disabled with 1.0.
@@ -310,6 +381,46 @@ class GroupLayoutOptions:
         if str(self.direction_axis).upper() not in {"AUTO", "X", "Y", "Z"}:
             raise ValueError("direction_axis must be AUTO, X, Y, or Z")
         _normalize_direction_auto_priority(self.direction_auto_priority)
+        if not math.isfinite(float(self.direction_auto_cardinal_bias)) or not 0.0 <= float(
+            self.direction_auto_cardinal_bias
+        ) <= 1.0:
+            raise ValueError(
+                "direction_auto_cardinal_bias must be finite and in [0, 1]"
+            )
+        if not math.isfinite(float(self.direction_auto_cardinal_min_confidence)) or not 0.0 <= float(
+            self.direction_auto_cardinal_min_confidence
+        ) <= 1.0:
+            raise ValueError(
+                "direction_auto_cardinal_min_confidence must be finite and in [0, 1]"
+            )
+        if (
+            not math.isfinite(float(self.geometry_axis_cardinal_min_gain))
+            or not 0.0 <= float(self.geometry_axis_cardinal_min_gain) <= math.pi * 0.25
+        ):
+            raise ValueError(
+                "geometry_axis_cardinal_min_gain must be finite and in [0, pi/4]"
+            )
+        if (
+            not math.isfinite(float(self.geometry_axis_cardinal_max_quality_loss))
+            or not 0.0 <= float(self.geometry_axis_cardinal_max_quality_loss) <= 1.0
+        ):
+            raise ValueError(
+                "geometry_axis_cardinal_max_quality_loss must be finite and in [0, 1]"
+            )
+        if (
+            not math.isfinite(float(self.geometry_axis_consensus_min_tangent))
+            or not 0.0 <= float(self.geometry_axis_consensus_min_tangent) <= 1.0
+        ):
+            raise ValueError(
+                "geometry_axis_consensus_min_tangent must be finite and in [0, 1]"
+            )
+        if (
+            not math.isfinite(float(self.geometry_axis_consensus_min_confidence))
+            or not 0.0 <= float(self.geometry_axis_consensus_min_confidence) <= 1.0
+        ):
+            raise ValueError(
+                "geometry_axis_consensus_min_confidence must be finite and in [0, 1]"
+            )
         if (
             not math.isfinite(float(self.direction_axis_min_projection))
             or not 0.0 <= float(self.direction_axis_min_projection) <= 1.0
@@ -338,6 +449,8 @@ class GroupLayoutOptions:
             raise ValueError(
                 "source_layout_row_weight must be finite and in [0, 10]"
             )
+        if str(self.source_layout_order).upper() not in {"ROW_MAJOR", "AREA"}:
+            raise ValueError("source_layout_order must be ROW_MAJOR or AREA")
         if (
             not math.isfinite(float(self.source_layout_affinity_weight))
             or not 0.0 <= float(self.source_layout_affinity_weight) <= 10.0
@@ -345,6 +458,19 @@ class GroupLayoutOptions:
             raise ValueError(
                 "source_layout_affinity_weight must be finite and in [0, 10]"
             )
+        if self.source_layout_cell_max_members < 2:
+            raise ValueError(
+                "source_layout_cell_max_members must be at least two"
+            )
+        for name in (
+            "source_layout_cell_diameter_ratio",
+            "source_layout_cell_link_radius_ratio",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or not 0.0 < value <= 1.0:
+                raise ValueError(
+                    "{} must be finite and in (0, 1]".format(name)
+                )
         if not math.isfinite(float(self.small_island_scale_boost)) or not 1.0 <= float(
             self.small_island_scale_boost
         ) <= 3.0:
@@ -1111,6 +1237,86 @@ def _orientation_reference_angle(
     return None
 
 
+def _uv_cardinal_reference(
+    mesh: Any,
+    uv_layer: Any,
+    face_indices: Sequence[int],
+    min_pca_anisotropy: float = 0.06,
+    min_edge_confidence: float = 0.15,
+) -> Tuple[Optional[float], float]:
+    """Return a line cue and confidence for AUTO axis scoring.
+
+    AUTO axis resolution runs before an :class:`IslandRecord` is assembled,
+    so it cannot reuse ``_orientation_reference_angle`` directly.  Keep this
+    small read-only helper in the same module and use the exact PCA/boundary
+    edge policy as the later cardinal alignment pass.
+    """
+
+    points = []
+    for face_index in face_indices:
+        try:
+            points.extend(
+                uv_layer.data[int(loop_index)].uv.copy()
+                for loop_index in mesh.polygons[int(face_index)].loop_indices
+            )
+        except (AttributeError, IndexError, TypeError, RuntimeError):
+            continue
+    if len(points) < 2:
+        return None, 0.0
+    bounds = _uv_bounds(points)
+    extent = max(
+        float(bounds[2]) - float(bounds[0]),
+        float(bounds[3]) - float(bounds[1]),
+        _EPSILON,
+    )
+    principal, anisotropy = _principal_axis(points)
+    if anisotropy >= float(min_pca_anisotropy):
+        return _line_angle_wrap(float(principal)), _clamp(float(anisotropy), 0.0, 1.0)
+    edge_angle, edge_confidence = _dominant_uv_edge_angle(
+        mesh, uv_layer, face_indices, extent
+    )
+    if (
+        edge_angle is not None
+        and math.isfinite(float(edge_angle))
+        and float(edge_confidence) >= float(min_edge_confidence)
+    ):
+        return _line_angle_wrap(float(edge_angle)), _clamp(
+            float(edge_confidence), 0.0, 1.0
+        )
+    return None, 0.0
+
+
+def _cardinal_axis_quality(
+    reference: Optional[float],
+    rotation: float,
+    confidence: float,
+    min_confidence: float,
+) -> Optional[float]:
+    """Map a candidate's rigidly corrected line to a bounded quality score."""
+
+    if reference is None:
+        return None
+    try:
+        reference = float(reference)
+        rotation = float(rotation)
+        confidence = float(confidence)
+        min_confidence = float(min_confidence)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (
+        reference, rotation, confidence, min_confidence
+    )) or confidence + _EPSILON < min_confidence:
+        return None
+    error = abs(_nearest_cardinal_delta(
+        _line_angle_wrap(reference + rotation)
+    ))
+    # A 45-degree line is the least useful orientation cue.  Keep the
+    # confidence factor separate so a weak edge cannot dominate a strong PCA
+    # candidate merely because it happens to be near a cardinal angle.
+    normalized = 1.0 - _clamp(error / (math.pi * 0.25), 0.0, 1.0)
+    return _clamp(normalized * _clamp(confidence, 0.0, 1.0), 0.0, 1.0)
+
+
 def _stable_hash(payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -1736,6 +1942,140 @@ def _direction_point(obj: Any, point: Vector, space: str) -> Vector:
     return point.copy()
 
 
+def _geometry_island_normal(
+    obj: Any,
+    mesh: Any,
+    face_indices: Sequence[int],
+    space: str,
+) -> Vector:
+    """Return an area-weighted island normal in the requested direction space.
+
+    ``IslandRecord.average_normal`` is retained for legacy reports and is
+    always evaluated with the object's world normal matrix.  AUTO direction
+    coherence, however, must compare the normal to the same axis basis used
+    by the derivative solver.  Recompute it here so OBJECT-space contracts do
+    not accidentally inherit a rotated object's world orientation.
+    """
+
+    normal_matrix = _normal_matrix(obj) if str(space).upper() == "WORLD" else None
+    weighted = Vector((0.0, 0.0, 0.0))
+    total_weight = 0.0
+    for face_index in face_indices:
+        try:
+            polygon = mesh.polygons[int(face_index)]
+            normal = polygon.normal.copy()
+            if normal_matrix is not None:
+                normal = normal_matrix @ normal
+            if normal.length_squared <= _EPSILON:
+                continue
+            normal.normalize()
+            weight = max(float(polygon.area), _EPSILON)
+        except (AttributeError, IndexError, TypeError, ValueError, RuntimeError):
+            continue
+        weighted += normal * weight
+        total_weight += weight
+    if weighted.length_squared <= _EPSILON:
+        return Vector((0.0, 0.0, 0.0))
+    weighted.normalize()
+    return weighted
+
+
+def _geometry_axis_tangent_projection(
+    normal: Vector,
+    axis_name: str,
+) -> float:
+    """Return the unit model-axis magnitude that lies in a tangent plane."""
+
+    axis = _DIRECTION_AXES.get(str(axis_name).upper())
+    if axis is None or normal.length_squared <= _EPSILON:
+        return 0.0 if axis is not None else 0.0
+    try:
+        normalized = normal.normalized()
+        parallel = float(normalized.dot(axis))
+    except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+    if not math.isfinite(parallel):
+        return 0.0
+    return _clamp(math.sqrt(max(0.0, 1.0 - parallel * parallel)), 0.0, 1.0)
+
+
+def _unsigned_normal_alignment(left: Vector, right: Vector) -> float:
+    """Return the orientation-invariant alignment of two normals."""
+
+    if (
+        left is None
+        or right is None
+        or left.length_squared <= _EPSILON
+        or right.length_squared <= _EPSILON
+    ):
+        return -1.0
+    try:
+        return _clamp(abs(float(left.normalized().dot(right.normalized()))), 0.0, 1.0)
+    except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+        return -1.0
+
+
+def _geometry_normal_domains(
+    normals: Mapping[int, Vector],
+    *,
+    max_angle: float = _GEOMETRY_AXIS_CONSENSUS_NORMAL_ANGLE,
+) -> Tuple[Tuple[int, ...], ...]:
+    """Cluster island normals into deterministic unsigned normal domains.
+
+    Opposite-facing sides of a repeated hard-surface part belong to the same
+    domain because the direction contract is expressed in the positive object
+    axis, not in the face-normal sign.  A greedy representative update keeps
+    this O(n * domain_count) for dense meshes and makes the result independent
+    of hash/set iteration order.
+    """
+
+    try:
+        angle = float(max_angle)
+    except (TypeError, ValueError):
+        angle = _GEOMETRY_AXIS_CONSENSUS_NORMAL_ANGLE
+    if not math.isfinite(angle):
+        angle = _GEOMETRY_AXIS_CONSENSUS_NORMAL_ANGLE
+    angle = _clamp(angle, 0.0, math.pi * 0.5)
+    cosine_threshold = math.cos(angle)
+    domains: List[List[int]] = []
+    representatives: List[Vector] = []
+    for island_id in sorted(int(value) for value in normals):
+        normal = normals[island_id]
+        if normal is None or normal.length_squared <= _EPSILON:
+            continue
+        try:
+            normalized = normal.normalized()
+        except (AttributeError, ValueError, ZeroDivisionError):
+            continue
+        best_index = None
+        best_alignment = cosine_threshold
+        for index, representative in enumerate(representatives):
+            alignment = _unsigned_normal_alignment(normalized, representative)
+            if alignment + _EPSILON < best_alignment:
+                continue
+            if (
+                best_index is None
+                or alignment > best_alignment + _EPSILON
+                or index < best_index
+            ):
+                best_index = index
+                best_alignment = alignment
+        if best_index is None:
+            domains.append([island_id])
+            representatives.append(normalized.copy())
+            continue
+        domains[best_index].append(island_id)
+        representative = representatives[best_index]
+        # Align opposite normals before averaging so the representative stays
+        # on one unsigned hemisphere and does not collapse toward zero.
+        aligned = normalized if representative.dot(normalized) >= 0.0 else -normalized
+        updated = representative + aligned
+        if updated.length_squared > _EPSILON:
+            updated.normalize()
+            representatives[best_index] = updated
+    return tuple(tuple(domain) for domain in domains)
+
+
 def _geometry_derivative_records(
     obj: Any,
     mesh: Any,
@@ -1936,8 +2276,17 @@ def _select_auto_geometry_axis(
     axis_names: Sequence[str],
     statistics: Mapping[str, Mapping[str, float]],
     min_projection: float,
+    cardinal_scores: Optional[Mapping[str, Optional[float]]] = None,
+    cardinal_bias: float = 0.0,
 ) -> Optional[str]:
-    """Choose the first coherent AUTO axis or the strongest stable fallback."""
+    """Choose an AUTO axis using stability, with an optional cardinal bias.
+
+    The legacy resolver is intentionally unchanged when ``cardinal_bias`` is
+    zero.  Hard-surface callers can opt in to the extra term: every candidate
+    still has to pass the same tangent projection gate, and the cardinal term
+    only chooses among those valid candidates.  This avoids the unsafe
+    arbitrary post-pack rotations that used to break the signed +V contract.
+    """
 
     eligible = [
         axis_name for axis_name in axis_names
@@ -1947,6 +2296,36 @@ def _select_auto_geometry_axis(
     ]
     if not eligible:
         return None
+
+    try:
+        bias = _clamp(float(cardinal_bias), 0.0, 1.0)
+    except (TypeError, ValueError):
+        bias = 0.0
+    if bias > _EPSILON and cardinal_scores:
+        scored = [
+            axis_name for axis_name in eligible
+            if cardinal_scores.get(axis_name) is not None
+        ]
+        if scored:
+            priority = {axis_name: index for index, axis_name in enumerate(axis_names)}
+
+            def score(axis_name: str) -> Tuple[float, float, float, int]:
+                values = statistics[axis_name]
+                stability = _clamp(
+                    float(values.get("stability_score", 0.0))
+                    * float(values.get("normalized_strength", 0.0)),
+                    0.0,
+                    1.0,
+                )
+                quality = _clamp(float(cardinal_scores[axis_name]), 0.0, 1.0)
+                return (
+                    bias * quality + (1.0 - bias) * stability,
+                    quality,
+                    stability,
+                    -priority.get(axis_name, len(axis_names)),
+                )
+
+            return max(scored, key=score)
 
     def coherent(axis_name: str) -> bool:
         values = statistics[axis_name]
@@ -1984,6 +2363,8 @@ def _geometry_direction_record(
     min_projection: float = 0.35,
     fixed_axis_name: Optional[str] = None,
     auto_priority: Any = _DEFAULT_DIRECTION_AUTO_PRIORITY,
+    cardinal_bias: float = 0.0,
+    cardinal_min_confidence: float = 0.15,
 ) -> Tuple[Optional[str], Vector, float, float]:
     """Resolve a positive 3D axis and its directed UV correction.
 
@@ -2020,8 +2401,43 @@ def _geometry_direction_record(
         if confidence + _EPSILON < float(min_projection):
             return None, Vector((0.0, 0.0)), 0.0, confidence
     else:
+        cardinal_scores = None
+        try:
+            configured_bias = _clamp(float(cardinal_bias), 0.0, 1.0)
+        except (TypeError, ValueError):
+            configured_bias = 0.0
+        if configured_bias > _EPSILON:
+            try:
+                configured_min_confidence = _clamp(
+                    float(cardinal_min_confidence), 0.0, 1.0
+                )
+            except (TypeError, ValueError):
+                configured_min_confidence = 0.15
+            reference, reference_confidence = _uv_cardinal_reference(
+                mesh,
+                uv_layer,
+                face_indices,
+                min_edge_confidence=configured_min_confidence,
+            )
+            cardinal_scores = {
+                candidate_axis: _cardinal_axis_quality(
+                    reference,
+                    math.atan2(
+                        float(statistics[candidate_axis].get("sum_u", 0.0)),
+                        float(statistics[candidate_axis].get("sum_v", 0.0)),
+                    ),
+                    reference_confidence,
+                    configured_min_confidence,
+                )
+                for candidate_axis in axis_names
+                if candidate_axis in statistics
+            }
         axis_name = _select_auto_geometry_axis(
-            axis_names, statistics, float(min_projection)
+            axis_names,
+            statistics,
+            float(min_projection),
+            cardinal_scores=cardinal_scores,
+            cardinal_bias=configured_bias,
         )
         if axis_name is None:
             strongest = max(
@@ -2043,6 +2459,156 @@ def _geometry_direction_record(
         direction.normalize()
     rotation = _angle_wrap(math.atan2(component_u, component_v))
     return axis_name, direction, rotation, confidence
+
+
+def _frame_vector_angle(vector: Vector) -> float:
+    """Return a frame-vector angle measured from UV +V."""
+
+    return _angle_wrap(math.atan2(float(vector.x), float(vector.y)))
+
+
+def _weighted_frame_angle_median(
+    samples: Sequence[Mapping[str, Any]],
+    key: str,
+) -> Optional[float]:
+    """Return a deterministic weighted circular median for frame vectors."""
+
+    angles: List[Tuple[float, float, int]] = []
+    for index, sample in enumerate(samples):
+        vector = sample.get(key)
+        try:
+            weight = float(sample.get("weight", 0.0))
+            angle = _frame_vector_angle(vector)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if (
+            not math.isfinite(angle)
+            or not math.isfinite(weight)
+            or weight <= _EPSILON
+        ):
+            continue
+        angles.append((angle, weight, index))
+    if not angles:
+        return None
+
+    # Unwrap around a weighted circular mean before taking the ordinary
+    # weighted median.  This avoids the +/-pi seam splitting an otherwise
+    # tight cluster and remains deterministic for a bimodal chart.
+    mean_x = sum(math.sin(angle) * weight for angle, weight, _ in angles)
+    mean_y = sum(math.cos(angle) * weight for angle, weight, _ in angles)
+    if math.hypot(mean_x, mean_y) > _EPSILON:
+        reference = _angle_wrap(math.atan2(mean_x, mean_y))
+    else:
+        reference = min(
+            angles,
+            key=lambda item: (-item[1], item[2]),
+        )[0]
+    unwrapped = sorted(
+        (
+            _angle_wrap(angle - reference),
+            weight,
+            index,
+        )
+        for angle, weight, index in angles
+    )
+    total_weight = sum(item[1] for item in unwrapped)
+    threshold = total_weight * 0.5
+    accumulated = 0.0
+    selected_delta = unwrapped[-1][0]
+    for delta, weight, _index in unwrapped:
+        accumulated += weight
+        if accumulated + _EPSILON >= threshold:
+            selected_delta = delta
+            break
+    return _angle_wrap(reference + selected_delta)
+
+
+def _robust_frame_sample_subset(
+    samples: Sequence[Mapping[str, Any]],
+) -> Tuple[List[Mapping[str, Any]], float, bool]:
+    """Select a dominant, internally orthogonal local-frame mode.
+
+    The returned fraction is measured against the original weighted sample
+    total.  ``False`` means the chart is too multimodal to justify trimming;
+    callers should keep the raw aggregate but lower its confidence so the
+    strict single-axis path remains in charge.
+    """
+
+    if len(samples) < 3:
+        total = sum(
+            max(float(sample.get("weight", 0.0)), 0.0)
+            for sample in samples
+        )
+        return list(samples), 1.0 if total > _EPSILON else 0.0, True
+    total_weight = sum(
+        max(float(sample.get("weight", 0.0)), 0.0)
+        for sample in samples
+    )
+    if total_weight <= _EPSILON:
+        return [], 0.0, False
+
+    positive_weight = sum(
+        max(float(sample.get("weight", 0.0)), 0.0)
+        for sample in samples
+        if int(sample.get("parity", 0)) > 0
+    )
+    negative_weight = sum(
+        max(float(sample.get("weight", 0.0)), 0.0)
+        for sample in samples
+        if int(sample.get("parity", 0)) < 0
+    )
+    dominant_parity = 1 if positive_weight >= negative_weight else -1
+    dominant_weight = max(positive_weight, negative_weight)
+    # Do not mix reflected local frames while looking for the dominant mode;
+    # the parity confidence gate below still evaluates the full chart.
+    parity_pool = [
+        sample for sample in samples
+        if int(sample.get("parity", 0)) == dominant_parity
+    ]
+    if dominant_weight / max(total_weight, _EPSILON) < _GEOMETRY_FRAME_MIN_PARITY_CONFIDENCE:
+        parity_pool = list(samples)
+        dominant_parity = 1
+    median_v = _weighted_frame_angle_median(parity_pool, "v")
+    if median_v is None:
+        return list(samples), 0.0, False
+
+    trim_angle = _GEOMETRY_FRAME_ROBUST_TRIM_ANGLE
+    inliers = []
+    inlier_weight = 0.0
+    for sample in parity_pool:
+        try:
+            v_angle = _frame_vector_angle(sample.get("v"))
+            u_angle = _frame_vector_angle(sample.get("u"))
+            weight = float(sample.get("weight", 0.0))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if not math.isfinite(weight) or weight <= _EPSILON:
+            continue
+        v_error = abs(_angle_wrap(v_angle - median_v))
+        expected_u = median_v + (
+            math.pi * 0.5 if dominant_parity > 0 else -math.pi * 0.5
+        )
+        # The local U/V pair must remain orthogonal with the same handedness;
+        # this second gate rejects a shear mode that happens to share V.
+        pair_error = abs(_angle_wrap(u_angle - v_angle - (
+            math.pi * 0.5 if int(sample.get("parity", 0)) > 0
+            else -math.pi * 0.5
+        )))
+        expected_error = abs(_angle_wrap(u_angle - expected_u))
+        if (
+            v_error <= trim_angle + _EPSILON
+            and pair_error <= trim_angle + _EPSILON
+            and expected_error <= trim_angle + _EPSILON
+        ):
+            inliers.append(sample)
+            inlier_weight += weight
+    fraction = inlier_weight / max(total_weight, _EPSILON)
+    if (
+        not inliers
+        or fraction + _EPSILON < _GEOMETRY_FRAME_MIN_INLIER_WEIGHT
+    ):
+        return list(samples), fraction, False
+    return inliers, fraction, True
 
 
 def _geometry_frame_record(
@@ -2117,11 +2683,7 @@ def _geometry_frame_record(
         return result
 
     axis_vector = _DIRECTION_AXES[selected_axis]
-    u_sum = Vector((0.0, 0.0))
-    v_sum = Vector((0.0, 0.0))
-    total_weight = 0.0
-    parity_sum = 0.0
-    valid_count = 0
+    frame_samples: List[Mapping[str, Any]] = []
     for record in records:
         derivative_u = record.get("derivative_u")
         derivative_v = record.get("derivative_v")
@@ -2212,21 +2774,74 @@ def _geometry_frame_record(
         )
         if not math.isfinite(weight) or weight <= _EPSILON:
             continue
-        u_sum += uv_u * weight
-        v_sum += uv_v * weight
-        parity_sum += parity * weight
-        total_weight += weight
-        valid_count += 1
+        frame_samples.append({
+            "u": uv_u,
+            "v": uv_v,
+            "parity": int(parity),
+            "weight": weight,
+        })
 
-    result["valid_records"] = valid_count
-    result["effective_fraction"] = valid_count / max(len(records), 1)
-    if total_weight <= _EPSILON or valid_count == 0:
+    raw_total_weight = sum(
+        max(float(sample.get("weight", 0.0)), 0.0)
+        for sample in frame_samples
+    )
+    raw_parity_sum = sum(
+        float(sample.get("parity", 0))
+        * max(float(sample.get("weight", 0.0)), 0.0)
+        for sample in frame_samples
+    )
+    raw_valid_count = len(frame_samples)
+    if raw_total_weight <= _EPSILON or raw_valid_count == 0:
         result["reason"] = "no_frame_signal"
         return result
 
+    robust_samples, inlier_fraction, robust_ready = (
+        _robust_frame_sample_subset(frame_samples)
+    )
+    # A multimodal chart remains diagnosable through the raw vectors, but its
+    # robust support is part of frame confidence.  This ensures a curved or
+    # sheared island cannot opt into a pseudo-frame merely because its raw
+    # circular mean happened to be sharp.
+    samples = robust_samples if robust_ready else frame_samples
+    used_weight = sum(
+        max(float(sample.get("weight", 0.0)), 0.0)
+        for sample in samples
+    )
+    if used_weight <= _EPSILON or not samples:
+        result["reason"] = "no_frame_signal"
+        return result
+    u_sum = sum(
+        (
+            sample["u"] * max(float(sample.get("weight", 0.0)), 0.0)
+            for sample in samples
+        ),
+        Vector((0.0, 0.0)),
+    )
+    v_sum = sum(
+        (
+            sample["v"] * max(float(sample.get("weight", 0.0)), 0.0)
+            for sample in samples
+        ),
+        Vector((0.0, 0.0)),
+    )
+    parity_sum = raw_parity_sum
+    valid_count = len(samples)
+    total_weight = used_weight
+    result["valid_records"] = valid_count
+    result["effective_fraction"] = min(
+        valid_count / max(len(records), 1),
+        _clamp(inlier_fraction, 0.0, 1.0),
+    )
+    result["robust_inlier_fraction"] = _clamp(inlier_fraction, 0.0, 1.0)
+
     u_concentration = _clamp(float(u_sum.length) / total_weight, 0.0, 1.0)
     v_concentration = _clamp(float(v_sum.length) / total_weight, 0.0, 1.0)
-    parity_confidence = _clamp(abs(parity_sum) / total_weight, 0.0, 1.0)
+    # Parity is a chart-wide winding contract.  Keep the denominator on the
+    # untrimmed sample weight so discarding a minority angular mode cannot
+    # inflate a mixed/reflected chart into a falsely positive frame.
+    parity_confidence = _clamp(
+        abs(parity_sum) / max(raw_total_weight, _EPSILON), 0.0, 1.0
+    )
     result["u_concentration"] = u_concentration
     result["v_concentration"] = v_concentration
     result["parity_confidence"] = parity_confidence
@@ -2280,6 +2895,8 @@ def _geometry_frame_record(
         )
     ):
         result["reason"] = "low_frame_concentration"
+    elif not robust_ready:
+        result["reason"] = "low_frame_inlier_support"
     else:
         result["reason"] = None
     return result
@@ -2454,6 +3071,8 @@ def compute_active_uv_islands(
             axis=settings.direction_axis,
             min_projection=settings.direction_axis_min_projection,
             auto_priority=settings.direction_auto_priority,
+            cardinal_bias=settings.direction_auto_cardinal_bias,
+            cardinal_min_confidence=settings.direction_auto_cardinal_min_confidence,
         )
         if settings.align_geometry_direction and settings.align_geometry_frame:
             geometry_frame = _geometry_frame_record(
@@ -4631,6 +5250,10 @@ def _select_common_geometry_axis(
     member_candidates: Sequence[Mapping[str, Mapping[str, Any]]],
     priority: Sequence[str],
     preferred_axis: Optional[str] = None,
+    *,
+    prefer_geometry_axis_cardinal: bool = False,
+    geometry_axis_cardinal_min_gain: float = math.radians(5.0),
+    geometry_axis_cardinal_max_quality_loss: float = 0.15,
 ) -> Optional[str]:
     """Choose one stable axis shared by every structural member.
 
@@ -4687,7 +5310,110 @@ def _select_common_geometry_axis(
         if weakest[axis_name][1] + _GEOMETRY_AXIS_GROUP_TIE_EPSILON
         >= best_confidence
     ]
-    return min(confidence_pool, key=lambda axis_name: priority_rank[axis_name])
+    baseline = min(confidence_pool, key=lambda axis_name: priority_rank[axis_name])
+
+    # A structural/repeat lock is an explicit contract.  The cardinal pass is
+    # only a presentation preference and must never replace that contract.
+    if not prefer_geometry_axis_cardinal:
+        return baseline
+
+    try:
+        min_gain = float(geometry_axis_cardinal_min_gain)
+    except (TypeError, ValueError):
+        min_gain = math.radians(5.0)
+    if not math.isfinite(min_gain):
+        min_gain = math.radians(5.0)
+    min_gain = _clamp(min_gain, 0.0, math.pi * 0.25)
+    try:
+        max_quality_loss = float(geometry_axis_cardinal_max_quality_loss)
+    except (TypeError, ValueError):
+        max_quality_loss = 0.15
+    if not math.isfinite(max_quality_loss):
+        max_quality_loss = 0.15
+    max_quality_loss = _clamp(max_quality_loss, 0.0, 1.0)
+
+    def cardinal_stats(axis_name: str) -> Optional[Tuple[float, float, int]]:
+        """Return weighted line error, cue weight, and member coverage.
+
+        Candidates are produced by ``_cohere_auto_geometry_axes``.  Keeping
+        this reader tolerant of absent fields preserves compatibility with
+        older test doubles and callers that only provide stability/confidence.
+        A candidate with no reliable edge cue is not allowed to win a visual
+        orientation vote.
+        """
+
+        weighted_error = 0.0
+        total_weight = 0.0
+        covered = 0
+        for candidates in member_candidates:
+            values = candidates.get(axis_name)
+            if values is None:
+                continue
+            raw_error = values.get("cardinal_error")
+            if raw_error is None:
+                # Accept the descriptive spelling used by external probes.
+                raw_error = values.get("cardinal_error_radians")
+            try:
+                error = abs(float(raw_error))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(error):
+                continue
+            raw_weight = values.get("cardinal_weight", values.get("area", 1.0))
+            try:
+                weight = float(raw_weight)
+            except (TypeError, ValueError):
+                weight = 0.0
+            if not math.isfinite(weight) or weight <= _EPSILON:
+                continue
+            weighted_error += error * weight
+            total_weight += weight
+            covered += 1
+        if total_weight <= _EPSILON or covered == 0:
+            return None
+        return weighted_error / total_weight, total_weight, covered
+
+    baseline_cardinal = cardinal_stats(baseline)
+    if baseline_cardinal is None:
+        return baseline
+
+    # ``weakest`` mirrors the legacy resolver's stability comparison.  The
+    # cardinal candidate may trade a little stability for a clearly straighter
+    # long edge, but never enough to make a weak chart define the whole cohort.
+    baseline_stability = weakest[baseline][0]
+    candidates = []
+    # Alternatives are drawn from the full coherent/common pool rather than
+    # the weakest-stability tie pool.  The explicit quality-loss gate below is
+    # what permits a *bounded* stability trade for a meaningfully straighter
+    # long edge; restricting this to ``confidence_pool`` would make that gate
+    # unreachable in practice.
+    for axis_name in pool:
+        if axis_name == baseline:
+            continue
+        stats = cardinal_stats(axis_name)
+        if stats is None:
+            continue
+        cardinal_error, _weight, covered = stats
+        if covered < baseline_cardinal[2]:
+            continue
+        gain = baseline_cardinal[0] - cardinal_error
+        if gain + _EPSILON < min_gain:
+            continue
+        stability_loss = max(0.0, baseline_stability - weakest[axis_name][0])
+        if stability_loss > max_quality_loss + _EPSILON:
+            continue
+        candidates.append((
+            cardinal_error,
+            -gain,
+            stability_loss,
+            -weakest[axis_name][0],
+            -weakest[axis_name][1],
+            priority_rank[axis_name],
+            axis_name,
+        ))
+    if not candidates:
+        return baseline
+    return min(candidates)[-1]
 
 
 def _cohere_auto_geometry_axes(
@@ -4717,11 +5443,52 @@ def _cohere_auto_geometry_axes(
     priority = _direction_axis_order(
         "AUTO", settings.direction_auto_priority
     )
-    candidate_cache: Dict[int, Dict[str, Mapping[str, Any]]] = {}
+    candidate_cache: Dict[Tuple[int, float], Dict[str, Mapping[str, Any]]] = {}
+    # A matching persisted contract is the result of a previous successful
+    # layout.  Do not let a later visual preference silently choose another
+    # axis during replay; ``_apply_persisted_geometry_axis_contract`` will
+    # rebind the exact recorded axes immediately after this pass.
+    cardinal_common_enabled = bool(
+        getattr(settings, "prefer_geometry_axis_cardinal", False)
+    )
+    if cardinal_common_enabled:
+        try:
+            persisted = _load_geometry_axis_contract(mesh, uv_layer, settings)
+            current_face_sets = {
+                tuple(sorted(int(index) for index in island.face_indices))
+                for island in analysis.islands
+                if island.face_indices
+            }
+            if persisted and set(persisted) == current_face_sets:
+                cardinal_common_enabled = False
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            # A lightweight test double may not expose ID properties.  In that
+            # case there is no replay contract to protect.
+            pass
 
-    def island_candidates(island_id: int) -> Dict[str, Mapping[str, Any]]:
-        if island_id in candidate_cache:
-            return candidate_cache[island_id]
+    def island_candidates(
+        island_id: int,
+        minimum_confidence: Optional[float] = None,
+    ) -> Dict[str, Mapping[str, Any]]:
+        """Return axis candidates with a caller-specific numerical gate.
+
+        Topology reconciliation retains the configured projection threshold.
+        The normal-domain pass asks for the relaxed numerical set so a highly
+        anisotropic but valid rectangle can inherit the same axis as its
+        coplanar twin; its lower confidence is recorded as a downgrade.
+        """
+
+        if minimum_confidence is None:
+            minimum_confidence = float(settings.direction_axis_min_projection)
+        try:
+            candidate_gate = max(float(minimum_confidence), _GEOMETRY_AXIS_RELATIVE_EPSILON)
+        except (TypeError, ValueError):
+            candidate_gate = _GEOMETRY_AXIS_RELATIVE_EPSILON
+        if not math.isfinite(candidate_gate):
+            candidate_gate = _GEOMETRY_AXIS_RELATIVE_EPSILON
+        cache_key = (int(island_id), candidate_gate)
+        if cache_key in candidate_cache:
+            return candidate_cache[cache_key]
         island = by_id[island_id]
         sum_u, sum_v, records = _geometry_derivative_records(
             obj,
@@ -4734,13 +5501,13 @@ def _cohere_auto_geometry_axes(
             float(sum_u.length_squared + sum_v.length_squared), 0.0
         ))
         if not records or not math.isfinite(energy) or energy <= _EPSILON:
-            candidate_cache[island_id] = {}
-            return candidate_cache[island_id]
+            candidate_cache[cache_key] = {}
+            return candidate_cache[cache_key]
         statistics = _geometry_axis_statistics(
             records,
             priority,
             energy,
-            float(settings.direction_axis_min_projection),
+            candidate_gate,
         )
         candidates: Dict[str, Mapping[str, Any]] = {}
         for axis_name in priority:
@@ -4748,9 +5515,7 @@ def _cohere_auto_geometry_axes(
             if values is None:
                 continue
             confidence = float(values.get("confidence", 0.0))
-            if confidence + _EPSILON < float(
-                settings.direction_axis_min_projection
-            ):
+            if confidence + _EPSILON < candidate_gate:
                 continue
             component_u = float(values.get("sum_u", 0.0))
             component_v = float(values.get("sum_v", 0.0))
@@ -4764,6 +5529,74 @@ def _cohere_auto_geometry_axes(
                 and float(values.get("effective_fraction", 0.0)) + _EPSILON
                 >= _GEOMETRY_AXIS_MIN_EFFECTIVE_FRACTION
             )
+            # Keep the long-edge cue attached to each axis candidate.  The
+            # same source edge is evaluated after that candidate's signed
+            # +V correction, so a structural cohort can compare X/Y/Z without
+            # applying a post-hoc rotation that would invalidate the contract.
+            cardinal_error = None
+            cardinal_weight = 0.0
+            # Keep the common-axis cardinal cue identical to the later
+            # orientation policy: anisotropic charts use their PCA long axis,
+            # while round/low-anisotropy charts fall back to a reliable
+            # boundary edge.  Looking only at ``dominant_edge_angle`` here
+            # made large panels lose their strongest directional evidence.
+            edge_angle = _orientation_reference_angle(
+                island,
+                min_pca_anisotropy=float(settings.min_pca_anisotropy),
+                min_edge_confidence=float(settings.min_cardinal_edge_confidence),
+            )
+            try:
+                edge_confidence = float(
+                    getattr(island, "dominant_edge_confidence", 0.0)
+                )
+            except (AttributeError, TypeError, ValueError):
+                edge_confidence = 0.0
+            try:
+                area = abs(float(island.area_3d))
+            except (AttributeError, TypeError, ValueError):
+                area = 0.0
+            if not math.isfinite(edge_confidence):
+                edge_confidence = 0.0
+            if not math.isfinite(area):
+                area = 0.0
+            # PCA has no independent confidence field on IslandRecord.  Its
+            # anisotropy is the corresponding bounded salience measure; use
+            # it when the reference helper selected ``principal_angle``.
+            try:
+                anisotropy = _clamp(float(island.anisotropy), 0.0, 1.0)
+            except (AttributeError, TypeError, ValueError):
+                anisotropy = 0.0
+            if (
+                edge_angle is not None
+                and anisotropy + _EPSILON >= float(settings.min_pca_anisotropy)
+                and abs(
+                    _line_angle_wrap(
+                        float(edge_angle) - float(island.principal_angle)
+                    )
+                ) <= 1.0e-7
+            ):
+                edge_confidence = max(edge_confidence, anisotropy)
+            try:
+                edge_value = float(edge_angle)
+            except (TypeError, ValueError):
+                edge_value = None
+            if (
+                edge_value is not None
+                and math.isfinite(edge_value)
+                and edge_confidence + _EPSILON
+                >= float(settings.direction_auto_cardinal_min_confidence)
+            ):
+                final_line = _line_angle_wrap(
+                    edge_value + float(
+                        math.atan2(component_u, component_v)
+                    )
+                )
+                cardinal_error = abs(_nearest_cardinal_delta(final_line))
+                # Area and candidate confidence keep tiny bevels/weak tangent
+                # projections from overturning the main panel's vote.
+                cardinal_weight = max(area, _EPSILON) * max(
+                    edge_confidence, float(settings.direction_auto_cardinal_min_confidence)
+                ) * max(confidence, float(settings.direction_axis_min_projection), 0.05)
             candidates[axis_name] = {
                 "direction": direction,
                 "rotation": _angle_wrap(math.atan2(component_u, component_v)),
@@ -4773,8 +5606,11 @@ def _cohere_auto_geometry_axes(
                     float(values.get("stability_score", 0.0))
                     * float(values.get("normalized_strength", 0.0))
                 ),
+                "cardinal_error": cardinal_error,
+                "cardinal_weight": cardinal_weight,
+                "cardinal_edge_confidence": edge_confidence,
             }
-        candidate_cache[island_id] = candidates
+        candidate_cache[cache_key] = candidates
         return candidates
 
     def choose_axis(
@@ -4788,6 +5624,13 @@ def _cohere_auto_geometry_axes(
             member_candidates,
             priority,
             preferred_axis=preferred_axis,
+            prefer_geometry_axis_cardinal=cardinal_common_enabled,
+            geometry_axis_cardinal_min_gain=float(
+                settings.geometry_axis_cardinal_min_gain
+            ),
+            geometry_axis_cardinal_max_quality_loss=float(
+                settings.geometry_axis_cardinal_max_quality_loss
+            ),
         )
 
     locked_axes: Dict[int, str] = {}
@@ -5146,6 +5989,375 @@ def _cohere_auto_geometry_axes(
             False,
         )
 
+    # A source unwrap can leave unrelated hard-surface panels in arbitrary UV
+    # orientations.  Resolve those charts by *normal domain*, rather than by
+    # choosing the first candidate independently.  UV aspect ratio then only
+    # affects the quality tie-break; it cannot make two coplanar panels pick
+    # different model axes.  Existing structure/repeat/owner/continuity
+    # records above are contracts and remain deliberately excluded here.
+    if getattr(settings, "cohere_auto_geometry_axis", False):
+        try:
+            tangent_threshold = _clamp(
+                float(settings.geometry_axis_consensus_min_tangent),
+                0.0,
+                1.0,
+            )
+        except (AttributeError, TypeError, ValueError):
+            tangent_threshold = 0.70
+        try:
+            confidence_threshold = _clamp(
+                float(settings.geometry_axis_consensus_min_confidence),
+                0.0,
+                1.0,
+            )
+        except (AttributeError, TypeError, ValueError):
+            confidence_threshold = 0.30
+
+        constrained_ids: Set[int] = set()
+        constrained_sources = {
+            "STRUCTURE_AFFINITY",
+            "OWNER_ATTACHMENT",
+            "OWNER_ATTACHMENT_RECONCILE",
+            "REPEAT_COHORT",
+            "CONTINUITY_SOFT",
+        }
+        for record in analysis.geometry_axis_groups:
+            if str(record.get("source", "")) not in constrained_sources:
+                continue
+            constrained_ids.update(
+                int(island_id) for island_id in record.get("members", ())
+            )
+
+        normals: Dict[int, Vector] = {}
+        consensus_skipped: Dict[str, int] = defaultdict(int)
+        for island in analysis.islands:
+            island_id = int(island.island_id)
+            if island_id in constrained_ids:
+                continue
+            normal = _geometry_island_normal(
+                obj,
+                mesh,
+                island.face_indices,
+                str(settings.direction_space).upper(),
+            )
+            if normal.length_squared <= _EPSILON:
+                consensus_skipped["normal_unresolved"] += 1
+                continue
+            normals[island_id] = normal
+
+        normal_domains = _geometry_normal_domains(normals)
+        consensus_domain_count = 0
+        for domain_index, member_ids in enumerate(normal_domains):
+            if not member_ids:
+                continue
+            consensus_domain_count += 1
+            total_area = sum(
+                max(float(by_id[island_id].area_3d), _EPSILON)
+                for island_id in member_ids
+            )
+            # Use the numerical candidate set here.  A very elongated but
+            # valid chart can have confidence below the perceptual threshold
+            # simply because one UV side is short; dropping it would recreate
+            # the very X/Z split this pass is intended to remove.
+            domain_candidates = {
+                island_id: island_candidates(
+                    island_id, _GEOMETRY_AXIS_RELATIVE_EPSILON
+                )
+                for island_id in member_ids
+            }
+            axis_stats: Dict[str, Dict[str, Any]] = {}
+            for axis_name in priority:
+                support_ids: List[int] = []
+                support_area = 0.0
+                weighted_quality = 0.0
+                weighted_tangent = 0.0
+                weakest_confidence = 1.0
+                weakest_stability = 1.0
+                for island_id in member_ids:
+                    candidate = domain_candidates[island_id].get(axis_name)
+                    tangent = _geometry_axis_tangent_projection(
+                        normals[island_id], axis_name
+                    )
+                    if candidate is not None:
+                        try:
+                            candidate["tangent_projection"] = tangent
+                        except (TypeError, AttributeError):
+                            pass
+                    # Coherence is the safety gate: it proves that one signed
+                    # +V correction is meaningful throughout this chart.  The
+                    # confidence value is retained for ranking/diagnostics,
+                    # but is not used to eject a numerically valid member from
+                    # an otherwise well-supported domain.
+                    if (
+                        candidate is None
+                        or tangent + _EPSILON < tangent_threshold
+                        or not bool(candidate.get("coherent", False))
+                    ):
+                        continue
+                    try:
+                        confidence = _clamp(
+                            float(candidate.get("confidence", 0.0)),
+                            0.0,
+                            1.0,
+                        )
+                    except (TypeError, ValueError):
+                        confidence = 0.0
+                    try:
+                        stability = _clamp(
+                            float(candidate.get("stability", 0.0)),
+                            0.0,
+                            1.0,
+                        )
+                    except (TypeError, ValueError):
+                        stability = 0.0
+                    area = max(float(by_id[island_id].area_3d), _EPSILON)
+                    support_ids.append(island_id)
+                    support_area += area
+                    weighted_tangent += area * tangent
+                    # Geometry/tangent quality dominates; confidence is a
+                    # gentle tie-break so source UV scale cannot overturn a
+                    # broad common-domain vote.
+                    weighted_quality += area * tangent * (
+                        0.70 + 0.20 * stability + 0.10 * confidence
+                    )
+                    weakest_confidence = min(weakest_confidence, confidence)
+                    weakest_stability = min(weakest_stability, stability)
+                coverage = support_area / max(total_area, _EPSILON)
+                axis_stats[axis_name] = {
+                    "members": tuple(support_ids),
+                    "support_area": support_area,
+                    "coverage": coverage,
+                    "mean_tangent": weighted_tangent / max(
+                        support_area, _EPSILON
+                    ),
+                    "quality": weighted_quality / max(support_area, _EPSILON),
+                    "weakest_confidence": (
+                        weakest_confidence if support_ids else 0.0
+                    ),
+                    "weakest_stability": (
+                        weakest_stability if support_ids else 0.0
+                    ),
+                }
+
+            supported_axes = [
+                axis_name for axis_name in priority
+                if axis_stats[axis_name]["coverage"] + _EPSILON
+                >= _GEOMETRY_AXIS_CONSENSUS_MIN_COVERAGE
+            ]
+            selected_axis: Optional[str] = None
+            if supported_axes:
+                # Coverage is the primary contract.  Among near-equal covers,
+                # favor geometric tangent/stability and use configured
+                # priority only as the deterministic final tie-break.
+                best_coverage = max(
+                    axis_stats[axis_name]["coverage"]
+                    for axis_name in supported_axes
+                )
+                coverage_pool = [
+                    axis_name for axis_name in supported_axes
+                    if axis_stats[axis_name]["coverage"] + 0.05
+                    >= best_coverage
+                ]
+                selected_axis = max(
+                    coverage_pool,
+                    key=lambda axis_name: (
+                        axis_stats[axis_name]["quality"],
+                        axis_stats[axis_name]["mean_tangent"],
+                        axis_stats[axis_name]["weakest_stability"],
+                        axis_stats[axis_name]["weakest_confidence"],
+                        -priority.index(axis_name),
+                    ),
+                )
+
+            if selected_axis is None:
+                consensus_skipped["no_common_tangent_axis"] += 1
+                analysis.geometry_axis_groups.append({
+                    "source": "OBJECT_AXIS_CONSENSUS_SKIPPED",
+                    "members": [int(island_id) for island_id in member_ids],
+                    "component_members": [
+                        int(island_id) for island_id in member_ids
+                    ],
+                    "selected_axis": None,
+                    "resolved": False,
+                    "compatibility_split": False,
+                    "compatibility_rank": 0,
+                    "normal_domain": int(domain_index),
+                    "min_tangent_projection": round(tangent_threshold, 6),
+                    "min_confidence": round(confidence_threshold, 6),
+                    "axis_stats": {
+                        axis_name: {
+                            key: value
+                            for key, value in values.items()
+                            if key != "members"
+                        }
+                        for axis_name, values in axis_stats.items()
+                    },
+                })
+                continue
+
+            selected_stats = axis_stats[selected_axis]
+            assigned_ids: List[int] = []
+            downgraded_ids: List[int] = []
+            fallback_ids: List[int] = []
+            unavailable_ids: List[int] = []
+            for island_id in member_ids:
+                island = by_id[island_id]
+                candidates = domain_candidates[island_id]
+                candidate = candidates.get(selected_axis)
+                tangent = _geometry_axis_tangent_projection(
+                    normals[island_id], selected_axis
+                )
+                if (
+                    candidate is not None
+                    and tangent + _EPSILON >= tangent_threshold
+                    and bool(candidate.get("coherent", False))
+                ):
+                    chosen_axis = selected_axis
+                else:
+                    # The shared axis is allowed to fall back only when it is
+                    # genuinely unavailable for this chart.  Prefer the
+                    # existing resolver's axis if it is safe; otherwise use
+                    # the strongest coherent tangent candidate.
+                    old_axis = (
+                        None
+                        if island.geometry_axis_name is None
+                        else str(island.geometry_axis_name).upper()
+                    )
+                    old_candidate = candidates.get(old_axis)
+                    old_tangent = (
+                        _geometry_axis_tangent_projection(
+                            normals[island_id], old_axis
+                        )
+                        if old_axis in _DIRECTION_AXES else 0.0
+                    )
+                    if (
+                        old_candidate is not None
+                        and old_tangent + _EPSILON >= tangent_threshold
+                        and bool(old_candidate.get("coherent", False))
+                    ):
+                        chosen_axis = old_axis
+                    else:
+                        fallback_options = [
+                            axis_name for axis_name in priority
+                            if axis_name in candidates
+                            and _geometry_axis_tangent_projection(
+                                normals[island_id], axis_name
+                            ) + _EPSILON >= tangent_threshold
+                            and bool(candidates[axis_name].get("coherent", False))
+                        ]
+                        if not fallback_options:
+                            consensus_skipped["member_axis_unavailable"] += 1
+                            unavailable_ids.append(island_id)
+                            continue
+                        chosen_axis = max(
+                            fallback_options,
+                            key=lambda axis_name: (
+                                float(candidates[axis_name].get("stability", 0.0)),
+                                float(candidates[axis_name].get("confidence", 0.0)),
+                                -priority.index(axis_name),
+                            ),
+                        )
+                    fallback_ids.append(island_id)
+
+                chosen_candidate = candidates[chosen_axis]
+                old_axis = (
+                    None
+                    if island.geometry_axis_name is None
+                    else str(island.geometry_axis_name).upper()
+                )
+                island.geometry_axis_name = chosen_axis
+                island.geometry_direction_space = str(
+                    settings.direction_space
+                ).upper()
+                island.geometry_direction_vector = chosen_candidate[
+                    "direction"
+                ].copy()
+                island.geometry_direction_confidence = float(
+                    chosen_candidate["confidence"]
+                )
+                island.geometry_rotation_angle = float(
+                    chosen_candidate["rotation"]
+                )
+                island.geometry_final_residual = None
+                _bind_geometry_frame_metadata(
+                    obj,
+                    mesh,
+                    uv_layer,
+                    island,
+                    settings,
+                    axis_name=chosen_axis,
+                )
+                assigned_ids.append(island_id)
+                if (
+                    chosen_axis == selected_axis
+                    and float(chosen_candidate.get("confidence", 0.0))
+                    + _EPSILON < confidence_threshold
+                ):
+                    downgraded_ids.append(island_id)
+
+            if assigned_ids:
+                analysis.geometry_axis_groups.append({
+                    "source": "OBJECT_AXIS_CONSENSUS",
+                    "members": [int(island_id) for island_id in assigned_ids],
+                    "component_members": [
+                        int(island_id) for island_id in member_ids
+                    ],
+                    "selected_axis": selected_axis,
+                    "resolved": True,
+                    "compatibility_split": bool(fallback_ids or unavailable_ids),
+                    "compatibility_rank": 0,
+                    "normal_domain": int(domain_index),
+                    "normal_reference": [
+                        round(float(value), 6)
+                        for value in tuple(
+                            sum(
+                                (
+                                    normals[island_id]
+                                    * max(float(by_id[island_id].area_3d), _EPSILON)
+                                    for island_id in member_ids
+                                ),
+                                Vector((0.0, 0.0, 0.0)),
+                            ).normalized()
+                        )
+                    ],
+                    "coverage": round(float(selected_stats["coverage"]), 6),
+                    "support_area": round(
+                        float(selected_stats["support_area"]), 9
+                    ),
+                    "support_count": len(selected_stats["members"]),
+                    "weakest_confidence": round(
+                        float(selected_stats["weakest_confidence"]), 6
+                    ),
+                    "weakest_stability": round(
+                        float(selected_stats["weakest_stability"]), 6
+                    ),
+                    "min_tangent_projection": round(tangent_threshold, 6),
+                    "min_confidence": round(confidence_threshold, 6),
+                    "downgraded_ids": [int(island_id) for island_id in downgraded_ids],
+                    "fallback_ids": [int(island_id) for island_id in fallback_ids],
+                    "unavailable_ids": [
+                        int(island_id) for island_id in unavailable_ids
+                    ],
+                })
+
+        if consensus_skipped:
+            analysis.geometry_axis_groups.append({
+                "source": "OBJECT_AXIS_CONSENSUS_SKIPPED",
+                "members": [],
+                "component_members": [],
+                "selected_axis": None,
+                "resolved": False,
+                "compatibility_split": False,
+                "compatibility_rank": 0,
+                "normal_domains": int(consensus_domain_count),
+                "min_tangent_projection": round(tangent_threshold, 6),
+                "min_confidence": round(confidence_threshold, 6),
+                "skipped": {
+                    str(reason): int(count)
+                    for reason, count in sorted(consensus_skipped.items())
+                },
+            })
+
 
 def analyze_active_uv(
     obj: Any,
@@ -5453,6 +6665,8 @@ def _geometry_angle_cohorts(
 
 def _geometry_long_edge_components(
     analysis: UVLayoutAnalysis,
+    *,
+    transitive: bool = True,
 ) -> Tuple[Mapping[str, Any], ...]:
     """Return semantic cohorts eligible for long-edge heading coherence.
 
@@ -5541,6 +6755,26 @@ def _geometry_long_edge_components(
 
     if not constraints:
         return ()
+
+    if not transitive:
+        # Long-edge coherence is intentionally more conservative than the
+        # signed-axis resolver: a transitive repeat/continuity chain can span
+        # an entire weapon and hide the fact that its local panels have
+        # different headings.  Keep each semantic relation as its own cohort
+        # and merge only exact duplicate member sets for deterministic output.
+        relation_sources: Dict[frozenset, Set[str]] = defaultdict(set)
+        relation_members: Dict[frozenset, Tuple[int, ...]] = {}
+        for members, source in constraints:
+            key = frozenset(members)
+            relation_sources[key].add(source)
+            relation_members.setdefault(key, tuple(sorted(key)))
+        return tuple({
+            "members": relation_members[key],
+            "sources": tuple(sorted(relation_sources[key])),
+        } for key in sorted(
+            relation_members,
+            key=lambda value: (min(value), tuple(sorted(value))),
+        ) if len(key) >= 2)
 
     parent: Dict[int, int] = {}
 
@@ -5682,8 +6916,11 @@ def _geometry_long_edge_coherence(
         if not str(item.get("reason", "")).startswith("long_edge_")
     ]
 
-    for component in _geometry_long_edge_components(analysis):
-        report["cohorts_considered"] += 1
+    relation_candidates = []
+    for component in _geometry_long_edge_components(
+        analysis,
+        transitive=False,
+    ):
         component_members = tuple(int(value) for value in component["members"])
         sources = tuple(component.get("sources", ()))
         by_axis: Dict[str, List[int]] = defaultdict(list)
@@ -5699,294 +6936,333 @@ def _geometry_long_edge_coherence(
             members = tuple(sorted(set(by_axis[axis_name])))
             if len(members) < 2:
                 continue
-            report["cohorts_with_reference"] += 1
-            member_data = []
-            for island_id in members:
-                island = by_id[island_id]
-                reference = _orientation_reference_angle(
-                    island,
-                    min_pca_anisotropy=settings.min_pca_anisotropy,
-                    min_edge_confidence=settings.min_cardinal_edge_confidence,
-                )
-                base_angle = _angle_wrap(result_angles.get(island_id, 0.0))
-                strict_angle = _angle_wrap(
-                    float(getattr(island, "geometry_rotation_angle", 0.0))
-                )
-                base_residual = abs(_angle_wrap(base_angle - strict_angle))
-                if reference is None or not math.isfinite(float(reference)):
-                    member_data.append({
-                        "id": island_id,
-                        "island": island,
-                        "reference": None,
-                        "base_angle": base_angle,
-                        "strict_angle": strict_angle,
-                        "base_residual": base_residual,
-                        "weight": _geometry_long_edge_weight(island),
-                    })
-                    continue
+            relation_candidates.append({
+                "members": members,
+                "axis": axis_name,
+                "sources": sources,
+            })
+
+    # Relations overlap by design (an owner pair can also be in a repeat and
+    # a continuity block).  Claim each island once, preferring the strongest
+    # semantic relation and then the smallest/local cohort.  This prevents a
+    # long transitive chain from inflating metrics or repeatedly overwriting a
+    # chart's downgrade reason.
+    source_rank = {
+        "REPEAT": 0,
+        "OWNER": 1,
+        "STRUCTURE": 2,
+        "CONTINUITY": 3,
+    }
+    relation_candidates.sort(key=lambda item: (
+        min(
+            source_rank.get(str(source), len(source_rank))
+            for source in item["sources"]
+        ) if item["sources"] else len(source_rank),
+        len(item["members"]),
+        min(item["members"]),
+        tuple(item["members"]),
+    ))
+    claimed_islands: Set[int] = set()
+    for candidate in relation_candidates:
+        members = tuple(
+            int(island_id)
+            for island_id in candidate["members"]
+            if int(island_id) not in claimed_islands
+        )
+        if len(members) < 2:
+            continue
+        report["cohorts_considered"] += 1
+        axis_name = str(candidate["axis"])
+        sources = tuple(candidate.get("sources", ()))
+        claimed_islands.update(members)
+        report["cohorts_with_reference"] += 1
+        member_data = []
+        for island_id in members:
+            island = by_id[island_id]
+            reference = _orientation_reference_angle(
+                island,
+                min_pca_anisotropy=settings.min_pca_anisotropy,
+                min_edge_confidence=settings.min_cardinal_edge_confidence,
+            )
+            base_angle = _angle_wrap(result_angles.get(island_id, 0.0))
+            strict_angle = _angle_wrap(
+                float(getattr(island, "geometry_rotation_angle", 0.0))
+            )
+            base_residual = abs(_angle_wrap(base_angle - strict_angle))
+            if reference is None or not math.isfinite(float(reference)):
                 member_data.append({
                     "id": island_id,
                     "island": island,
-                    "reference": _line_angle_wrap(float(reference)),
+                    "reference": None,
                     "base_angle": base_angle,
                     "strict_angle": strict_angle,
                     "base_residual": base_residual,
                     "weight": _geometry_long_edge_weight(island),
                 })
-
-            with_reference = [
-                item for item in member_data if item["reference"] is not None
-            ]
-            if len(with_reference) < 2:
-                # There is no reliable cohort vote.  Preserve the base
-                # rotation and record the reason per member for auditability.
-                for item in member_data:
-                    island = item["island"]
-                    island.geometry_long_edge_angle = None
-                    island.geometry_long_edge_downgrade_reason = (
-                        "long_edge_reference_unresolved"
-                    )
-                    analysis.orientation_downgrades.append({
-                        "members": [int(item["id"])],
-                        "cohort_members": [int(value) for value in members],
-                        "axis": axis_name,
-                        "sources": list(sources),
-                        "reason": "long_edge_reference_unresolved",
-                    })
-                report["downgraded_islands"] += len(member_data)
-                report["downgraded_ids"].extend(
-                    int(item["id"]) for item in member_data
-                )
                 continue
+            member_data.append({
+                "id": island_id,
+                "island": island,
+                "reference": _line_angle_wrap(float(reference)),
+                "base_angle": base_angle,
+                "strict_angle": strict_angle,
+                "base_residual": base_residual,
+                "weight": _geometry_long_edge_weight(island),
+            })
 
-            for item in with_reference:
-                item["current"] = _line_angle_wrap(
-                    item["reference"] + item["base_angle"]
-                )
-
-            # A cohort that already spans two materially different headings
-            # is not a safe candidate for a shared cardinal target.  Reject
-            # it as one unit before voting; otherwise a large structural
-            # component could opportunistically rotate a handful of members
-            # while leaving the remainder at a conflicting angle.  This is
-            # the explicit 45-degree cohort contract, while the per-island
-            # residual gate below handles smaller, individually unsafe
-            # corrections.
-            source_spread = 0.0
-            source_lines = [item["current"] for item in with_reference]
-            for left_index, left in enumerate(source_lines):
-                for right in source_lines[left_index + 1:]:
-                    source_spread = max(
-                        source_spread,
-                        abs(_line_angle_wrap(left - right)),
-                    )
-            if source_spread > _GEOMETRY_LONG_EDGE_MAX_SPREAD + _EPSILON:
-                report["attempted_islands"] += len(members)
-                skipped_ids = []
-                for item in member_data:
-                    island = item["island"]
-                    island.geometry_long_edge_target_angle = None
-                    island.geometry_long_edge_correction = 0.0
-                    if item.get("reference") is None:
-                        reason = "long_edge_reference_unresolved"
-                        island.geometry_long_edge_angle = None
-                    else:
-                        reason = "long_edge_cohort_spread_exceeds_45_degrees"
-                        island.geometry_long_edge_angle = _line_angle_wrap(
-                            float(item["current"])
-                        )
-                    island.geometry_long_edge_aligned = False
-                    island.geometry_long_edge_downgrade_reason = reason
-                    skipped_ids.append(int(item["id"]))
-                    analysis.orientation_downgrades.append({
-                        "members": [int(item["id"])],
-                        "cohort_members": [int(value) for value in members],
-                        "axis": axis_name,
-                        "sources": list(sources),
-                        "source_spread_degrees": round(
-                            math.degrees(source_spread), 6
-                        ),
-                        "reason": reason,
-                    })
-                report["downgraded_islands"] += len(member_data)
-                report["downgraded_ids"].extend(skipped_ids)
-                report["max_source_spread_degrees"] = max(
-                    float(report["max_source_spread_degrees"]),
-                    math.degrees(source_spread),
-                )
-                report["cohorts"].append({
-                    "members": [int(value) for value in members],
-                    "axis": axis_name,
-                    "sources": list(sources),
-                    "target_degrees": None,
-                    "aligned_ids": [],
-                    "downgraded_ids": skipped_ids,
-                    "spread_degrees": round(
-                        math.degrees(source_spread), 6
-                    ),
-                    "status": "skipped_source_spread",
-                })
-                continue
-
-            def target_score(target: float) -> Tuple[float, int, float, int]:
-                accepted_weight = 0.0
-                accepted_count = 0
-                residual_cost = 0.0
-                for item in with_reference:
-                    correction = _line_angle_wrap(target - item["current"])
-                    final_residual = abs(_angle_wrap(
-                        item["base_angle"] + correction
-                        - item["strict_angle"]
-                    ))
-                    accepted = bool(
-                        abs(correction)
-                        <= _GEOMETRY_LONG_EDGE_MAX_SPREAD + _EPSILON
-                        and final_residual <= tolerance + _EPSILON
-                    )
-                    if accepted:
-                        accepted_weight += float(item["weight"])
-                        accepted_count += 1
-                        residual_cost += float(item["weight"]) * abs(correction)
-                # Prefer the horizontal target on a complete tie.  The
-                # negative target index is deterministic for ``max``.
-                target_index = 1 if abs(target) > _EPSILON else 0
-                return (
-                    accepted_weight,
-                    accepted_count,
-                    -residual_cost,
-                    -target_index,
-                )
-
-            target_candidates = (0.0, math.pi * 0.5)
-            target = max(target_candidates, key=target_score)
-            target_index = 1 if abs(target) > _EPSILON else 0
-            target_label = "90" if target_index else "0"
-            report["targets"][target_label] += 1
-            report["attempted_islands"] += len(members)
-            accepted_ids: List[int] = []
-            final_angles: Dict[int, float] = {}
-            cohort_downgrades = []
-
+        with_reference = [
+            item for item in member_data if item["reference"] is not None
+        ]
+        if len(with_reference) < 2:
+            # There is no reliable cohort vote.  Preserve the base
+            # rotation and record the reason per member for auditability.
             for item in member_data:
                 island = item["island"]
-                island.geometry_long_edge_target_angle = target
-                island.geometry_long_edge_correction = 0.0
-                if item.get("reference") is None:
-                    reason = "long_edge_reference_unresolved"
-                    island.geometry_long_edge_downgrade_reason = reason
-                    cohort_downgrades.append((item, reason, None))
-                    final_angles[item["id"]] = _line_angle_wrap(
-                        float(item.get("base_angle", 0.0))
-                    )
-                    continue
-                correction = _line_angle_wrap(
-                    target - float(item["current"])
-                )
-                final_angle = _angle_wrap(item["base_angle"] + correction)
-                final_residual = abs(_angle_wrap(
-                    final_angle - item["strict_angle"]
-                ))
-                if abs(correction) > _GEOMETRY_LONG_EDGE_MAX_SPREAD + _EPSILON:
-                    reason = "long_edge_correction_exceeds_45_degrees"
-                elif final_residual > tolerance + _EPSILON:
-                    reason = "long_edge_strict_tolerance_budget_exceeded"
-                else:
-                    result_angles[item["id"]] = final_angle
-                    island.geometry_long_edge_correction = correction
-                    island.geometry_long_edge_aligned = True
-                    island.geometry_long_edge_downgrade_reason = None
-                    final_long = _line_angle_wrap(
-                        float(item["reference"]) + final_angle
-                    )
-                    island.geometry_long_edge_angle = final_long
-                    accepted_ids.append(item["id"])
-                    final_angles[item["id"]] = final_long
-                    continue
-                # Keep the base (strict) rotation when the visual correction
-                # cannot be admitted.  This is the per-island fallback.
-                island.geometry_long_edge_downgrade_reason = reason
-                final_long = _line_angle_wrap(
-                    float(item["reference"]) + item["base_angle"]
-                )
-                island.geometry_long_edge_angle = final_long
-                final_angles[item["id"]] = final_long
-                cohort_downgrades.append((item, reason, correction))
-
-            # A cardinal target makes accepted members coincident in line
-            # space.  Keep an explicit spread guard so future target policies
-            # cannot silently violate the public 45-degree contract.
-            accepted_lines = [
-                final_angles[item_id] for item_id in accepted_ids
-                if item_id in final_angles
-            ]
-            spread = 0.0
-            for left_index, left in enumerate(accepted_lines):
-                for right in accepted_lines[left_index + 1:]:
-                    spread = max(spread, abs(_line_angle_wrap(left - right)))
-            report["max_final_spread_degrees"] = max(
-                float(report["max_final_spread_degrees"]),
-                math.degrees(spread),
-            )
-            if spread > _GEOMETRY_LONG_EDGE_MAX_SPREAD + _EPSILON:
-                # Defensive rollback of the whole accepted subset.  This is
-                # unlikely with the two cardinal targets, but keeps the
-                # contract true if the target selector is extended later.
-                for item_id in accepted_ids:
-                    item = by_id[item_id]
-                    result_angles[item_id] = item.geometry_rotation_angle
-                    item.geometry_long_edge_aligned = False
-                    item.geometry_long_edge_correction = 0.0
-                    item.geometry_long_edge_downgrade_reason = (
-                        "long_edge_cohort_spread_exceeds_45_degrees"
-                    )
-                    cohort_downgrades.append((
-                        next(value for value in member_data if value["id"] == item_id),
-                        "long_edge_cohort_spread_exceeds_45_degrees",
-                        None,
-                    ))
-                accepted_ids = []
-
-            if accepted_ids:
-                report["cohorts_aligned"] += 1
-                report["aligned_islands"] += len(accepted_ids)
-            for item, reason, correction in cohort_downgrades:
-                island_id = int(item["id"])
-                correction_degrees = (
-                    None
-                    if correction is None
-                    else round(math.degrees(float(correction)), 6)
+                island.geometry_long_edge_angle = None
+                island.geometry_long_edge_downgrade_reason = (
+                    "long_edge_reference_unresolved"
                 )
                 analysis.orientation_downgrades.append({
-                    "members": [island_id],
+                    "members": [int(item["id"])],
                     "cohort_members": [int(value) for value in members],
                     "axis": axis_name,
                     "sources": list(sources),
-                    "target_degrees": round(math.degrees(target), 6),
-                    "base_long_edge_degrees": (
-                        None
-                        if item.get("reference") is None
-                        else round(math.degrees(item["current"]), 6)
+                    "reason": "long_edge_reference_unresolved",
+                })
+            report["downgraded_islands"] += len(member_data)
+            report["downgraded_ids"].extend(
+                int(item["id"]) for item in member_data
+            )
+            continue
+
+        for item in with_reference:
+            item["current"] = _line_angle_wrap(
+                item["reference"] + item["base_angle"]
+            )
+
+        # A cohort that already spans two materially different headings
+        # is not a safe candidate for a shared cardinal target.  Reject
+        # it as one unit before voting; otherwise a large structural
+        # component could opportunistically rotate a handful of members
+        # while leaving the remainder at a conflicting angle.  This is
+        # the explicit 45-degree cohort contract, while the per-island
+        # residual gate below handles smaller, individually unsafe
+        # corrections.
+        source_spread = 0.0
+        source_lines = [item["current"] for item in with_reference]
+        for left_index, left in enumerate(source_lines):
+            for right in source_lines[left_index + 1:]:
+                source_spread = max(
+                    source_spread,
+                    abs(_line_angle_wrap(left - right)),
+                )
+        if source_spread > _GEOMETRY_LONG_EDGE_MAX_SPREAD + _EPSILON:
+            report["attempted_islands"] += len(members)
+            skipped_ids = []
+            for item in member_data:
+                island = item["island"]
+                island.geometry_long_edge_target_angle = None
+                island.geometry_long_edge_correction = 0.0
+                if item.get("reference") is None:
+                    reason = "long_edge_reference_unresolved"
+                    island.geometry_long_edge_angle = None
+                else:
+                    reason = "long_edge_cohort_spread_exceeds_45_degrees"
+                    island.geometry_long_edge_angle = _line_angle_wrap(
+                        float(item["current"])
+                    )
+                island.geometry_long_edge_aligned = False
+                island.geometry_long_edge_downgrade_reason = reason
+                skipped_ids.append(int(item["id"]))
+                analysis.orientation_downgrades.append({
+                    "members": [int(item["id"])],
+                    "cohort_members": [int(value) for value in members],
+                    "axis": axis_name,
+                    "sources": list(sources),
+                    "source_spread_degrees": round(
+                        math.degrees(source_spread), 6
                     ),
-                    "correction_degrees": correction_degrees,
                     "reason": reason,
                 })
-            report["downgraded_islands"] += len(cohort_downgrades)
-            report["downgraded_ids"].extend(
-                int(item["id"]) for item, _reason, _correction
-                in cohort_downgrades
+            report["downgraded_islands"] += len(member_data)
+            report["downgraded_ids"].extend(skipped_ids)
+            report["max_source_spread_degrees"] = max(
+                float(report["max_source_spread_degrees"]),
+                math.degrees(source_spread),
             )
             report["cohorts"].append({
                 "members": [int(value) for value in members],
                 "axis": axis_name,
                 "sources": list(sources),
-                "target_degrees": round(math.degrees(target), 6),
-                "aligned_ids": [int(value) for value in accepted_ids],
-                "downgraded_ids": [
-                    int(item["id"])
-                    for item, _reason, _correction in cohort_downgrades
-                ],
-                "spread_degrees": round(math.degrees(spread), 6),
+                "target_degrees": None,
+                "aligned_ids": [],
+                "downgraded_ids": skipped_ids,
+                "spread_degrees": round(
+                    math.degrees(source_spread), 6
+                ),
+                "status": "skipped_source_spread",
             })
+            continue
+
+        def target_score(target: float) -> Tuple[float, int, float, int]:
+            accepted_weight = 0.0
+            accepted_count = 0
+            residual_cost = 0.0
+            for item in with_reference:
+                correction = _line_angle_wrap(target - item["current"])
+                final_residual = abs(_angle_wrap(
+                    item["base_angle"] + correction
+                    - item["strict_angle"]
+                ))
+                accepted = bool(
+                    abs(correction)
+                    <= _GEOMETRY_LONG_EDGE_MAX_SPREAD + _EPSILON
+                    and final_residual <= tolerance + _EPSILON
+                )
+                if accepted:
+                    accepted_weight += float(item["weight"])
+                    accepted_count += 1
+                    residual_cost += float(item["weight"]) * abs(correction)
+            # Prefer the horizontal target on a complete tie.  The
+            # negative target index is deterministic for ``max``.
+            target_index = 1 if abs(target) > _EPSILON else 0
+            return (
+                accepted_weight,
+                accepted_count,
+                -residual_cost,
+                -target_index,
+            )
+
+        target_candidates = (0.0, math.pi * 0.5)
+        target = max(target_candidates, key=target_score)
+        target_index = 1 if abs(target) > _EPSILON else 0
+        target_label = "90" if target_index else "0"
+        report["targets"][target_label] += 1
+        report["attempted_islands"] += len(members)
+        accepted_ids: List[int] = []
+        final_angles: Dict[int, float] = {}
+        cohort_downgrades = []
+
+        for item in member_data:
+            island = item["island"]
+            island.geometry_long_edge_target_angle = target
+            island.geometry_long_edge_correction = 0.0
+            if item.get("reference") is None:
+                reason = "long_edge_reference_unresolved"
+                island.geometry_long_edge_downgrade_reason = reason
+                cohort_downgrades.append((item, reason, None))
+                final_angles[item["id"]] = _line_angle_wrap(
+                    float(item.get("base_angle", 0.0))
+                )
+                continue
+            correction = _line_angle_wrap(
+                target - float(item["current"])
+            )
+            final_angle = _angle_wrap(item["base_angle"] + correction)
+            final_residual = abs(_angle_wrap(
+                final_angle - item["strict_angle"]
+            ))
+            if abs(correction) > _GEOMETRY_LONG_EDGE_MAX_SPREAD + _EPSILON:
+                reason = "long_edge_correction_exceeds_45_degrees"
+            elif final_residual > tolerance + _EPSILON:
+                reason = "long_edge_strict_tolerance_budget_exceeded"
+            else:
+                result_angles[item["id"]] = final_angle
+                island.geometry_long_edge_correction = correction
+                island.geometry_long_edge_aligned = True
+                island.geometry_long_edge_downgrade_reason = None
+                final_long = _line_angle_wrap(
+                    float(item["reference"]) + final_angle
+                )
+                island.geometry_long_edge_angle = final_long
+                accepted_ids.append(item["id"])
+                final_angles[item["id"]] = final_long
+                continue
+            # Keep the base (strict) rotation when the visual correction
+            # cannot be admitted.  This is the per-island fallback.
+            island.geometry_long_edge_downgrade_reason = reason
+            final_long = _line_angle_wrap(
+                float(item["reference"]) + item["base_angle"]
+            )
+            island.geometry_long_edge_angle = final_long
+            final_angles[item["id"]] = final_long
+            cohort_downgrades.append((item, reason, correction))
+
+        # A cardinal target makes accepted members coincident in line
+        # space.  Keep an explicit spread guard so future target policies
+        # cannot silently violate the public 45-degree contract.
+        accepted_lines = [
+            final_angles[item_id] for item_id in accepted_ids
+            if item_id in final_angles
+        ]
+        spread = 0.0
+        for left_index, left in enumerate(accepted_lines):
+            for right in accepted_lines[left_index + 1:]:
+                spread = max(spread, abs(_line_angle_wrap(left - right)))
+        report["max_final_spread_degrees"] = max(
+            float(report["max_final_spread_degrees"]),
+            math.degrees(spread),
+        )
+        if spread > _GEOMETRY_LONG_EDGE_MAX_SPREAD + _EPSILON:
+            # Defensive rollback of the whole accepted subset.  This is
+            # unlikely with the two cardinal targets, but keeps the
+            # contract true if the target selector is extended later.
+            for item_id in accepted_ids:
+                item = by_id[item_id]
+                result_angles[item_id] = item.geometry_rotation_angle
+                item.geometry_long_edge_aligned = False
+                item.geometry_long_edge_correction = 0.0
+                item.geometry_long_edge_downgrade_reason = (
+                    "long_edge_cohort_spread_exceeds_45_degrees"
+                )
+                cohort_downgrades.append((
+                    next(value for value in member_data if value["id"] == item_id),
+                    "long_edge_cohort_spread_exceeds_45_degrees",
+                    None,
+                ))
+            accepted_ids = []
+
+        if accepted_ids:
+            report["cohorts_aligned"] += 1
+            report["aligned_islands"] += len(accepted_ids)
+        for item, reason, correction in cohort_downgrades:
+            island_id = int(item["id"])
+            correction_degrees = (
+                None
+                if correction is None
+                else round(math.degrees(float(correction)), 6)
+            )
+            analysis.orientation_downgrades.append({
+                "members": [island_id],
+                "cohort_members": [int(value) for value in members],
+                "axis": axis_name,
+                "sources": list(sources),
+                "target_degrees": round(math.degrees(target), 6),
+                "base_long_edge_degrees": (
+                    None
+                    if item.get("reference") is None
+                    else round(math.degrees(item["current"]), 6)
+                ),
+                "correction_degrees": correction_degrees,
+                "reason": reason,
+            })
+        report["downgraded_islands"] += len(cohort_downgrades)
+        report["downgraded_ids"].extend(
+            int(item["id"]) for item, _reason, _correction
+            in cohort_downgrades
+        )
+        report["cohorts"].append({
+            "members": [int(value) for value in members],
+            "axis": axis_name,
+            "sources": list(sources),
+            "target_degrees": round(math.degrees(target), 6),
+            "aligned_ids": [int(value) for value in accepted_ids],
+            "downgraded_ids": [
+                int(item["id"])
+                for item, _reason, _correction in cohort_downgrades
+            ],
+            "spread_degrees": round(math.degrees(spread), 6),
+        })
 
     report["downgraded_ids"] = sorted(set(report["downgraded_ids"]))
     analysis.geometry_long_edge_metrics = report
@@ -6251,6 +7527,52 @@ def _apply_orientation_policy(
         "geometry_axis_auto_priority": list(_direction_axis_order(
             "AUTO", settings.direction_auto_priority
         )),
+        "geometry_axis_cardinal_preference": bool(
+            getattr(settings, "prefer_geometry_axis_cardinal", False)
+        ),
+        "geometry_axis_cardinal_min_gain_degrees": round(
+            math.degrees(float(getattr(
+                settings, "geometry_axis_cardinal_min_gain", math.radians(5.0)
+            ))),
+            6,
+        ),
+        "geometry_axis_cardinal_max_quality_loss": round(
+            float(getattr(
+                settings, "geometry_axis_cardinal_max_quality_loss", 0.15
+            )),
+            6,
+        ),
+        "geometry_axis_auto_cardinal_bias": round(
+            float(getattr(settings, "direction_auto_cardinal_bias", 0.0)),
+            6,
+        ),
+        "geometry_axis_auto_cardinal_min_confidence": round(
+            float(getattr(
+                settings, "direction_auto_cardinal_min_confidence", 0.15
+            )),
+            6,
+        ),
+        "geometry_axis_object_consensus": bool(
+            getattr(settings, "cohere_auto_geometry_axis", False)
+        ),
+        "geometry_axis_consensus_min_tangent_projection": round(
+            float(getattr(
+                settings, "geometry_axis_consensus_min_tangent", 0.70
+            )),
+            6,
+        ),
+        "geometry_axis_consensus_min_confidence": round(
+            float(getattr(
+                settings, "geometry_axis_consensus_min_confidence", 0.30
+            )),
+            6,
+        ),
+        "geometry_axis_consensus_normal_angle_degrees": round(
+            math.degrees(_GEOMETRY_AXIS_CONSENSUS_NORMAL_ANGLE), 6
+        ),
+        "geometry_axis_consensus_min_coverage": round(
+            float(_GEOMETRY_AXIS_CONSENSUS_MIN_COVERAGE), 6
+        ),
         "geometry_resolution_contract": (
             "all_islands"
             if str(settings.direction_axis).upper() == "AUTO"
@@ -9658,13 +10980,13 @@ def _source_layout_links(
     }
 
 
-def _pack_source_layout_once(
+def _pack_source_layout_once_legacy(
     oriented: Mapping[int, Mapping[int, Vector]],
     analysis: UVLayoutAnalysis,
     gap: float,
     settings: GroupLayoutOptions,
 ) -> _PackedPlan:
-    """Rotate in place and translate only charts whose AABBs conflict."""
+    """Legacy island-at-a-time source layout retained as a fallback."""
 
     coordinates = {
         int(island_id): {
@@ -9683,20 +11005,38 @@ def _pack_source_layout_once(
     }
     links = _source_layout_links(analysis, source_centers)
     by_id = {int(island.island_id): island for island in analysis.islands}
-    order = sorted(
-        coordinates,
-        key=lambda island_id: (
-            -abs(float(getattr(by_id.get(island_id), "uv_area", 0.0))),
-            round(float(source_centers[island_id].y), 10),
-            round(float(source_centers[island_id].x), 10),
-            island_id,
-        ),
-    )
+    row_quantum = max(float(settings.source_layout_row_quantum), 1.0e-6)
+    source_order = str(getattr(settings, "source_layout_order", "ROW_MAJOR")).upper()
+    if source_order == "AREA":
+        # Legacy behavior: large charts claim their source positions first.
+        # Keep it available for callers that explicitly depend on that policy.
+        order = sorted(
+            coordinates,
+            key=lambda island_id: (
+                -abs(float(getattr(by_id.get(island_id), "uv_area", 0.0))),
+                round(float(source_centers[island_id].y), 10),
+                round(float(source_centers[island_id].x), 10),
+                island_id,
+            ),
+        )
+    else:
+        # The source atlas is already a useful artist-authored scaffold.  A
+        # row-major insertion order means a collision displaces only the
+        # later chart in that row instead of cascading from area-first holes.
+        order = sorted(
+            coordinates,
+            key=lambda island_id: (
+                int(round(-float(source_centers[island_id].y) /
+                          max(row_quantum, 1.0e-6))),
+                round(float(source_centers[island_id].x), 10),
+                -abs(float(getattr(by_id.get(island_id), "uv_area", 0.0))),
+                island_id,
+            ),
+        )
 
     placed: Dict[int, Dict[int, Vector]] = {}
     placed_bounds: Dict[int, Tuple[float, float, float, float]] = {}
     translations: Dict[int, Vector] = {}
-    row_quantum = max(float(settings.source_layout_row_quantum), 1.0e-6)
     row_weight = max(float(settings.source_layout_row_weight), 0.0)
     # ``getattr`` keeps manifests/scripts created against pre-v38 option
     # objects readable while the dataclass field supplies the normal default.
@@ -9816,6 +11156,549 @@ def _pack_source_layout_once(
         total_translation=total_translation,
         max_translation=max_translation,
     )
+
+
+def _source_cell_bounds(
+    member_ids: Iterable[int],
+    source_bounds: Mapping[int, Sequence[float]],
+) -> Tuple[float, float, float, float]:
+    """Return the source-space envelope for a prospective local cell."""
+
+    boxes = [
+        source_bounds[int(member)]
+        for member in member_ids
+        if int(member) in source_bounds
+    ]
+    if not boxes:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (
+        min(float(box[0]) for box in boxes),
+        min(float(box[1]) for box in boxes),
+        max(float(box[2]) for box in boxes),
+        max(float(box[3]) for box in boxes),
+    )
+
+
+def _source_cell_edge_records(
+    analysis: UVLayoutAnalysis,
+    source_centers: Mapping[int, Vector],
+    row_quantum: float,
+    link_radius: float,
+) -> Tuple[Tuple[int, float, int, int], ...]:
+    """Build a sparse, source-local structural edge stream.
+
+    Lower ``priority`` values are authoritative topology/repeat links;
+    higher values are only nearest-neighbour hints.  The union pass applies
+    the cell diameter/member limits, so even a long chain cannot become an
+    atlas-wide rigid block.
+    """
+
+    valid = {int(value) for value in source_centers}
+    records: Dict[Tuple[int, int], Tuple[int, float, int, int]] = {}
+
+    def add(left: int, right: int, priority: int) -> None:
+        left = int(left)
+        right = int(right)
+        if left == right or left not in valid or right not in valid:
+            return
+        pair = tuple(sorted((left, right)))
+        distance = float((source_centers[left] - source_centers[right]).length)
+        if not math.isfinite(distance):
+            return
+        # Proximity hints are intentionally local.  Explicit topology/repeat
+        # links may be farther apart, but the cell envelope gate still limits
+        # the resulting component.
+        if int(priority) >= 3 and distance > float(link_radius) + _EPSILON:
+            return
+        candidate = (int(priority), distance, pair[0], pair[1])
+        previous = records.get(pair)
+        if previous is None or candidate < previous:
+            records[pair] = candidate
+
+    # Real mesh boundaries are the strongest continuity signal.
+    for edge in analysis.adjacency:
+        add(edge.left_id, edge.right_id, 0)
+
+    # Explicit owner/structure affinities are next.  These are already
+    # bounded by ``build_layout_groups`` and are safe to replay as local
+    # rigid relationships.
+    for group in analysis.layout_groups:
+        members = tuple(dict.fromkeys(
+            int(member) for member in group.member_ids if int(member) in valid
+        ))
+        ordered = tuple(sorted(
+            members,
+            key=lambda member: (
+                int(round(-float(source_centers[member].y) /
+                          max(float(row_quantum), 1.0e-6))),
+                round(float(source_centers[member].x), 10),
+                member,
+            ),
+        ))
+        # A source-ordered path conveys the group relationship without making
+        # every member a clique (which would over-constrain a large group).
+        for left, right in zip(ordered, ordered[1:]):
+            add(left, right, 1)
+        for pair in group.affinity_pairs:
+            if len(pair) == 2:
+                add(pair[0], pair[1], 0)
+        for left, right in zip(
+            group.small_member_ids, group.small_anchor_ids
+        ):
+            add(left, right, 1)
+        for cohort in group.owner_cohorts:
+            cohort_order = tuple(sorted(
+                (int(member) for member in cohort if int(member) in valid),
+                key=lambda member: (
+                    round(-float(source_centers[member].y), 10),
+                    round(float(source_centers[member].x), 10),
+                    member,
+                ),
+            ))
+            for left, right in zip(cohort_order, cohort_order[1:]):
+                add(left, right, 1)
+
+    # Repeated parts should share a local rack when their source positions are
+    # within the configured envelope.  The union diameter gate below keeps
+    # intentionally distant mirrored sets as separate cells.
+    for repeat in analysis.repeat_groups:
+        ordered = tuple(sorted(
+            (int(member) for member in repeat.member_ids if int(member) in valid),
+            key=lambda member: (
+                round(-float(source_centers[member].y), 10),
+                round(float(source_centers[member].x), 10),
+                member,
+            ),
+        ))
+        for left, right in zip(ordered, ordered[1:]):
+            add(left, right, 1)
+
+    # Finally add at most two source-nearest hints per island.  These make a
+    # group of unannotated hard-surface strips readable without inventing a
+    # semantic relationship in the analysis metadata.
+    ids = tuple(sorted(valid))
+    for left in ids:
+        neighbours = sorted(
+            (
+                float((source_centers[left] - source_centers[right]).length),
+                int(right),
+            )
+            for right in ids
+            if right != left
+        )
+        for distance, right in neighbours[:2]:
+            if distance <= float(link_radius) + _EPSILON:
+                add(left, right, 3)
+
+    return tuple(sorted(records.values(), key=lambda item: item))
+
+
+def _source_cell_partition(
+    source_centers: Mapping[int, Vector],
+    source_bounds: Mapping[int, Sequence[float]],
+    edge_records: Sequence[Sequence[float]],
+    max_members: int,
+    max_diameter: float,
+) -> Tuple[Tuple[int, ...], ...]:
+    """Union source-local edges while enforcing hard cell bounds."""
+
+    ids = tuple(sorted(int(value) for value in source_centers))
+    parent = {value: value for value in ids}
+    members = {value: {value} for value in ids}
+
+    def find(value: int) -> int:
+        value = int(value)
+        root = value
+        while parent[root] != root:
+            root = parent[root]
+        while parent[value] != value:
+            next_value = parent[value]
+            parent[value] = root
+            value = next_value
+        return root
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
+            return
+        # Stable root selection keeps cell ids deterministic across Blender
+        # versions and independent of adjacency iteration order.
+        if left_root > right_root:
+            left_root, right_root = right_root, left_root
+        parent[right_root] = left_root
+        members[left_root].update(members[right_root])
+        members[right_root].clear()
+
+    def envelope(ids_to_measure: Iterable[int]) -> Tuple[float, float, float, float]:
+        return _source_cell_bounds(ids_to_measure, source_bounds)
+
+    for raw in sorted(
+        edge_records,
+        key=lambda item: (
+            int(item[0]), float(item[1]), int(item[2]), int(item[3])
+        ),
+    ):
+        if len(raw) < 4:
+            continue
+        left = int(raw[2])
+        right = int(raw[3])
+        if left not in parent or right not in parent:
+            continue
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
+            continue
+        combined = members[left_root] | members[right_root]
+        if len(combined) > max(int(max_members), 2):
+            continue
+        bounds = envelope(combined)
+        diameter = math.hypot(
+            max(float(bounds[2]) - float(bounds[0]), 0.0),
+            max(float(bounds[3]) - float(bounds[1]), 0.0),
+        )
+        if diameter > float(max_diameter) + _EPSILON:
+            continue
+        union(left, right)
+
+    components: Dict[int, List[int]] = defaultdict(list)
+    for value in ids:
+        components[find(value)].append(value)
+    return tuple(
+        tuple(sorted(values))
+        for _root, values in sorted(
+            components.items(), key=lambda item: min(item[1])
+        )
+    )
+
+
+def _source_cell_rack(
+    member_ids: Sequence[int],
+    local_coordinates: Mapping[int, Mapping[int, Vector]],
+    island_sizes: Mapping[int, Sequence[float]],
+    source_centers: Mapping[int, Vector],
+    edge_records: Sequence[Sequence[float]],
+    gap: float,
+    row_quantum: float,
+) -> Tuple[Dict[int, _Placement], float, float]:
+    """Pack one bounded cell as a source-ordered, non-rotating rack."""
+
+    ordered = tuple(sorted(
+        (int(member) for member in member_ids),
+        key=lambda member: (
+            int(round(-float(source_centers[member].y) /
+                      max(float(row_quantum), 1.0e-6))),
+            round(float(source_centers[member].x), 10),
+            member,
+        ),
+    ))
+    rectangles = tuple(
+        _Rect(
+            key=member,
+            width=float(island_sizes[member][0]),
+            height=float(island_sizes[member][1]),
+            sort_rank=index,
+        )
+        for index, member in enumerate(ordered)
+    )
+    if len(rectangles) == 1:
+        item = rectangles[0]
+        return {
+            item.key: _Placement(0.0, 0.0, item.width, item.height, False)
+        }, item.width, item.height
+
+    # Evaluate every bounded column count.  The compactness term is primary;
+    # sparse structural links break ties in favour of neighbouring cells.
+    by_id = {int(item.key): item for item in rectangles}
+    edges = [
+        (int(item[2]), int(item[3]))
+        for item in edge_records
+        if len(item) >= 4
+        and int(item[2]) in by_id
+        and int(item[3]) in by_id
+    ]
+    candidates = []
+    for columns in range(1, len(rectangles) + 1):
+        placement, width, height = _regular_grid_rack(
+            rectangles, gap, columns=columns
+        )
+        longest = max(float(width), float(height))
+        shortest = max(min(float(width), float(height)), _EPSILON)
+        aspect = longest / shortest
+        edge_distance = 0.0
+        for left, right in edges:
+            first = placement[left]
+            second = placement[right]
+            edge_distance += _placement_distance(first, second)
+        # Prefer a square-ish local block only after its longest edge is
+        # comparable.  This avoids turning a coherent row into a tall strip.
+        score = longest * (
+            1.0 + 0.06 * min(max(aspect - 1.0, 0.0), 3.0)
+        ) + 0.04 * edge_distance
+        candidates.append((
+            score,
+            longest,
+            float(width) * float(height),
+            aspect,
+            edge_distance,
+            columns,
+            placement,
+            float(width),
+            float(height),
+        ))
+    chosen = min(candidates, key=lambda item: item[:6])
+    return chosen[6], chosen[7], chosen[8]
+
+
+def _pack_source_cell_layout_once(
+    oriented: Mapping[int, Mapping[int, Vector]],
+    analysis: UVLayoutAnalysis,
+    gap: float,
+    settings: GroupLayoutOptions,
+) -> _PackedPlan:
+    """Pack bounded source cells, then repair cell-level AABB collisions."""
+
+    coordinates = {
+        int(island_id): {
+            int(loop_index): point.copy()
+            for loop_index, point in values.items()
+        }
+        for island_id, values in oriented.items()
+        if values
+    }
+    if not coordinates:
+        raise RuntimeError("Source-preserving layout has no UV coordinates")
+
+    source_centers = {
+        island_id: sum(values.values(), Vector((0.0, 0.0))) / len(values)
+        for island_id, values in coordinates.items()
+    }
+    source_bounds = {
+        island_id: _uv_bounds(values.values())
+        for island_id, values in coordinates.items()
+    }
+    atlas_bounds = _uv_bounds(
+        point for values in coordinates.values() for point in values.values()
+    )
+    source_extent = max(
+        float(atlas_bounds[2]) - float(atlas_bounds[0]),
+        float(atlas_bounds[3]) - float(atlas_bounds[1]),
+        _EPSILON,
+    )
+    row_quantum = max(float(settings.source_layout_row_quantum), 1.0e-6)
+    max_diameter = max(
+        source_extent * float(settings.source_layout_cell_diameter_ratio),
+        float(gap) * 4.0,
+        row_quantum,
+    )
+    link_radius = max(
+        source_extent * float(settings.source_layout_cell_link_radius_ratio),
+        float(gap) * 4.0,
+        row_quantum,
+    )
+    edges = _source_cell_edge_records(
+        analysis,
+        source_centers,
+        row_quantum,
+        link_radius,
+    )
+    cells = _source_cell_partition(
+        source_centers,
+        source_bounds,
+        edges,
+        int(settings.source_layout_cell_max_members),
+        max_diameter,
+    )
+
+    local_coordinates = {}
+    island_sizes = {}
+    for island_id, values in coordinates.items():
+        local, width, height = _translate_to_origin(values)
+        if width <= _EPSILON or height <= _EPSILON:
+            raise RuntimeError(
+                "UV island {} has degenerate bounds".format(island_id)
+            )
+        local_coordinates[island_id] = local
+        island_sizes[island_id] = (width, height)
+
+    # Map each island edge to its cell so local racks can use only the links
+    # that actually exist inside the bounded source envelope.
+    cell_by_island = {
+        int(member): cell_index
+        for cell_index, cell in enumerate(cells)
+        for member in cell
+    }
+    edge_by_cell: Dict[int, List[Tuple[int, float, int, int]]] = defaultdict(list)
+    for edge in edges:
+        if len(edge) < 4:
+            continue
+        left_cell = cell_by_island.get(int(edge[2]))
+        right_cell = cell_by_island.get(int(edge[3]))
+        if left_cell is not None and left_cell == right_cell:
+            edge_by_cell[left_cell].append(tuple(edge))
+
+    cell_data = {}
+    for cell_index, members in enumerate(cells):
+        rack, width, height = _source_cell_rack(
+            members,
+            local_coordinates,
+            island_sizes,
+            source_centers,
+            edge_by_cell.get(cell_index, ()),
+            gap,
+            row_quantum,
+        )
+        packed = {
+            int(island_id): {
+                int(loop_index): Vector((
+                    float(point.x) + float(rack[island_id].x),
+                    float(point.y) + float(rack[island_id].y),
+                ))
+                for loop_index, point in local_coordinates[island_id].items()
+            }
+            for island_id in members
+        }
+        packed_bounds = _uv_bounds(
+            point for values in packed.values() for point in values.values()
+        )
+        center = sum(
+            (source_centers[island_id] for island_id in members),
+            Vector((0.0, 0.0)),
+        ) / max(len(members), 1)
+        cell_data[cell_index] = {
+            "members": tuple(members),
+            "coordinates": packed,
+            "bounds": packed_bounds,
+            "width": max(float(packed_bounds[2] - packed_bounds[0]), _EPSILON),
+            "height": max(float(packed_bounds[3] - packed_bounds[1]), _EPSILON),
+            "center": center,
+        }
+
+    cell_order = tuple(sorted(
+        cell_data,
+        key=lambda cell_index: (
+            int(round(-float(cell_data[cell_index]["center"].y) /
+                      row_quantum)),
+            round(float(cell_data[cell_index]["center"].x), 10),
+            min(cell_data[cell_index]["members"]),
+        ),
+    ))
+    desired = {}
+    for cell_index in cell_order:
+        item = cell_data[cell_index]
+        center = item["center"]
+        desired[cell_index] = _Placement(
+            float(center.x) - item["width"] * 0.5,
+            float(center.y) - item["height"] * 0.5,
+            item["width"],
+            item["height"],
+            False,
+        )
+
+    placements: Dict[int, _Placement] = {}
+    placed: List[_Placement] = []
+    for cell_index in cell_order:
+        placement = _resolve_source_layout_placement(
+            desired[cell_index],
+            placed,
+            float(gap),
+            float(settings.source_layout_row_weight),
+        )
+        placements[cell_index] = placement
+        placed.append(placement)
+
+    # Materialize each rack at its resolved cell placement.  A cell remains a
+    # rigid translation-only block after this point.
+    placed_coordinates: Dict[int, Dict[int, Vector]] = {}
+    translations: Dict[int, Vector] = {}
+    moved_islands = 0
+    total_translation = 0.0
+    max_translation = 0.0
+    for cell_index in cell_order:
+        item = cell_data[cell_index]
+        placement = placements[cell_index]
+        local_left = float(item["bounds"][0])
+        local_bottom = float(item["bounds"][1])
+        translation = Vector((
+            float(placement.x) - local_left,
+            float(placement.y) - local_bottom,
+        ))
+        for island_id, values in item["coordinates"].items():
+            placed_coordinates[island_id] = {
+                loop_index: point + translation
+                for loop_index, point in values.items()
+            }
+            original_center = source_centers[island_id]
+            final_center = sum(
+                placed_coordinates[island_id].values(), Vector((0.0, 0.0))
+            ) / max(len(values), 1)
+            island_translation = final_center - original_center
+            translations[island_id] = island_translation
+            distance = float(island_translation.length)
+            total_translation += distance
+            max_translation = max(max_translation, distance)
+            if distance > 1.0e-8:
+                moved_islands += 1
+
+    final_bounds = _uv_bounds(
+        point for values in placed_coordinates.values() for point in values.values()
+    )
+    minimum = Vector((float(final_bounds[0]), float(final_bounds[1])))
+    normalized = {
+        island_id: {
+            loop_index: point - minimum
+            for loop_index, point in values.items()
+        }
+        for island_id, values in placed_coordinates.items()
+    }
+    width = max(float(final_bounds[2] - final_bounds[0]), _EPSILON)
+    height = max(float(final_bounds[3] - final_bounds[1]), _EPSILON)
+    group_placements: Dict[int, _Placement] = {}
+    for group in analysis.layout_groups:
+        points = [
+            point
+            for island_id in group.member_ids
+            for point in normalized.get(int(island_id), {}).values()
+        ]
+        if not points:
+            continue
+        bounds = _uv_bounds(points)
+        group_placements[int(group.group_id)] = _Placement(
+            x=float(bounds[0]),
+            y=float(bounds[1]),
+            width=max(float(bounds[2] - bounds[0]), 0.0),
+            height=max(float(bounds[3] - bounds[1]), 0.0),
+            quarter_turn=False,
+        )
+    return _PackedPlan(
+        coordinates=normalized,
+        width=width,
+        height=height,
+        source_gap=float(gap),
+        group_placements=group_placements,
+        strategy="source_cell_layout",
+        moved_islands=moved_islands,
+        total_translation=total_translation,
+        max_translation=max_translation,
+    )
+
+
+def _pack_source_layout_once(
+    oriented: Mapping[int, Mapping[int, Vector]],
+    analysis: UVLayoutAnalysis,
+    gap: float,
+    settings: GroupLayoutOptions,
+) -> _PackedPlan:
+    """Select the bounded source-cell path or the legacy repair fallback."""
+
+    if not bool(getattr(settings, "source_layout_cell_enabled", True)):
+        return _pack_source_layout_once_legacy(oriented, analysis, gap, settings)
+    try:
+        return _pack_source_cell_layout_once(oriented, analysis, gap, settings)
+    except (RuntimeError, ValueError, TypeError, KeyError, IndexError):
+        # Preserve the transactional behavior of the old source layout when a
+        # malformed/lightweight test double cannot supply cell metadata.
+        return _pack_source_layout_once_legacy(oriented, analysis, gap, settings)
 
 
 def _plan_source_layout_with_margin(
@@ -9940,6 +11823,7 @@ def _plan_with_margin(
     repeat_groups: Sequence[RepeatGroup] = (),
     group_model_centroids: Optional[Mapping[int, Sequence[float]]] = None,
     islands: Sequence[IslandRecord] = (),
+    analysis: Optional[UVLayoutAnalysis] = None,
 ) -> Tuple[_PackedPlan, Dict[int, Dict[int, Vector]], float]:
     def build_plan(source_gap: float) -> _PackedPlan:
         if settings.preserve_source_layout:
@@ -9947,8 +11831,18 @@ def _plan_with_margin(
                 raise RuntimeError(
                     "Source-preserving layout requires island records"
                 )
-            return _pack_source_preserving_plan(
-                oriented, islands, source_gap, settings
+            # Keep the artist-authored atlas as the scaffold, but resolve
+            # collisions through the topology/repeat/owner links.  The local
+            # resolver moves only the conflicting chart and keeps linked
+            # charts on the same translation whenever possible; the legacy
+            # _pack_source_preserving_plan path ignored those links and could
+            # leave a structurally related family scattered across the tile.
+            if analysis is None:
+                raise RuntimeError(
+                    "Source-preserving layout requires UV analysis"
+                )
+            return _pack_source_layout_once(
+                oriented, analysis, source_gap, settings
             )
         return _pack_plan(
             oriented,
@@ -11818,6 +13712,7 @@ def layout_active_uv(
             analysis.layout_groups, analysis.islands
         ),
         islands=analysis.islands,
+        analysis=analysis,
     )
 
     def validate_direction_contract() -> bool:

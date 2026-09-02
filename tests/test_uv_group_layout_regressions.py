@@ -3953,6 +3953,7 @@ def _test_same_axis_geometry_cohort_uses_stable_common_angle():
     settings = VUV.GroupLayoutOptions(
         align_geometry_direction=True,
         direction_residual_tolerance=math.radians(3.0),
+        cohere_geometry_angle_groups=True,
     )
     angles = VUV._orientation_angles(analysis, settings)
     # The larger panel is the deterministic weighted anchor.  Sharing its
@@ -3984,6 +3985,77 @@ def _test_geometry_cohort_rejects_real_turn_or_axis_mix():
     assert abs(VUV._angle_wrap(angles[1] - quarter.geometry_rotation_angle)) < 1.0e-12
     assert abs(VUV._angle_wrap(angles[2] - cross_axis.geometry_rotation_angle)) < 1.0e-12
     assert not VUV._geometry_angle_cohorts(analysis, settings)
+
+
+def _test_common_axis_cardinal_preference_is_bounded():
+    """A straighter shared long edge may win only inside explicit gates."""
+
+    candidates = (
+        {
+            "Z": {
+                "coherent": True,
+                "stability": 0.80,
+                "confidence": 0.80,
+                "cardinal_error": math.radians(30.0),
+                "cardinal_weight": 4.0,
+            },
+            "X": {
+                "coherent": True,
+                "stability": 0.70,
+                "confidence": 0.90,
+                "cardinal_error": math.radians(0.0),
+                "cardinal_weight": 4.0,
+            },
+        },
+        {
+            "Z": {
+                "coherent": True,
+                "stability": 0.90,
+                "confidence": 0.80,
+                "cardinal_error": math.radians(30.0),
+                "cardinal_weight": 1.0,
+            },
+            "X": {
+                "coherent": True,
+                "stability": 0.80,
+                "confidence": 0.90,
+                "cardinal_error": math.radians(0.0),
+                "cardinal_weight": 1.0,
+            },
+        },
+    )
+    # Legacy/default behavior remains stability-first.
+    assert VUV._select_common_geometry_axis(candidates, ("Z", "X", "Y")) == "Z"
+    # A 30-degree weighted gain is worth a 0.10 weakest-stability loss.
+    assert VUV._select_common_geometry_axis(
+        candidates,
+        ("Z", "X", "Y"),
+        prefer_geometry_axis_cardinal=True,
+        geometry_axis_cardinal_min_gain=math.radians(5.0),
+        geometry_axis_cardinal_max_quality_loss=0.15,
+    ) == "X"
+    # Tightening either gate must retain the stable baseline.
+    assert VUV._select_common_geometry_axis(
+        candidates,
+        ("Z", "X", "Y"),
+        prefer_geometry_axis_cardinal=True,
+        geometry_axis_cardinal_min_gain=math.radians(35.0),
+        geometry_axis_cardinal_max_quality_loss=0.15,
+    ) == "Z"
+    assert VUV._select_common_geometry_axis(
+        candidates,
+        ("Z", "X", "Y"),
+        prefer_geometry_axis_cardinal=True,
+        geometry_axis_cardinal_min_gain=math.radians(5.0),
+        geometry_axis_cardinal_max_quality_loss=0.05,
+    ) == "Z"
+    # An inherited/explicit axis is never overridden by the presentation pass.
+    assert VUV._select_common_geometry_axis(
+        candidates,
+        ("Z", "X", "Y"),
+        preferred_axis="Z",
+        prefer_geometry_axis_cardinal=True,
+    ) == "Z"
 
 
 _test_repeat_anchor_order_and_packing()
@@ -4053,4 +4125,5 @@ _test_area_score_falls_back_without_small_islands()
 _test_area_score_balances_aabb_fill_and_coverage()
 _test_same_axis_geometry_cohort_uses_stable_common_angle()
 _test_geometry_cohort_rejects_real_turn_or_axis_mix()
+_test_common_axis_cardinal_preference_is_bounded()
 print("VUV_GROUP_LAYOUT_REGRESSION_OK")

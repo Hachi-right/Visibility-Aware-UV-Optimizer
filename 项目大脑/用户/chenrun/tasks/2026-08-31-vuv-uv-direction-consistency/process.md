@@ -18,7 +18,7 @@
   必须共享有符号方向；结构组内部采用确定性邻近行列/rack，且全程保持正 winding。
 - Body 暴露弱轴组在布局前后换轴；Gun Head 的 42 面连续岛可保留，但 float32
   写回会令两个近共线三角翻面。正在以真实场景作为阻断样本修复。
-- 旧 0.5.6 ZIP 和 v24/v26 场景均不再视为本轮最终交付；当前未提交、未推送。
+- 旧 0.5.6 ZIP 和 v24/v26 场景均不再视为本轮最终交付；当前已完成源码增强、安装包重建和双版本 smoke，待 GitLab 推送。
 
 ## 团队经验引用
 
@@ -75,22 +75,22 @@
 
 | 检查 | 结果 | 覆盖范围 | 未覆盖风险 |
 | --- | --- | --- | --- |
-| 修改 Python `py_compile` | 10/10 通过 | 6 个插件模块、4 个测试脚本 | 不代替 Blender 运行时 |
+| 修改 Python `py_compile` | 21/21 通过 | 插件与测试全部 Python 文件 | 不代替 Blender 运行时 |
 | Blender 3.3.5 / 5.2.0 方向几何 | 两版均 `VUV_DIRECTED_GEOMETRY_OK` | 正反、斜面、回退、极小岛、Object/World | 无 |
 | Blender 3.3.5 / 5.2.0 完整方向管线 | 两版均 `VUV_DIRECTION_PIPELINE_OK` | 分组开关、原选轴保持、手动轴丢失与 Auto 换轴回滚 | 无 |
 | Blender 3.3.5 / 5.2.0 分组布局 | 两版均 `VUV_GROUP_LAYOUT_REGRESSION_OK` | 重复/镜像/旋转结构、小岛 owner、Adaptive 回放 | 无 |
 | Blender 3.3.5 / 5.2.0 Unique 修复 | 两版均 `VUV_UNIQUE_LOCAL_REPAIR_OK` | 修复后重定向、局部回退、事务恢复 | 无 |
 | Blender 3.3.5 / 5.2.0 strict smoke | 两版均 `VUV_055_SMOKE_OK` | 0.5.5 继承合同、Operator RNA、失败注入 | 测试标记沿用兼容脚本名称 |
-| 新 ZIP 解压后 strict smoke | 两版均 `VUV_055_SMOKE_OK`，版本 `[0,5,6]` | 实际发布包可加载性 | 无 |
+| 新 ZIP 解压后 strict smoke | 两版均 `VUV_055_SMOKE_OK`，版本 `[0,5,6]` | 当前安装包真实导入链 | 无 |
 | 拼接武器 `VUV_Directed_v24` | 887/887 upright，0 unresolved/misaligned/opposite/quarter-turn | Body 680、Gun Head 203、Bullet 4 | Blender 5.2 格式场景不能由 3.3 打开 |
 | 场景最大残差 | Body `0.004785°`；Gun Head `0.002105°`；Bullet `0.000022°` | `3°` 门槛内的真实资产方向 | 场景原有缺失骨骼父级 warning，不影响 UV |
 | 场景完整性 | 拓扑、Seam、源 UV 未变；目标 UV 在 0-1、正 winding、零退化、零重叠 | 三个目标 Mesh | 场景只读打开，未保存 |
-| 0.5.6 安装包 | 15/15 白名单文件与源码哈希一致；136647 字节 | 唯一顶层、无缓存、无重复 entry | 无 |
-| 0.5.6 ZIP SHA-256 | `AAD9D2F413F7BF22BDC2358729EFBC1950B99AB4E3FE1CFA81837F6731B555A0` | 正式安装包 | 源码再变更必须重建 |
+| 0.5.6 安装包 | 15/15 白名单文件与源码哈希一致；220220 字节 | 唯一顶层、无缓存、无重复 entry | 无 |
+| 0.5.6 ZIP SHA-256 | `7022CAC248B4EBFA74FE726A89EA1B3462D9630D9D828859F0C124B3202E65B6` | 当前重建安装包 | 源码再变更必须重建 |
 | `release/SHA256SUMS.txt` | 8/8 匹配 | 历史包、0.5.6 ZIP 与四份历史 smoke | 无 |
 | 确定性重复构建 | 重建哈希与正式 ZIP 完全一致 | 固定白名单、顺序和 entry 时间戳 | 无 |
 | `git diff --check` | 通过 | 空白、冲突标记和补丁格式 | 无 |
-| 发布范围审计 | 25 个路径；禁止项 0 | 无 Blend、图片、场景审计、MCP 脚本或缓存 | 未提交、未推送 |
+| 发布范围审计 | 源码、文档、安装包和轻量验证结果；实验 sandbox 已忽略 | 无 Blend、图片、场景审计、MCP 脚本或缓存 | GitLab 远端状态需推送后复核 |
 | 项目大脑 healthcheck | `errors=12 warnings=0`，本任务无新增错误 | 当前任务五件套、代码地图和索引 | 12 项均为入口/hook/公共索引覆盖等既有历史债务 |
 
 ## 交付与范围
@@ -100,4 +100,4 @@
 - 实测场景：工作区 `release/VUV_0.5.6_DirectedScene_v24/拼接武器_VUV_方向一致_v24.blend`，
   UV 图层 `VUV_Directed_v24`；场景及 audit 不纳入本仓库待提交范围。
 - 不纳入 `.blend/.blend1`、场景 manifest、PNG/SVG、临时审计/MCP 脚本、缓存。
-- 用户本轮未要求 Git 提交或推送，因此保持未提交、未推送。
+- 本轮已按用户“上传到 GitLab”要求准备提交与推送；目标远程为 `origin`（`gitlab2.seasungame.com/AIGC/MB-AIGC.git`），推送后需复核远程分支与 commit。

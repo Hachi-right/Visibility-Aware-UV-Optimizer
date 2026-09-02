@@ -81,8 +81,8 @@ Body 安全合并 `172` 个碎岛，Gun Head 合并 `43` 个；重复件组方�
 ## 发布物
 
 - 安装包：`release/Visibility_Aware_UV_Optimizer_0.5.6_HardSurface.zip`
-- 大小：`159319` 字节
-- SHA-256：`8046BB58DEA79E5518AEB04FC5F586353F6521C274574626ED0A4C5BFD4253E7`
+- 大小：`220220` 字节
+- SHA-256：`7022CAC248B4EBFA74FE726A89EA1B3462D9630D9D828859F0C124B3202E65B6`
 - 内容：唯一顶层 `visibility_uv_optimizer/`，精确 15 个白名单文件，逐文件与
   `addons/visibility_uv_optimizer/` 的 SHA-256 一致，无缓存文件。
 

@@ -97,6 +97,8 @@ class VUV_PT_MainPanel(bpy.types.Panel):
             row.prop(settings, "uv_direction_space")
             row.prop(settings, "uv_direction_axis")
             direction.prop(settings, "uv_direction_auto_priority")
+            direction.prop(settings, "uv_direction_auto_cardinal_bias")
+            direction.prop(settings, "uv_direction_auto_cardinal_min_confidence")
             box.prop(settings, "hard_surface_hidden_collapse")
         if settings.initial_uv_mode != 'PRESERVE_LAYOUT':
             box.prop(settings, "smart_angle")
@@ -147,6 +149,16 @@ class VUV_PT_MainPanel(bpy.types.Panel):
                 grouping.prop(settings, "uv_square_pack_max_edge_relaxation")
                 grouping.prop(settings, "uv_cardinal_edge_confidence")
                 grouping.prop(settings, "uv_directed_cardinal_tolerance")
+                grouping.prop(settings, "uv_prefer_geometry_axis_cardinal")
+                cardinal = grouping.column(align=True)
+                cardinal.enabled = settings.uv_prefer_geometry_axis_cardinal
+                cardinal.prop(settings, "uv_geometry_axis_cardinal_min_gain")
+                cardinal.prop(settings, "uv_geometry_axis_cardinal_max_quality_loss")
+                grouping.prop(settings, "uv_cohere_auto_geometry_axis")
+                domain = grouping.column(align=True)
+                domain.enabled = settings.uv_cohere_auto_geometry_axis
+                domain.prop(settings, "uv_geometry_axis_consensus_min_tangent")
+                domain.prop(settings, "uv_geometry_axis_consensus_min_confidence")
             box.prop(settings, "preserve_seams")
             box.prop(settings, "respect_materials")
             box.prop(settings, "respect_sharp")

@@ -3,3 +3,5 @@ workstate.json
 __pycache__/
 *.pyc
 node_modules/
+sandbox/
+*.blend1

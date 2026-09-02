@@ -2190,6 +2190,18 @@ def _group_layout_options(settings, strict_source_overlap=True):
             'uv_direction_auto_priority',
             getattr(settings, 'direction_auto_priority', 'ZXY'),
         )).upper(),
+        direction_auto_cardinal_bias=max(
+            min(float(getattr(
+                settings, 'uv_direction_auto_cardinal_bias', 0.0
+            )), 1.0),
+            0.0,
+        ),
+        direction_auto_cardinal_min_confidence=max(
+            min(float(getattr(
+                settings, 'uv_direction_auto_cardinal_min_confidence', 0.15
+            )), 1.0),
+            0.0,
+        ),
         direction_axis_min_projection=(
             hard_surface.GEOMETRY_AXIS_RELATIVE_EPSILON
         ),
@@ -2213,6 +2225,36 @@ def _group_layout_options(settings, strict_source_overlap=True):
         min_cardinal_edge_confidence=max(
             min(float(getattr(
                 settings, 'uv_cardinal_edge_confidence', 0.15
+            )), 1.0),
+            0.0,
+        ),
+        prefer_geometry_axis_cardinal=bool(getattr(
+            settings, 'uv_prefer_geometry_axis_cardinal', False
+        )),
+        geometry_axis_cardinal_min_gain=max(
+            min(float(getattr(
+                settings, 'uv_geometry_axis_cardinal_min_gain', math.radians(5.0)
+            )), math.pi * 0.25),
+            0.0,
+        ),
+        geometry_axis_cardinal_max_quality_loss=max(
+            min(float(getattr(
+                settings, 'uv_geometry_axis_cardinal_max_quality_loss', 0.15
+            )), 1.0),
+            0.0,
+        ),
+        cohere_auto_geometry_axis=bool(getattr(
+            settings, 'uv_cohere_auto_geometry_axis', False
+        )),
+        geometry_axis_consensus_min_tangent=max(
+            min(float(getattr(
+                settings, 'uv_geometry_axis_consensus_min_tangent', 0.70
+            )), 1.0),
+            0.0,
+        ),
+        geometry_axis_consensus_min_confidence=max(
+            min(float(getattr(
+                settings, 'uv_geometry_axis_consensus_min_confidence', 0.30
             )), 1.0),
             0.0,
         ),

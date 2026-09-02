@@ -402,6 +402,29 @@ class VUVSettings(bpy.types.PropertyGroup):
         ),
         default='ZXY',
     )
+    uv_direction_auto_cardinal_bias: FloatProperty(
+        name="AUTO Cardinal Bias / 自动直角偏好",
+        description=(
+            "Optional bounded bias toward an AUTO axis whose corrected long edge "
+            "is cardinal; 仅在通过几何投影门槛时偏好长边更水平/垂直的自动轴"
+        ),
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        precision=2,
+        subtype='FACTOR',
+    )
+    uv_direction_auto_cardinal_min_confidence: FloatProperty(
+        name="AUTO Cardinal Cue Confidence / 自动直角线索置信度",
+        description=(
+            "Ignore boundary-edge cardinal cues below this confidence; 忽略低于该置信度的边界边直角线索"
+        ),
+        default=0.15,
+        min=0.0,
+        max=1.0,
+        precision=2,
+        subtype='FACTOR',
+    )
     hard_surface_hidden_collapse: BoolProperty(
         name="Collapse Hidden Overrides",
         description="Collapse only explicitly Hidden-overridden faces to the UV origin",
@@ -473,6 +496,74 @@ class VUVSettings(bpy.types.PropertyGroup):
         min=0.0,
         max=1.0,
         precision=2,
+    )
+    uv_prefer_geometry_axis_cardinal: BoolProperty(
+        name="Prefer Shared Cardinal Axes / 优先共享直角轴",
+        description=(
+            "For related hard-surface islands, allow a clearly straighter long-edge "
+            "heading to choose a common AUTO geometry axis within the quality gates; "
+            "仅在质量门槛允许时让结构相关硬表面岛共享更规整的几何轴"
+        ),
+        # Keep the historical AUTO resolver unchanged unless an artist opts in.
+        default=False,
+    )
+    uv_geometry_axis_cardinal_min_gain: FloatProperty(
+        name="Shared Axis Min Gain / 共享轴最小收益",
+        description=(
+            "Minimum long-edge cardinal improvement required before the common "
+            "AUTO axis may change; 共享 AUTO 轴切换前要求的最小长边直角收益"
+        ),
+        default=math.radians(5.0),
+        min=0.0,
+        max=math.radians(45.0),
+        precision=1,
+        subtype='ANGLE',
+    )
+    uv_geometry_axis_cardinal_max_quality_loss: FloatProperty(
+        name="Shared Axis Quality Loss / 共享轴质量损失",
+        description=(
+            "Maximum weakest-stability loss accepted for the cardinal improvement; "
+            "为获得直角长边方向允许的最大最弱稳定性损失"
+        ),
+        default=0.15,
+        min=0.0,
+        max=1.0,
+        precision=2,
+        subtype='FACTOR',
+    )
+    uv_cohere_auto_geometry_axis: BoolProperty(
+        name="Normal-Domain Axis Coherence / 法线域轴一致",
+        description=(
+            "For unconstrained hard-surface islands, choose the first stable "
+            "configured model axis that lies in the island tangent plane; "
+            "按法线域和配置优先级为无结构约束的硬表面岛选择稳定切向轴"
+        ),
+        default=False,
+    )
+    uv_geometry_axis_consensus_min_tangent: FloatProperty(
+        name="Axis Tangent Threshold / 轴切向阈值",
+        description=(
+            "Minimum model-axis projection in the tangent plane before the "
+            "normal-domain AUTO resolver may use that axis; "
+            "轴在切平面内的最小投影"
+        ),
+        default=0.70,
+        min=0.0,
+        max=1.0,
+        precision=2,
+        subtype='FACTOR',
+    )
+    uv_geometry_axis_consensus_min_confidence: FloatProperty(
+        name="Axis Confidence Threshold / 轴置信阈值",
+        description=(
+            "Quality threshold used to report a low-confidence member while "
+            "retaining a valid shared axis; 用于标记低置信成员而不拆散有效共享轴"
+        ),
+        default=0.30,
+        min=0.0,
+        max=1.0,
+        precision=2,
+        subtype='FACTOR',
     )
     uv_directed_cardinal_tolerance: FloatProperty(
         name="Directed Cardinal Tolerance / 有向直角容差",
