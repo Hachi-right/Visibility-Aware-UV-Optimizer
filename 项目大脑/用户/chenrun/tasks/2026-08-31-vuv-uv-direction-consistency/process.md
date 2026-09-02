@@ -18,7 +18,7 @@
   必须共享有符号方向；结构组内部采用确定性邻近行列/rack，且全程保持正 winding。
 - Body 暴露弱轴组在布局前后换轴；Gun Head 的 42 面连续岛可保留，但 float32
   写回会令两个近共线三角翻面。正在以真实场景作为阻断样本修复。
-- 旧 0.5.6 ZIP 和 v24/v26 场景均不再视为本轮最终交付；当前已完成源码增强、安装包重建和双版本 smoke，待 GitLab 推送。
+- 旧 0.5.6 ZIP 和 v24/v26 场景均不再视为本轮最终交付；当前已完成源码增强、安装包重建、双版本 smoke 和 GitLab 推送。
 
 ## 团队经验引用
 
@@ -90,7 +90,7 @@
 | `release/SHA256SUMS.txt` | 8/8 匹配 | 历史包、0.5.6 ZIP 与四份历史 smoke | 无 |
 | 确定性重复构建 | 重建哈希与正式 ZIP 完全一致 | 固定白名单、顺序和 entry 时间戳 | 无 |
 | `git diff --check` | 通过 | 空白、冲突标记和补丁格式 | 无 |
-| 发布范围审计 | 源码、文档、安装包和轻量验证结果；实验 sandbox 已忽略 | 无 Blend、图片、场景审计、MCP 脚本或缓存 | GitLab 远端状态需推送后复核 |
+| 发布范围审计 | 源码、文档、安装包和轻量验证结果；实验 sandbox 已忽略 | 无 Blend、图片、场景审计、MCP 脚本或缓存 | GitLab 远端 commit 推送后复核 |
 | 项目大脑 healthcheck | `errors=12 warnings=0`，本任务无新增错误 | 当前任务五件套、代码地图和索引 | 12 项均为入口/hook/公共索引覆盖等既有历史债务 |
 
 ## 交付与范围
@@ -100,4 +100,4 @@
 - 实测场景：工作区 `release/VUV_0.5.6_DirectedScene_v24/拼接武器_VUV_方向一致_v24.blend`，
   UV 图层 `VUV_Directed_v24`；场景及 audit 不纳入本仓库待提交范围。
 - 不纳入 `.blend/.blend1`、场景 manifest、PNG/SVG、临时审计/MCP 脚本、缓存。
-- 本轮已按用户“上传到 GitLab”要求准备提交与推送；目标远程为 `origin`（`gitlab2.seasungame.com/AIGC/MB-AIGC.git`），推送后需复核远程分支与 commit。
+- 本轮已按用户“上传到 GitLab”要求完成提交与推送；目标远程为 `origin`（`gitlab2.seasungame.com/AIGC/MB-AIGC.git`），分支为 `uv展开`。
