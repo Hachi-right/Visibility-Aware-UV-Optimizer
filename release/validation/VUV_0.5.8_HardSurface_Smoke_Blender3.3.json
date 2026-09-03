@@ -1,0 +1,271 @@
+{
+  "active_render": {
+    "active_after": 0,
+    "active_before": 0,
+    "layer_hash_after": "3b9b531887c80721912f4f65fc23065b796eae8281f1839b1df6f8d0bee389fe",
+    "layer_hash_before": "11b94efb8b88d60780078ff050d8d2402ae804ee2fa563cc09a1d43e39265603",
+    "render_layer_preserved": true
+  },
+  "addon_version": [
+    0,
+    5,
+    8
+  ],
+  "auto_contract_names": {
+    "SM_Weapon_InfoAtlas_LOD1": "INFO_ATLAS",
+    "SM_Weapon_LED1_LOD1": "LED",
+    "SM_Weapon_LED_LOD1": "LED",
+    "SM_Weapon_LOD1": "UNIQUE",
+    "SM_Weapon_TrimSheet_LOD1": "TRIM_SHEET",
+    "SM_Weapon_VFX_LOD1": "LED"
+  },
+  "blender_version": "3.3.5",
+  "constraints": {
+    "marked": {
+      "audit": {
+        "false_negative": 0,
+        "islands": 2,
+        "loops": 8,
+        "overlap": false,
+        "seams": 7
+      },
+      "discontinuous": true,
+      "edge": 2,
+      "seam": true
+    },
+    "material": {
+      "audit": {
+        "false_negative": 0,
+        "islands": 2,
+        "loops": 8,
+        "overlap": false,
+        "seams": 7
+      },
+      "discontinuous": true,
+      "edge": 2,
+      "seam": true
+    },
+    "sharp": {
+      "audit": {
+        "false_negative": 0,
+        "islands": 2,
+        "loops": 8,
+        "overlap": false,
+        "seams": 7
+      },
+      "discontinuous": true,
+      "edge": 2,
+      "seam": true
+    }
+  },
+  "detail_score_transaction": {
+    "cancelled": true,
+    "restored": true,
+    "snapshot_hash": "ac46067f7a3e9d153e56c63912da20e52a572b1bef929728da884efe54b7ce92"
+  },
+  "empty_uv": {
+    "HARD_SURFACE": {
+      "false_negative": 0,
+      "islands": 2,
+      "loops": 8,
+      "overlap": false,
+      "seams": 7
+    },
+    "LEGACY_SMART": {
+      "false_negative": 0,
+      "islands": 1,
+      "loops": 8,
+      "overlap": false,
+      "seams": 0
+    }
+  },
+  "hard_surface": {
+    "cylinder": {
+      "cap_faces": 2,
+      "cap_islands": [
+        1,
+        2
+      ],
+      "false_negative": 0,
+      "islands": 3,
+      "loops": 96,
+      "overlap": false,
+      "seams": 33,
+      "side_faces": 16,
+      "side_islands": [
+        0
+      ]
+    },
+    "rail": {
+      "false_negative": 0,
+      "islands": 1,
+      "loops": 144,
+      "overlap": false,
+      "seams": 30,
+      "uv_bounds": [
+        0.37549999356269836,
+        0.0020000000949949026,
+        0.6244999766349792,
+        0.997999906539917
+      ]
+    }
+  },
+  "hard_surface_contract": "hard_surface_profile:WEAPON",
+  "hidden_geometry": {
+    "audit": {
+      "false_negative": 0,
+      "islands": 2,
+      "loops": 8,
+      "overlap": false,
+      "seams": 7
+    },
+    "hidden_state_preserved": true
+  },
+  "non_unique_preserve": {
+    "mesh_hash": "39e82ef99c008f56d7a1eb35f09c8f65df976d2b636ac87cd08192ec3125414a",
+    "summary": "Islands 2 -> 2, merged 0/0; reject stretch 0, overlap 0, topology 0, probe 0; guided 0; mode PRESERVE_LAYOUT; usage TRIM_SHEET; cuts 0; repaired 0; mirrored 0; safe pack no; small/\u5c0f\u5c9b n/a; groups/\u5206\u7ec4 n/a",
+    "unchanged": true
+  },
+  "operator_rna": {
+    "calls": [
+      {
+        "kwargs": [
+          "angle_limit",
+          "area_weight",
+          "correct_aspect",
+          "island_margin",
+          "scale_to_bounds"
+        ],
+        "operator": "smart_project"
+      },
+      {
+        "kwargs": [
+          "action"
+        ],
+        "operator": "select_all"
+      },
+      {
+        "kwargs": [],
+        "operator": "average_islands_scale"
+      },
+      {
+        "kwargs": [
+          "action"
+        ],
+        "operator": "select_all"
+      },
+      {
+        "kwargs": [
+          "margin",
+          "rotate",
+          "udim_source"
+        ],
+        "operator": "pack_islands"
+      }
+    ],
+    "helper_probe": [
+      "margin",
+      "rotate"
+    ],
+    "invalid": {},
+    "supported": {
+      "average_islands_scale": [
+        "scale_uv",
+        "shear"
+      ],
+      "follow_active_quads": [
+        "mode"
+      ],
+      "pack_islands": [
+        "margin",
+        "rotate",
+        "udim_source"
+      ],
+      "select_all": [
+        "action"
+      ],
+      "smart_project": [
+        "angle_limit",
+        "area_weight",
+        "correct_aspect",
+        "island_margin",
+        "scale_to_bounds"
+      ],
+      "unwrap": [
+        "correct_aspect",
+        "fill_holes",
+        "margin",
+        "method",
+        "use_subsurf_data"
+      ]
+    }
+  },
+  "panel_flatness": {
+    "loose": "panel",
+    "tight": "mixed"
+  },
+  "rollback": {
+    "cancelled": true,
+    "legacy_expected_gap": false,
+    "mesh_restored": true,
+    "selection_restored": true,
+    "snapshot_hash": "843bba36043303a1b972c1debbd0117aa6f55d519710d589b1bc1fbe2d9a885f"
+  },
+  "schema": "vuv-055-smoke-v1",
+  "small_repeat_layout_priority": {
+    "left_anchor_group": 0,
+    "left_small_group": 0,
+    "left_small_owner": 0,
+    "right_anchor_group": 0,
+    "right_small_group": 0,
+    "right_small_owner": 1
+  },
+  "status": "VUV_055_SMOKE_OK",
+  "strict_054": false,
+  "strict_055": true,
+  "unique_quality_gate": {
+    "failures": {
+      "cross_chart_overlap": {
+        "cancelled": true,
+        "injections": 2,
+        "restored": true,
+        "snapshot_hash": "456cd42a430904fe8d361c5b1009076b9697d8a1bd34d38442a88a89b7f617cd"
+      },
+      "intra_chart_overlap": {
+        "cancelled": true,
+        "injections": 2,
+        "restored": true,
+        "snapshot_hash": "860bd7ab846db75b26dbdf53609154f933a4e86270379086e583847ad04541fe"
+      },
+      "mixed_winding": {
+        "cancelled": true,
+        "injections": 2,
+        "restored": true,
+        "snapshot_hash": "b0ec5e9bdc090d8347886dfd397838f6d31d07777504d4f93ea3a0c12a1d4a24"
+      },
+      "out_of_bounds": {
+        "cancelled": true,
+        "injections": 1,
+        "restored": true,
+        "snapshot_hash": "4636d6d0fd4870287ccaea52260632451164b30d051fa9fb328cae52aefa2789"
+      },
+      "uv_degenerate": {
+        "cancelled": true,
+        "injections": 3,
+        "restored": true,
+        "snapshot_hash": "4636d6d0fd4870287ccaea52260632451164b30d051fa9fb328cae52aefa2789"
+      }
+    },
+    "uniform_negative": {
+      "degenerate": 0,
+      "finite": true,
+      "inside_tile": true,
+      "negative": 0,
+      "overlap": false,
+      "positive": 72,
+      "source_degenerate": 0,
+      "triangles": 72,
+      "uv_degenerate": 0
+    }
+  }
+}

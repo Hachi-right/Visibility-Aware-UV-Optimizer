@@ -223,6 +223,83 @@ def _make_small_fragment_pair(name, artist_seam):
     return obj, shared_edge.index
 
 
+def _make_small_fragment_chain(name, face_count=4):
+    obj = _make_connected_quad_strip(name, face_count)
+    uv_layer = obj.data.uv_layers.active
+    for polygon in obj.data.polygons:
+        offset = 0.05 + polygon.index * 0.22
+        coordinates = (
+            Vector((offset, 0.10)),
+            Vector((offset + 0.16, 0.10)),
+            Vector((offset + 0.16, 0.90)),
+            Vector((offset, 0.90)),
+        )
+        for local_index, loop_index in enumerate(polygon.loop_indices):
+            uv_layer.data[loop_index].uv = coordinates[local_index]
+    obj.data.update()
+    return obj
+
+
+def _make_large_panel_fragment_chain(name, base_faces=100, fragments=2):
+    obj = _make_connected_quad_strip(name, base_faces + fragments)
+    uv_layer = obj.data.uv_layers.active
+    base_width = 0.68
+    for polygon in obj.data.polygons:
+        if polygon.index < base_faces:
+            left = 0.05 + base_width * polygon.index / base_faces
+            right = 0.05 + base_width * (polygon.index + 1) / base_faces
+        else:
+            fragment_index = polygon.index - base_faces
+            left = 0.77 + 0.04 * fragment_index
+            right = left + 0.025
+        coordinates = (
+            Vector((left, 0.10)),
+            Vector((right, 0.10)),
+            Vector((right, 0.90)),
+            Vector((left, 0.90)),
+        )
+        for local_index, loop_index in enumerate(polygon.loop_indices):
+            uv_layer.data[loop_index].uv = coordinates[local_index]
+    obj.data.update()
+    return obj
+
+
+def _make_distant_fragment_pair(name):
+    x_values = (-1.0, 0.0, 10.0, 11.0)
+    vertices = [
+        (x_value, float(row), 0.0)
+        for row in range(2)
+        for x_value in x_values
+    ]
+    row_length = len(x_values)
+    faces = [
+        (index, index + 1, row_length + index + 1, row_length + index)
+        for index in range(3)
+    ]
+    mesh = bpy.data.meshes.new(name + "Mesh")
+    mesh.from_pydata(vertices, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    uv_bounds = (
+        (0.03, 0.11),
+        (0.15, 0.85),
+        (0.91, 0.97),
+    )
+    for polygon, (left, right) in zip(mesh.polygons, uv_bounds):
+        coordinates = (
+            Vector((left, 0.10)),
+            Vector((right, 0.10)),
+            Vector((right, 0.90)),
+            Vector((left, 0.90)),
+        )
+        for local_index, loop_index in enumerate(polygon.loop_indices):
+            uv_layer.data[loop_index].uv = coordinates[local_index]
+    mesh.update()
+    return obj
+
+
 def _small_cleanup_fixture(
         name,
         *,
@@ -255,6 +332,9 @@ def _small_cleanup_fixture(
         small_cleanup_max_merges=4,
         small_cleanup_p95=1.35,
         small_cleanup_max_stretch=2.0,
+        small_chain_max_faces=96,
+        small_chain_max_absorptions=8,
+        small_chain_max_diameter_ratio=0.0,
         max_p95_stretch=1.5,
         max_stretch=3.0,
         respect_sharp=False,
@@ -285,6 +365,98 @@ def _small_cleanup_fixture(
     finally:
         uv_optimize._try_merge = original_try_merge
     return obj, shared_edge_index, result
+
+
+def _small_cleanup_chain_fixture(name, **chain_limits):
+    _clear_scene()
+    obj = _make_small_fragment_chain(name)
+    _activate(obj)
+    bm, uv_layer = _enter_edit(obj)
+    settings = SimpleNamespace(
+        small_cleanup_enabled=True,
+        small_island_faces=1,
+        small_island_area_ratio=0.3,
+        small_uv_area_ratio=0.3,
+        small_boundary_ratio=0.2,
+        small_structural_cleanup_enabled=True,
+        small_structural_boundary_ratio=0.08,
+        small_structural_angle=math.radians(60.0),
+        small_structural_max_merges=8,
+        small_cleanup_tests=16,
+        small_cleanup_max_merges=8,
+        small_cleanup_p95=1.35,
+        small_cleanup_max_stretch=2.0,
+        small_chain_max_faces=chain_limits.get("max_faces", 96),
+        small_chain_max_absorptions=chain_limits.get("max_absorptions", 8),
+        small_chain_max_diameter_ratio=chain_limits.get(
+            "max_diameter_ratio", 0.0
+        ),
+        max_p95_stretch=1.5,
+        max_stretch=3.0,
+        respect_sharp=False,
+        island_margin=0.002,
+    )
+    constraints = SimpleNamespace(
+        locked_cuts=set(),
+        forced_cuts=set(),
+        face_classes={index: "PANEL" for index in range(4)},
+    )
+    return uv_optimize.small_island_cleanup.stitch_small_islands(
+        obj,
+        bm,
+        uv_layer,
+        settings,
+        constraints,
+        uv_optimize,
+    )
+
+
+def _run_panel_fragment_cleanup(
+        obj,
+        *,
+        face_count,
+        area_ratio,
+        uv_area_ratio,
+        max_faces,
+        max_absorptions,
+        max_diameter_ratio):
+    _activate(obj)
+    bm, uv_layer = _enter_edit(obj)
+    settings = SimpleNamespace(
+        small_cleanup_enabled=True,
+        small_island_faces=1,
+        small_island_area_ratio=area_ratio,
+        small_uv_area_ratio=uv_area_ratio,
+        small_boundary_ratio=0.2,
+        small_structural_cleanup_enabled=True,
+        small_structural_boundary_ratio=0.08,
+        small_structural_angle=math.radians(60.0),
+        small_structural_max_merges=8,
+        small_cleanup_tests=16,
+        small_cleanup_max_merges=8,
+        small_cleanup_p95=1.35,
+        small_cleanup_max_stretch=2.0,
+        small_chain_max_faces=max_faces,
+        small_chain_max_absorptions=max_absorptions,
+        small_chain_max_diameter_ratio=max_diameter_ratio,
+        max_p95_stretch=1.5,
+        max_stretch=3.0,
+        respect_sharp=False,
+        island_margin=0.002,
+    )
+    constraints = SimpleNamespace(
+        locked_cuts=set(),
+        forced_cuts=set(),
+        face_classes={index: "PANEL" for index in range(face_count)},
+    )
+    return uv_optimize.small_island_cleanup.stitch_small_islands(
+        obj,
+        bm,
+        uv_layer,
+        settings,
+        constraints,
+        uv_optimize,
+    )
 
 
 def _topology_signature(mesh):
@@ -959,6 +1131,73 @@ def _test_refine_unlocked_seam_allows_structural_cleanup():
     assert not obj.data.edges[shared_edge_index].use_seam
 
 
+def _test_refine_copy_preserves_source_layer_and_mesh_seams():
+    _clear_scene()
+    obj, shared_edge_index = _make_small_fragment_pair(
+        "VUV_RefineCopyIsolation", True)
+    _activate(obj)
+    mesh = obj.data
+    target = mesh.uv_layers.active
+    target.name = "VUV_RefineTarget"
+    source = mesh.uv_layers.new(name="VUV_RefineSource")
+    for source_item, target_item in zip(source.data, target.data):
+        source_item.uv = target_item.uv + Vector((3.0, 5.0))
+    mesh.uv_layers.active = target
+    source_before = tuple(
+        (float(item.uv.x), float(item.uv.y)) for item in source.data)
+    seams_before = tuple(bool(edge.use_seam) for edge in mesh.edges)
+    target_before = tuple(
+        (float(item.uv.x), float(item.uv.y)) for item in target.data)
+
+    settings = bpy.context.scene.vuv_settings
+    settings.initial_uv_mode = 'REFINE_LAYOUT'
+    settings.uv_usage = 'UNIQUE'
+    settings.max_merge_tests = 0
+    settings.preserve_seams = False
+    settings.respect_materials = True
+    settings.hard_surface_respect_sharp = False
+    settings.hard_surface_hidden_collapse = False
+    settings.small_cleanup_enabled = True
+    settings.small_island_faces = 1
+    settings.small_island_area_ratio = 0.1
+    settings.small_uv_area_ratio = 0.1
+    settings.small_boundary_ratio = 0.25
+    settings.small_cleanup_p95 = 1.35
+    settings.small_cleanup_max_stretch = 2.0
+    settings.uv_group_layout_enabled = True
+
+    original_classifier = uv_optimize.hard_surface.classify_edge_constraints
+
+    def structural_classifier(*args, **kwargs):
+        constraints = original_classifier(*args, **kwargs)
+        constraints.face_classes.update({0: 'PANEL', 1: 'BEVEL'})
+        return constraints
+
+    uv_optimize.hard_surface.classify_edge_constraints = structural_classifier
+    try:
+        result = uv_optimize.optimize_active_object(
+            bpy.context, obj, settings)
+    finally:
+        uv_optimize.hard_surface.classify_edge_constraints = original_classifier
+
+    source_after = mesh.uv_layers.get("VUV_RefineSource")
+    target_after = mesh.uv_layers.get("VUV_RefineTarget")
+    assert source_after is not None
+    assert target_after is not None
+    assert tuple(
+        (float(item.uv.x), float(item.uv.y)) for item in source_after.data
+    ) == source_before
+    assert tuple(bool(edge.use_seam) for edge in mesh.edges) == seams_before
+    assert mesh.uv_layers.active.name == "VUV_RefineTarget"
+    assert tuple(
+        (float(item.uv.x), float(item.uv.y)) for item in target_after.data
+    ) != target_before
+    assert result.small_cleanup_merges == 1, result.small_cleanup_summary
+    assert result.final_islands == 1
+    assert mesh.edges[shared_edge_index].use_seam
+    uv_optimize._audit_unique_object_mesh(mesh)
+
+
 def _test_refine_cleanup_normalizes_unwrap_density_explosion():
     obj, shared_edge_index, result, _classification = (
         _run_refine_fragment_pair(
@@ -1026,6 +1265,91 @@ def _test_structural_lane_rolls_back_stretch_rejection():
     assert result["final_charts"] == 2, result
     bm, _uv_layer = uv_optimize._refresh_edit_bmesh(obj.data)
     assert bm.edges[shared_edge_index].seam
+
+
+def _test_small_cleanup_extends_a_local_fragment_chain():
+    result = _small_cleanup_chain_fixture("VUV_SmallChain")
+    assert result["accepted"] == 3, result
+    assert result["accepted_chain_extensions"] == 2, result
+    assert result["max_chain_absorptions"] == 3, result
+    assert result["max_chain_faces"] == 3, result
+    assert result["final_charts"] == 1, result
+
+
+def _test_small_cleanup_chain_limits_are_local():
+    cases = (
+        (
+            "Faces",
+            {"max_faces": 2},
+            "chain_face_limit",
+            2,
+        ),
+        (
+            "Absorptions",
+            {"max_absorptions": 1},
+            "chain_absorption_limit",
+            1,
+        ),
+        (
+            "Diameter",
+            {"max_diameter_ratio": 0.70},
+            "chain_diameter_limit",
+            1,
+        ),
+    )
+    for suffix, limits, reason, maximum_absorptions in cases:
+        result = _small_cleanup_chain_fixture(
+            "VUV_SmallChain" + suffix,
+            **limits
+        )
+        assert result["accepted"] == 2, (suffix, result)
+        assert result["final_charts"] == 2, (suffix, result)
+        assert result["max_chain_absorptions"] == maximum_absorptions, (
+            suffix, result
+        )
+        assert result["filter_funnel"].get(reason, 0) >= 1, (
+            suffix, result
+        )
+
+
+def _test_large_panel_is_not_charged_to_fragment_budget():
+    _clear_scene()
+    obj = _make_large_panel_fragment_chain("VUV_LargePanelFragments")
+    result = _run_panel_fragment_cleanup(
+        obj,
+        face_count=102,
+        area_ratio=0.02,
+        uv_area_ratio=0.05,
+        max_faces=2,
+        max_absorptions=2,
+        max_diameter_ratio=0.05,
+    )
+    assert result["initial_charts"] == 3, result
+    assert result["accepted"] == 2, result
+    assert result["accepted_chain_extensions"] == 1, result
+    assert result["max_chain_faces"] == 2, result
+    assert result["max_chain_diameter_ratio"] < 0.05, result
+    assert result["final_charts"] == 1, result
+
+
+def _test_distant_fragments_do_not_form_asset_chain():
+    _clear_scene()
+    obj = _make_distant_fragment_pair("VUV_DistantFragments")
+    result = _run_panel_fragment_cleanup(
+        obj,
+        face_count=3,
+        area_ratio=0.10,
+        uv_area_ratio=0.10,
+        max_faces=8,
+        max_absorptions=8,
+        max_diameter_ratio=0.15,
+    )
+    assert result["initial_charts"] == 3, result
+    assert result["accepted"] == 1, result
+    assert result["max_chain_faces"] == 1, result
+    assert result["max_chain_absorptions"] == 1, result
+    assert result["final_charts"] == 2, result
+    assert result["filter_funnel"].get("chain_diameter_limit", 0) >= 1, result
 
 
 def _test_final_pack_gate_repair():
@@ -1226,10 +1550,15 @@ try:
     _test_refine_artist_seam_blocks_small_cleanup()
     _test_refine_derived_uv_cut_allows_safe_small_cleanup()
     _test_refine_unlocked_seam_allows_structural_cleanup()
+    _test_refine_copy_preserves_source_layer_and_mesh_seams()
     _test_refine_cleanup_normalizes_unwrap_density_explosion()
     _test_structural_small_fragment_lane()
     _test_structural_lane_keeps_hard_boundaries()
     _test_structural_lane_rolls_back_stretch_rejection()
+    _test_small_cleanup_extends_a_local_fragment_chain()
+    _test_small_cleanup_chain_limits_are_local()
+    _test_large_panel_is_not_charged_to_fragment_budget()
+    _test_distant_fragments_do_not_form_asset_chain()
     _test_final_pack_gate_repair()
     _test_hard_surface_repair_reapplies_direction()
     _test_outer_transaction_rollback()

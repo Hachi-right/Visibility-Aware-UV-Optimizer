@@ -251,10 +251,63 @@ def _test_positive_shear_is_downgraded_without_hard_failure():
         _remove(obj, mesh)
 
 
+def _test_strict_planar_frame_gate_rejects_checker_skew():
+    """A planar hard-surface chart cannot silently use the +V fallback."""
+
+    sheared = (
+        (0.20, 0.10),
+        (0.50, 0.10),
+        (0.65, 0.70),
+        (0.35, 0.70),
+    )
+    obj, mesh, layer = _quad_object("VUV_Frame_Strict_Planar", sheared)
+    try:
+        options = VUV.GroupLayoutOptions(
+            align_geometry_direction=True,
+            align_geometry_frame=True,
+            direction_axis="Z",
+            strict_geometry_frame_quality=True,
+            strict_geometry_frame_planar_only=True,
+            strict_geometry_frame_planar_tolerance=math.radians(5.0),
+            strict_geometry_frame_residual_tolerance=math.radians(3.0),
+            margin=0.0,
+        )
+        source = VUV.analyze_active_uv(obj, options)
+        island = source.islands[0]
+        center = island.uv_centroid
+        for loop_index in island.loop_indices:
+            layer.data[loop_index].uv = VUV._rotate_point(
+                layer.data[loop_index].uv,
+                center,
+                float(island.geometry_rotation_angle),
+            )
+        mesh.update()
+
+        replay = VUV.analyze_active_uv(obj, options)
+        metrics = VUV.evaluate_layout_quality(
+            obj,
+            analysis=replay,
+            face_to_island=replay.face_to_island,
+            options=options,
+        )
+        directed = metrics["directed_geometry"]
+        assert directed["misaligned_islands"] == 0, directed
+        assert directed["strict_frame_contract_enabled"], directed
+        assert directed["strict_frame_required_ids"] == [0], directed
+        assert directed["strict_frame_violation_ids"] == [0], directed
+        assert directed["frame_fallback_ids"] == [0], directed
+        assert not directed["frame_contract_valid"], directed
+        assert not metrics["directed_geometry_valid"], metrics
+        assert not metrics["valid"], metrics
+    finally:
+        _remove(obj, mesh)
+
+
 _test_positive_and_180_keep_positive_parity()
 _test_mirror_is_reported_without_reflection()
 _test_frame_can_be_opted_out_without_changing_axis_contract()
 _test_frame_axis_drift_falls_back_to_strict_plus_v()
 _test_layout_writeback_uses_strict_axis_when_frame_has_small_drift()
 _test_positive_shear_is_downgraded_without_hard_failure()
+_test_strict_planar_frame_gate_rejects_checker_skew()
 print("VUV_COMPLETE_FRAME_OK")

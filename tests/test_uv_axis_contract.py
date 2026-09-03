@@ -76,11 +76,20 @@ def _settings(**kwargs):
     return VUV.GroupLayoutOptions(**values)
 
 
-def _payload(mesh, layer, *, space="OBJECT", faces=None, version=1):
+def _payload(
+    mesh,
+    layer,
+    *,
+    space="OBJECT",
+    auto_priority="ZXY",
+    faces=None,
+    version=1,
+):
     return {
         "version": version,
         "layer": layer.name,
         "space": space,
+        "auto_priority": auto_priority,
         "topology": VUV._mesh_topology_contract(mesh),
         "faces": {"0": "Z"} if faces is None else faces,
     }
@@ -108,7 +117,7 @@ def _single_analysis(obj, mesh, layer, settings):
     )
 
 
-def _test_malformed_and_space_contracts_are_ignored():
+def _test_malformed_contract_and_explicit_override_are_ignored():
     obj, mesh, layer = _quad_object("VUV_AxisContractMalformed")
     try:
         settings = _settings()
@@ -116,12 +125,91 @@ def _test_malformed_and_space_contracts_are_ignored():
         mesh[key] = '{"version":"not-an-int"}'
         assert VUV._load_geometry_axis_contract(mesh, layer, settings) == {}
 
-        _write_payload(mesh, layer, _payload(mesh, layer, space="WORLD"))
+        _write_payload(mesh, layer, _payload(mesh, layer, space="INVALID"))
         assert VUV._load_geometry_axis_contract(mesh, layer, settings) == {}
+
+        _write_payload(mesh, layer, _payload(mesh, layer, space="WORLD"))
+        force_rebuild = _settings(
+            restore_persisted_direction_contract=False
+        )
+        assert VUV._load_geometry_axis_contract(
+            mesh, layer, force_rebuild
+        ) == {}
+
+        explicit_override = _settings(
+            direction_contract_settings_explicit=True
+        )
+        assert VUV._load_geometry_axis_contract(
+            mesh, layer, explicit_override
+        ) == {}
 
         _write_payload(mesh, layer, _payload(mesh, layer))
         explicit = _settings(direction_axis="Z")
         assert VUV._load_geometry_axis_contract(mesh, layer, explicit) == {}
+    finally:
+        _remove(obj, mesh)
+
+
+def _test_saved_space_and_priority_override_scene_defaults():
+    """Generated-file contracts survive default UI settings after reopen."""
+
+    obj, mesh, layer = _quad_object("VUV_AxisContractSavedSettings")
+    try:
+        settings = _settings(
+            direction_space="OBJECT",
+            direction_auto_priority="ZXY",
+        )
+        _write_payload(
+            mesh,
+            layer,
+            _payload(
+                mesh,
+                layer,
+                space="WORLD",
+                auto_priority="YZX",
+            ),
+        )
+        contract = VUV._load_geometry_axis_contract(mesh, layer, settings)
+        assert contract == {(0,): ("Z", "WORLD")}, contract
+
+        # Blender's is_property_set() remains true after reopening.  The
+        # integration records that separately from the master restore switch;
+        # an identical WORLD/YZX signature still replays exact per-face axes.
+        matching_explicit = _settings(
+            direction_space="WORLD",
+            direction_auto_priority="YZX",
+            direction_contract_settings_explicit=True,
+        )
+        assert VUV._load_geometry_axis_contract(
+            mesh, layer, matching_explicit
+        ) == {(0,): ("Z", "WORLD")}
+
+        analysis = _single_analysis(obj, mesh, layer, settings)
+        original = VUV._geometry_direction_record
+        calls = []
+
+        def record_saved_axis(*args, **kwargs):
+            calls.append((kwargs.get("space"), kwargs.get("fixed_axis_name")))
+            return "Z", Vector((0.0, 1.0)), 0.0, 1.0
+
+        VUV._geometry_direction_record = record_saved_axis
+        try:
+            count = VUV._apply_persisted_geometry_axis_contract(
+                obj, mesh, layer, analysis, settings
+            )
+        finally:
+            VUV._geometry_direction_record = original
+        assert count == 1
+        assert calls == [("WORLD", "Z")], calls
+        assert analysis.islands[0].geometry_direction_space == "WORLD"
+        assert VUV._persist_geometry_axis_contract(
+            mesh, layer, analysis, settings
+        )
+        persisted = json.loads(
+            mesh[VUV._geometry_axis_contract_key(layer.name)]
+        )
+        assert persisted["space"] == "WORLD", persisted
+        assert persisted["auto_priority"] == "YZX", persisted
     finally:
         _remove(obj, mesh)
 
@@ -269,7 +357,8 @@ def _test_metrics_do_not_reresolve_persisted_unresolved_axes():
         _remove(obj, mesh)
 
 
-_test_malformed_and_space_contracts_are_ignored()
+_test_malformed_contract_and_explicit_override_are_ignored()
+_test_saved_space_and_priority_override_scene_defaults()
 _test_face_set_mismatch_rejects_entire_contract()
 _test_round_trip_rebinds_saved_axis()
 _test_none_and_unavailable_axes_stay_unresolved()

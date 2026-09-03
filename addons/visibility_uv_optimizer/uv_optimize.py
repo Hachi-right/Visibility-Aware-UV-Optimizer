@@ -20,6 +20,8 @@ from .visibility import write_face_float
 
 
 _LOW_VISIBILITY_SCALE = 0.01
+_PLANAR_FRAME_REPAIR_NORMAL_TOLERANCE = math.radians(0.1)
+_PLANAR_FRAME_REPAIR_DISTANCE_RATIO = 1.0e-5
 _UV_SELECTION_ATTRIBUTES = (
     '.uv_select_vert',
     '.uv_select_edge',
@@ -347,6 +349,34 @@ def _restore_mesh_uv_state(mesh, snapshot):
     mesh.update()
 
 
+def _restore_refine_source_state(mesh, snapshot, target_layer_name):
+    """Keep copied-source UV layers and mesh seams outside a refine result."""
+    if not snapshot:
+        return
+    has_source_layer = any(
+        name != target_layer_name for name, _values in snapshot.get('layers', ())
+    )
+    if not has_source_layer:
+        return
+    for name, values in snapshot.get('layers', ()):
+        if name == target_layer_name:
+            continue
+        layer = mesh.uv_layers.get(name)
+        if layer is None or len(layer.data) != len(values):
+            continue
+        for item, state in zip(layer.data, values):
+            item.uv = state['uv']
+            for key in ('select', 'select_edge', 'pin_uv'):
+                if hasattr(item, key):
+                    setattr(item, key, bool(state.get(key, False)))
+    for edge, state in zip(mesh.edges, snapshot.get('seams', ())):
+        edge.use_seam = bool(state)
+    active = mesh.uv_layers.get(target_layer_name) if target_layer_name else None
+    if active is not None:
+        mesh.uv_layers.active = active
+    mesh.update()
+
+
 @dataclass
 class OptimizeResult:
     initial_islands: int
@@ -376,6 +406,10 @@ class OptimizeResult:
     small_cleanup_initial_charts: int = 0
     small_cleanup_final_charts: int = 0
     small_cleanup_summary: dict = field(default_factory=dict)
+    planar_frame_repair_attempted: int = 0
+    planar_frame_repair_accepted: int = 0
+    planar_frame_repair_rejected: int = 0
+    planar_frame_repair_summary: dict = field(default_factory=dict)
     group_layout_applied: bool = False
     group_layout_repeat_groups: int = 0
     group_layout_repeat_members: int = 0
@@ -2162,6 +2196,56 @@ def _audit_directed_object_mesh(obj, settings, direction_contract):
 
 def _group_layout_options(settings, strict_source_overlap=True):
     """Map established VUV settings to the experimental post-layout stage."""
+    # The Blender PropertyGroup only exposes the small set of controls shown
+    # in the UI.  Batch/hard-surface scripts can still provide the complete
+    # ``GroupLayoutOptions`` contract either with the ``uv_*`` setting names
+    # used by this add-on or with the unprefixed dataclass names.  Keep the
+    # prefixed spelling first so an explicit UI value wins when both are
+    # present, and retain the historical defaults when neither is available.
+    def _option(name, default, *aliases):
+        for key in (name,) + aliases:
+            try:
+                value = getattr(settings, key)
+            except (AttributeError, TypeError):
+                continue
+            if value is not None:
+                return value
+        return default
+
+    defaults = uv_group_layout.GroupLayoutOptions()
+
+    def _bool(name, default, *aliases):
+        return bool(_option(name, default, *aliases))
+
+    def _int(name, default, minimum, *aliases):
+        return max(int(_option(name, default, *aliases)), int(minimum))
+
+    def _float(name, default, minimum=None, maximum=None, *aliases):
+        value = float(_option(name, default, *aliases))
+        if minimum is not None:
+            value = max(value, float(minimum))
+        if maximum is not None:
+            value = min(value, float(maximum))
+        return value
+
+    def _property_was_set(*names):
+        try:
+            checker = getattr(settings, 'is_property_set')
+        except (AttributeError, TypeError):
+            return False
+        if not callable(checker):
+            return False
+        for name in names:
+            try:
+                if checker(name):
+                    return True
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                continue
+        return False
+
+    direction_contract_was_set = _property_was_set(
+        'uv_direction_space', 'uv_direction_auto_priority')
+
     return uv_group_layout.GroupLayoutOptions(
         margin=max(float(settings.island_margin), 0.0),
         small_face_count=max(
@@ -2178,6 +2262,9 @@ def _group_layout_options(settings, strict_source_overlap=True):
             settings, 'hard_surface_align_cardinal', True)),
         align_geometry_direction=bool(getattr(
             settings, 'hard_surface_direction_lock', True)),
+        align_repeat_local_frame=_bool(
+            'uv_repeat_local_frame', True,
+            'align_repeat_local_frame'),
         direction_space=str(getattr(
             settings, 'uv_direction_space', 'OBJECT')).upper(),
         direction_axis=str(getattr(
@@ -2190,6 +2277,12 @@ def _group_layout_options(settings, strict_source_overlap=True):
             'uv_direction_auto_priority',
             getattr(settings, 'direction_auto_priority', 'ZXY'),
         )).upper(),
+        # A saved AUTO contract is authoritative after reopening a file until
+        # the artist explicitly changes a contract-defining RNA control.  A
+        # plain script settings proxy has no ``is_property_set`` method, so it
+        # retains the backward-compatible restore behavior.
+        restore_persisted_direction_contract=True,
+        direction_contract_settings_explicit=direction_contract_was_set,
         direction_auto_cardinal_bias=max(
             min(float(getattr(
                 settings, 'uv_direction_auto_cardinal_bias', 0.0
@@ -2264,6 +2357,144 @@ def _group_layout_options(settings, strict_source_overlap=True):
         cohere_geometry_long_edge=bool(getattr(
             settings, 'uv_cohere_geometry_long_edge', False
         )),
+        # Complete signed-frame controls.  These are intentionally separate
+        # from ``align_geometry_direction``: callers may request frame
+        # diagnostics without enabling the write-back rotation, or enable the
+        # stricter frame rotation only after their own compatibility check.
+        align_geometry_frame=_bool(
+            'uv_align_geometry_frame', defaults.align_geometry_frame,
+            'align_geometry_frame', 'hard_surface_align_geometry_frame'),
+        use_geometry_frame_rotation=_bool(
+            'uv_use_geometry_frame_rotation',
+            defaults.use_geometry_frame_rotation,
+            'use_geometry_frame_rotation',
+            'hard_surface_use_geometry_frame_rotation'),
+        cohere_geometry_angle_groups=_bool(
+            'uv_cohere_geometry_angle_groups',
+            defaults.cohere_geometry_angle_groups,
+            'cohere_geometry_angle_groups'),
+        strict_geometry_frame_quality=_bool(
+            'uv_strict_geometry_frame_quality',
+            defaults.strict_geometry_frame_quality,
+            'strict_geometry_frame_quality'),
+        strict_geometry_frame_planar_only=_bool(
+            'uv_strict_geometry_frame_planar_only',
+            defaults.strict_geometry_frame_planar_only,
+            'strict_geometry_frame_planar_only'),
+        strict_geometry_frame_planar_tolerance=_float(
+            'uv_strict_geometry_frame_planar_tolerance',
+            defaults.strict_geometry_frame_planar_tolerance,
+            0.0,
+            math.pi * 0.5,
+            'strict_geometry_frame_planar_tolerance'),
+        strict_geometry_frame_residual_tolerance=_float(
+            'uv_strict_geometry_frame_residual_tolerance',
+            defaults.strict_geometry_frame_residual_tolerance,
+            0.0,
+            math.pi,
+            'strict_geometry_frame_residual_tolerance'),
+        preserve_source_layout=_bool(
+            'uv_preserve_source_layout', defaults.preserve_source_layout,
+            'preserve_source_layout'),
+        source_layout_row_quantum=_float(
+            'uv_source_layout_row_quantum',
+            defaults.source_layout_row_quantum,
+            1.0e-6,
+            1.0,
+            'source_layout_row_quantum'),
+        source_layout_row_weight=_float(
+            'uv_source_layout_row_weight',
+            defaults.source_layout_row_weight,
+            0.0,
+            10.0,
+            'source_layout_row_weight'),
+        source_layout_order=str(_option(
+            'uv_source_layout_order', defaults.source_layout_order,
+            'source_layout_order')).upper(),
+        source_layout_affinity_weight=_float(
+            'uv_source_layout_affinity_weight',
+            defaults.source_layout_affinity_weight,
+            0.0,
+            10.0,
+            'source_layout_affinity_weight'),
+        source_layout_cell_enabled=_bool(
+            'uv_source_layout_cell_enabled',
+            defaults.source_layout_cell_enabled,
+            'source_layout_cell_enabled'),
+        source_layout_compact_cells=_bool(
+            'uv_source_layout_compact_cells',
+            defaults.source_layout_compact_cells,
+            'source_layout_compact_cells'),
+        source_layout_cell_max_members=_int(
+            'uv_source_layout_cell_max_members',
+            defaults.source_layout_cell_max_members,
+            2,
+            'source_layout_cell_max_members'),
+        source_layout_cell_diameter_ratio=_float(
+            'uv_source_layout_cell_diameter_ratio',
+            defaults.source_layout_cell_diameter_ratio,
+            1.0e-6,
+            1.0,
+            'source_layout_cell_diameter_ratio'),
+        source_layout_cell_link_radius_ratio=_float(
+            'uv_source_layout_cell_link_radius_ratio',
+            defaults.source_layout_cell_link_radius_ratio,
+            1.0e-6,
+            1.0,
+            'source_layout_cell_link_radius_ratio'),
+        structure_group_enabled=_bool(
+            'uv_structure_group_enabled', defaults.structure_group_enabled,
+            'structure_group_enabled'),
+        structure_group_max_members=_int(
+            'uv_structure_group_max_members',
+            defaults.structure_group_max_members,
+            2,
+            'structure_group_max_members'),
+        structure_group_max_degree=_int(
+            'uv_structure_group_max_degree',
+            defaults.structure_group_max_degree,
+            1,
+            'structure_group_max_degree'),
+        structure_group_min_contact_ratio=_float(
+            'uv_structure_group_min_contact_ratio',
+            defaults.structure_group_min_contact_ratio,
+            0.0,
+            None,
+            'structure_group_min_contact_ratio'),
+        structure_group_max_diameter_ratio=_float(
+            'uv_structure_group_max_diameter_ratio',
+            defaults.structure_group_max_diameter_ratio,
+            1.0e-6,
+            1.0,
+            'structure_group_max_diameter_ratio'),
+        structure_group_max_normal_angle=_float(
+            'uv_structure_group_max_normal_angle',
+            defaults.structure_group_max_normal_angle,
+            0.0,
+            math.pi,
+            'structure_group_max_normal_angle'),
+        repeat_group_max_members=_int(
+            'uv_repeat_group_max_members',
+            defaults.repeat_group_max_members,
+            2,
+            'repeat_group_max_members'),
+        repeat_group_max_diameter_ratio=_float(
+            'uv_repeat_group_max_diameter_ratio',
+            defaults.repeat_group_max_diameter_ratio,
+            1.0e-6,
+            1.0,
+            'repeat_group_max_diameter_ratio'),
+        # These two legacy limits are consumed alongside the newer
+        # ``repeat_group_*`` envelope.  Mapping them here prevents scripts
+        # that already expose the old names from silently losing their cap.
+        max_repeat_group_size=_int(
+            'uv_max_repeat_group_size', defaults.max_repeat_group_size, 2,
+            'max_repeat_group_size', 'repeat_group_max_size'),
+        max_small_members_per_group=_int(
+            'uv_max_small_members_per_group',
+            defaults.max_small_members_per_group,
+            1,
+            'max_small_members_per_group'),
         small_island_scale_boost=max(
             min(float(getattr(
                 settings, 'uv_small_island_scale_boost', 1.25
@@ -2364,12 +2595,367 @@ def _align_hard_surface_chart(
     return False
 
 
+def _frame_space_point(obj, point, space):
+    if str(space).upper() == 'WORLD':
+        return obj.matrix_world @ point
+    return point.copy()
+
+
+def _mesh_chart_triangles(
+        obj, mesh, uv_layer, face_indices, space, coordinates=None):
+    selected = {int(index) for index in face_indices}
+    mesh.calc_loop_triangles()
+    triangles = []
+    for triangle in mesh.loop_triangles:
+        if int(triangle.polygon_index) not in selected:
+            continue
+        loop_indices = tuple(int(index) for index in triangle.loops)
+        points = tuple(
+            _frame_space_point(
+                obj,
+                mesh.vertices[mesh.loops[index].vertex_index].co,
+                space,
+            )
+            for index in loop_indices
+        )
+        if coordinates is None:
+            uvs = tuple(
+                uv_layer.data[index].uv.copy() for index in loop_indices
+            )
+        else:
+            try:
+                uvs = tuple(coordinates[index].copy() for index in loop_indices)
+            except KeyError:
+                raise RuntimeError(
+                    "Planar frame candidate lost a chart loop")
+        triangles.append((int(triangle.polygon_index), points, uvs))
+    return triangles
+
+
+def _strict_planar_frame_basis(
+        obj, mesh, island, direction_space,
+        normal_tolerance=_PLANAR_FRAME_REPAIR_NORMAL_TOLERANCE,
+        distance_ratio=_PLANAR_FRAME_REPAIR_DISTANCE_RATIO):
+    """Return a signed U/V projection basis only for a strict geometric plane."""
+
+    triangles = _mesh_chart_triangles(
+        obj,
+        mesh,
+        mesh.uv_layers.active,
+        island.face_indices,
+        direction_space,
+    )
+    weighted_normal = Vector((0.0, 0.0, 0.0))
+    triangle_normals = []
+    for _face_index, points, _uvs in triangles:
+        cross = (points[1] - points[0]).cross(points[2] - points[0])
+        if (
+                cross.length_squared <= 1.0e-20
+                or not all(math.isfinite(float(value)) for value in cross)):
+            continue
+        triangle_normals.append(cross.normalized())
+        weighted_normal += cross
+    if not triangle_normals or weighted_normal.length_squared <= 1.0e-20:
+        return None, 'degenerate_geometry'
+    normal = weighted_normal.normalized()
+    cosine_limit = math.cos(max(min(float(normal_tolerance), math.pi), 0.0))
+    if any(
+            float(value.dot(normal)) + 1.0e-9 < cosine_limit
+            for value in triangle_normals):
+        return None, 'normal_spread'
+
+    vertex_indices = sorted({
+        int(vertex_index)
+        for face_index in island.face_indices
+        for vertex_index in mesh.polygons[int(face_index)].vertices
+    })
+    points = [
+        _frame_space_point(
+            obj, mesh.vertices[index].co, direction_space)
+        for index in vertex_indices
+    ]
+    if len(points) < 3:
+        return None, 'degenerate_geometry'
+    origin = sum(points, Vector((0.0, 0.0, 0.0))) / len(points)
+    minimum = Vector(tuple(
+        min(point[axis] for point in points) for axis in range(3)
+    ))
+    maximum = Vector(tuple(
+        max(point[axis] for point in points) for axis in range(3)
+    ))
+    diagonal = (maximum - minimum).length
+    if not math.isfinite(diagonal) or diagonal <= 1.0e-10:
+        return None, 'degenerate_geometry'
+    plane_error = max(
+        abs(float((point - origin).dot(normal))) for point in points
+    )
+    relative_error = plane_error / diagonal
+    if (
+            not math.isfinite(relative_error)
+            or relative_error > float(distance_ratio) + 1.0e-12):
+        return None, 'point_plane_error'
+
+    axis = {
+        'X': Vector((1.0, 0.0, 0.0)),
+        'Y': Vector((0.0, 1.0, 0.0)),
+        'Z': Vector((0.0, 0.0, 1.0)),
+    }.get(str(island.geometry_axis_name).upper())
+    if axis is None:
+        return None, 'unresolved_axis'
+    v_basis = axis - normal * axis.dot(normal)
+    if v_basis.length_squared <= 1.0e-12:
+        return None, 'axis_parallel_to_plane_normal'
+    v_basis.normalize()
+    # This signed construction maps the positive selected model axis to +V
+    # while preserving mesh winding: (V x N) x V = N.
+    u_basis = v_basis.cross(normal)
+    if u_basis.length_squared <= 1.0e-12:
+        return None, 'degenerate_basis'
+    u_basis.normalize()
+    if float(u_basis.cross(v_basis).dot(normal)) <= 0.0:
+        return None, 'negative_basis'
+    return {
+        'origin': origin,
+        'normal': normal,
+        'u_basis': u_basis,
+        'v_basis': v_basis,
+        'normal_spread': max(
+            math.acos(max(-1.0, min(1.0, float(value.dot(normal)))))
+            for value in triangle_normals
+        ),
+        'plane_error_ratio': relative_error,
+    }, None
+
+
+def _triangle_uv_signed_area(triangles):
+    return sum(
+        0.5 * (
+            (uvs[1].x - uvs[0].x) * (uvs[2].y - uvs[0].y)
+            - (uvs[1].y - uvs[0].y) * (uvs[2].x - uvs[0].x)
+        )
+        for _face_index, _points, uvs in triangles
+    )
+
+
+def _planar_frame_candidate(obj, mesh, uv_layer, island, basis):
+    loop_indices = tuple(int(index) for index in island.loop_indices)
+    if not loop_indices:
+        return None, 'missing_loops', {}
+    old_center = sum(
+        (uv_layer.data[index].uv.copy() for index in loop_indices),
+        Vector((0.0, 0.0)),
+    ) / len(loop_indices)
+    direction_space = str(island.geometry_direction_space).upper()
+    raw = {}
+    for loop_index in loop_indices:
+        point = _frame_space_point(
+            obj,
+            mesh.vertices[mesh.loops[loop_index].vertex_index].co,
+            direction_space,
+        )
+        relative = point - basis['origin']
+        raw[loop_index] = Vector((
+            relative.dot(basis['u_basis']),
+            relative.dot(basis['v_basis']),
+        ))
+    raw_center = sum(raw.values(), Vector((0.0, 0.0))) / len(raw)
+    old_triangles = _mesh_chart_triangles(
+        obj,
+        mesh,
+        uv_layer,
+        island.face_indices,
+        direction_space,
+    )
+    raw_triangles = _mesh_chart_triangles(
+        obj,
+        mesh,
+        uv_layer,
+        island.face_indices,
+        direction_space,
+        coordinates=raw,
+    )
+    old_area = abs(_triangle_uv_signed_area(old_triangles))
+    raw_area = abs(_triangle_uv_signed_area(raw_triangles))
+    if old_area <= 1.0e-15 or raw_area <= 1.0e-15:
+        return None, 'degenerate_area', {}
+    scale = math.sqrt(old_area / raw_area)
+    candidate = {
+        index: old_center + (point - raw_center) * scale
+        for index, point in raw.items()
+    }
+    candidate_triangles = _mesh_chart_triangles(
+        obj,
+        mesh,
+        uv_layer,
+        island.face_indices,
+        direction_space,
+        coordinates=candidate,
+    )
+    old_p95, old_maximum, old_flipped = _measure_distortion(old_triangles)
+    new_p95, new_maximum, new_flipped = _measure_distortion(
+        candidate_triangles)
+    candidate_area = abs(_triangle_uv_signed_area(candidate_triangles))
+    metrics = {
+        'old_p95': old_p95,
+        'old_max': old_maximum,
+        'new_p95': new_p95,
+        'new_max': new_maximum,
+        'area_ratio': candidate_area / max(old_area, 1.0e-15),
+        'old_flipped': bool(old_flipped),
+        'new_flipped': bool(new_flipped),
+        'internal_overlap': bool(_has_overlap(
+            candidate_triangles, ignore_same_face=False)),
+    }
+    return candidate, None, metrics
+
+
+def _repair_refine_planar_frame_failures(obj, settings, layout_options):
+    """Reparameterize strict planar frame failures without changing seams."""
+
+    mesh = obj.data
+    uv_layer = mesh.uv_layers.active
+    summary = {
+        'enabled': True,
+        'reason': 'completed',
+        'source_islands': 0,
+        'frame_failures': 0,
+        'strict_planar_failures': 0,
+        'attempted': 0,
+        'accepted': 0,
+        'rejected': 0,
+        'rejected_reasons': {},
+        'contract_entries': 0,
+        'normal_tolerance_degrees': math.degrees(
+            _PLANAR_FRAME_REPAIR_NORMAL_TOLERANCE),
+        'distance_ratio_tolerance': _PLANAR_FRAME_REPAIR_DISTANCE_RATIO,
+    }
+    if uv_layer is None or len(uv_layer.data) != len(mesh.loops):
+        raise RuntimeError(
+            "Planar frame repair requires a valid active UV layer")
+    source = uv_group_layout.analyze_active_uv(obj, layout_options)
+    summary['source_islands'] = len(source.islands)
+    direction_contract = {
+        tuple(sorted(int(index) for index in island.face_indices)): (
+            island.geometry_axis_name,
+            str(island.geometry_direction_space or layout_options.direction_space),
+        )
+        for island in source.islands
+    }
+    summary['contract_entries'] = len(direction_contract)
+    source_uv = [item.uv.copy() for item in uv_layer.data]
+    accepted = {}
+
+    def reject(reason):
+        summary['rejected'] += 1
+        reasons = summary['rejected_reasons']
+        reasons[reason] = int(reasons.get(reason, 0)) + 1
+
+    max_p95 = float(getattr(settings, 'max_p95_stretch', 1.35))
+    max_stretch = float(getattr(settings, 'max_stretch', 2.0))
+    for island in source.islands:
+        if uv_group_layout._geometry_frame_is_reliable(
+                island, layout_options):
+            continue
+        summary['frame_failures'] += 1
+        basis, reason = _strict_planar_frame_basis(
+            obj,
+            mesh,
+            island,
+            str(island.geometry_direction_space or layout_options.direction_space),
+        )
+        if basis is None:
+            # Non-planar failures are normal on curved shells and bands.  They
+            # are not repair attempts and remain visible in frame diagnostics.
+            continue
+        summary['strict_planar_failures'] += 1
+        summary['attempted'] += 1
+        candidate, reason, metrics = _planar_frame_candidate(
+            obj, mesh, uv_layer, island, basis)
+        if candidate is None:
+            reject(reason or 'candidate_failed')
+            continue
+        if metrics['old_flipped']:
+            reject('source_winding')
+            continue
+        if metrics['new_flipped']:
+            reject('candidate_winding')
+            continue
+        if metrics['internal_overlap']:
+            reject('internal_overlap')
+            continue
+        if not 0.999 <= float(metrics['area_ratio']) <= 1.001:
+            reject('area_change')
+            continue
+        if (
+                float(metrics['new_p95']) > max_p95 + 1.0e-7
+                or float(metrics['new_max']) > max_stretch + 1.0e-7):
+            reject('stretch_limit')
+            continue
+        if (
+                float(metrics['new_p95'])
+                > max(1.01, float(metrics['old_p95']) * 1.01)
+                or float(metrics['new_max'])
+                > max(1.02, float(metrics['old_max']) * 1.01)):
+            reject('stretch_regression')
+            continue
+        for loop_index, coordinate in candidate.items():
+            uv_layer.data[loop_index].uv = coordinate
+        accepted[tuple(sorted(int(index) for index in island.face_indices))] = (
+            tuple(int(index) for index in island.loop_indices),
+            metrics,
+        )
+    mesh.update()
+
+    # Face sets and selected axes are one transaction contract.  This raises
+    # instead of silently reselecting AUTO if a candidate changed identity.
+    rebound = uv_group_layout.analyze_active_uv(obj, layout_options)
+    rebound = uv_group_layout.rebind_geometry_axis_contract(
+        obj,
+        rebound,
+        direction_contract,
+        layout_options,
+    )
+    rebound_by_faces = {
+        tuple(sorted(int(index) for index in island.face_indices)): island
+        for island in rebound.islands
+    }
+    post_frame_rejected = []
+    for face_key, (loop_indices, _metrics) in accepted.items():
+        island = rebound_by_faces.get(face_key)
+        if (
+                island is None
+                or not uv_group_layout._geometry_frame_is_reliable(
+                    island, layout_options)):
+            for loop_index in loop_indices:
+                uv_layer.data[loop_index].uv = source_uv[loop_index]
+            post_frame_rejected.append(face_key)
+            reject('post_frame_gate')
+    for face_key in post_frame_rejected:
+        del accepted[face_key]
+    if post_frame_rejected:
+        mesh.update()
+        rebound = uv_group_layout.analyze_active_uv(obj, layout_options)
+        uv_group_layout.rebind_geometry_axis_contract(
+            obj,
+            rebound,
+            direction_contract,
+            layout_options,
+        )
+    summary['accepted'] = len(accepted)
+    if not accepted and summary['attempted'] == 0:
+        summary['reason'] = 'no_strict_planar_frame_failures'
+    elif not accepted:
+        summary['reason'] = 'all_candidates_rejected'
+    return summary, direction_contract
+
+
 def optimize_active_object(context, obj, settings):
     mesh = obj.data
     mesh.update()
     if not mesh.polygons:
         raise ValueError("Active mesh contains no faces")
     snapshot = _snapshot_mesh_uv_state(mesh)
+    target_layer_name = snapshot.get('active')
     visibility = effective_face_visibility(mesh, default=1.0)
     overrides = read_face_int(mesh)
     probe_evidence = probe_analysis.load_stored_evidence(obj)
@@ -2401,6 +2987,14 @@ def optimize_active_object(context, obj, settings):
         'tests': 0,
         'accepted': 0,
     }
+    planar_frame_repair_summary = {
+        'enabled': False,
+        'reason': 'not_refine_layout_group_pack',
+        'attempted': 0,
+        'accepted': 0,
+        'rejected': 0,
+    }
+    frozen_group_direction_contract = None
     group_layout_result = None
     direction_contract = {}
     group_layout_disabled_reason = 'not_hard_surface_unique'
@@ -3063,13 +3657,52 @@ def optimize_active_object(context, obj, settings):
         post_layout_final_count = len(final_charts)
         if uv_usage == 'UNIQUE' and hard_surface_mode:
             if bool(getattr(settings, 'uv_group_layout_enabled', True)):
-                group_layout_result = uv_group_layout.layout_active_uv_adaptive(
-                    obj,
-                    _group_layout_options(
-                        settings,
-                        strict_source_overlap=not allow_refine_source_overlap,
-                    ),
+                layout_options = _group_layout_options(
+                    settings,
+                    strict_source_overlap=not allow_refine_source_overlap,
                 )
+                if direct_refine_group_pack:
+                    if (
+                            layout_options.align_geometry_direction
+                            and layout_options.align_geometry_frame):
+                        (
+                            planar_frame_repair_summary,
+                            frozen_group_direction_contract,
+                        ) = _repair_refine_planar_frame_failures(
+                            obj,
+                            settings,
+                            layout_options,
+                        )
+                        if int(planar_frame_repair_summary.get(
+                                'accepted', 0)) > 0:
+                            # A shape-corrected chart may temporarily overlap
+                            # a neighbor around its preserved source center.
+                            # The adaptive layout owns final disjoint placement.
+                            allow_refine_source_overlap = True
+                            layout_options = _group_layout_options(
+                                settings,
+                                strict_source_overlap=False,
+                            )
+                    else:
+                        planar_frame_repair_summary = {
+                            'enabled': False,
+                            'reason': 'direction_or_frame_disabled',
+                            'attempted': 0,
+                            'accepted': 0,
+                            'rejected': 0,
+                        }
+                if frozen_group_direction_contract is None:
+                    group_layout_result = (
+                        uv_group_layout.layout_active_uv_adaptive(
+                            obj, layout_options))
+                else:
+                    group_layout_result = (
+                        uv_group_layout.layout_active_uv_adaptive(
+                            obj,
+                            layout_options,
+                            direction_contract=(
+                                frozen_group_direction_contract),
+                        ))
             else:
                 group_layout_disabled_reason = 'disabled_by_setting'
         if uv_usage == 'UNIQUE':
@@ -3086,6 +3719,15 @@ def optimize_active_object(context, obj, settings):
                     direction_contract,
                 )
         write_face_float(mesh, detail_values, name='vuv_detail_score')
+
+        if refine_layout_mode:
+            # A copied UV layer is a transaction boundary: Blender edit-mode
+            # UV operations may rebuild loop custom data, and the derived seam
+            # graph is only working state for stitching/layout.  Commit the
+            # active target UV while restoring all source layers and the
+            # object's artist seam flags exactly.
+            _restore_refine_source_state(
+                mesh, snapshot, target_layer_name)
 
         if group_layout_result is None:
             group_layout_summary = {
@@ -3149,6 +3791,14 @@ def optimize_active_object(context, obj, settings):
             small_cleanup_final_charts=int(
                 small_cleanup_summary.get('final_charts', 0)),
             small_cleanup_summary=dict(small_cleanup_summary),
+            planar_frame_repair_attempted=int(
+                planar_frame_repair_summary.get('attempted', 0)),
+            planar_frame_repair_accepted=int(
+                planar_frame_repair_summary.get('accepted', 0)),
+            planar_frame_repair_rejected=int(
+                planar_frame_repair_summary.get('rejected', 0)),
+            planar_frame_repair_summary=dict(
+                planar_frame_repair_summary),
             group_layout_applied=group_layout_result is not None,
             group_layout_repeat_groups=repeat_group_count,
             group_layout_repeat_members=repeat_member_count,

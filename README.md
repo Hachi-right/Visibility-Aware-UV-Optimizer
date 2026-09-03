@@ -2,7 +2,7 @@
 
 面向 Blender 硬表面游戏资产的可见性分析与保守自动 UV 插件。
 
-当前试验版本：`0.5.7`
+当前试验版本：`0.5.8`
 
 版本记录与后续计划：
 
@@ -11,7 +11,15 @@
 
 ## 下载与安装
 
-- [Visibility_Aware_UV_Optimizer_0.5.7_HardSurface.zip](release/Visibility_Aware_UV_Optimizer_0.5.7_HardSurface.zip)
+- [Visibility_Aware_UV_Optimizer_0.5.8_HardSurface.zip](release/Visibility_Aware_UV_Optimizer_0.5.8_HardSurface.zip)
+
+## 0.5.8 结构连续与完整方向
+
+- 小岛链预算只统计新增碎片，允许同一机械主体连续吸收局部小面；链长度、面数、模型空间直径以及 Seam、材质、硬切边、拉伸、翻转和重叠门禁仍会阻止跨结构扩张。
+- `Refine Layout` 会对严格平面且完整 U/V frame 失败的岛做受控重参数化；只有保持岛身份、中心、面积、正 winding、零内部重叠和拉伸门禁通过时才接受。
+- source-cell 同时评估规则网格与不旋转的可变尺寸 shelf；后者只有不降低可用统一缩放时才会采用，减少尺寸混杂机械结构内的空槽，并保持源顺序和方向合同。
+- 方向验收从单一 `+V` 扩展到有符号 U/V 双轴。对 `MIRROR / ROTATIONAL / REPEATED`，只有 exact signature 且具有可靠 intrinsic landmark 的成员才启用 repeat-local signed semantic frame；它优先于全局 Object/World 轴，只允许刚性旋转且不反射，证据不足则回退全局合同。PCA/轮廓 heading 只用于排布展示指标，不承担 180 度正反语义。
+- Blender 5.2 拼接武器实测：Body `680 -> 508`、Gun Head `203 -> 152`、Bullet `4 -> 4`；覆盖率依次为 `15.5157301% / 23.1494795% / 51.6135375%`。三个对象均为 0 overlap、0 degenerate、0 negative、0 planar-frame failure，并通过保存重开审计。
 
 ## 0.5.7 布局改进
 
@@ -130,6 +138,7 @@
 - [0.5.4 使用说明与 0.5.5 增量](docs/Visibility_Aware_UV_Optimizer_硬表面使用说明_0.5.4.md)
 - [0.5.6 方向一致性与验证记录](docs/Visibility_Aware_UV_Optimizer_方向一致性_0.5.6.md)
 - [0.5.7 布局改进记录](docs/Visibility_Aware_UV_Optimizer_布局改进_0.5.7.md)
+- [0.5.8 结构连续与方向验证](docs/Visibility_Aware_UV_Optimizer_结构连续与方向验证_0.5.8.md)
 - [0.5.5 验证记录](docs/Visibility_Aware_UV_Optimizer_验证记录_0.5.5.md)
 - [0.5.4 验证记录](docs/Visibility_Aware_UV_Optimizer_验证记录_0.5.4.md)
 - [0.5.2 历史教程](docs/Visibility_Aware_UV_Optimizer_使用教程.md)
@@ -138,8 +147,10 @@
 
 - 支持范围：Blender `3.3` 至 `5.2`
 - 发布回归版本：Blender `3.3.5`、Blender `5.2.0 LTS`
-- 0.5.6 的方向锁定和结构分组只使用两版共有的刚性 UV 变换和确定性矩形排布；不依赖
+- 0.5.8 的方向锁定和结构分组只使用两版共有的刚性 UV 变换和确定性矩形排布；不依赖
   Blender 5.x 专属的镜像或重叠 Pack 行为。
+- Blender 3.3.5 / 5.2.0 的完整 16 项矩阵与解压 ZIP strict smoke 均已通过。
+  这证明当前发布候选满足已定义门禁，但不代表所有复杂生产资产都能一次展开成功。
 - 0.5.4 Blender 5.2 ChopSword 历史实测：220 岛、4,246 个正 winding
   三角形、0 overlap、0 退化，全部位于 0-1。
 

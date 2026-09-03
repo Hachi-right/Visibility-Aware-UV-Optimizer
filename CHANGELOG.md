@@ -3,6 +3,24 @@
 本项目遵循语义化版本号。Blender 插件的 `bl_info.version` 与发布包版本保持一致；
 实验性验证结果不会单独伪装成稳定版本。
 
+## 0.5.8 - 2026-09-03
+
+### 改进
+
+- 小岛链预算改为只计算新增碎片，不再把大型机械主体计入面数上限；首次合法缝合不受链直径限制，后续扩张仍受吸收次数、碎片面数和模型空间直径约束。
+- `Refine Layout` 新增严格平面 U/V frame 修复，以 `0.1°` 法线散度和点到平面误差 / 包围盒对角 `1e-5` 判定真正平面，避免把翘曲 N-gon 当作平面重投影。
+- 平面修复保持 face-set、UV 中心、面积和正 winding，并逐岛检查内部重叠、退化和拉伸；不满足门禁的候选保持原状。
+- source-cell 增加不旋转的可变尺寸 shelf 候选；候选必须达到规则网格的统一缩放下限，避免用 texel density 换表面规整。
+- Adaptive 回放绑定冻结的 face-set/axis 合同，阻止重投影后 `AUTO` 静默换轴；最终方向审计覆盖有符号 U/V 双轴、90°、180° 和负 parity。
+- 对 exact signature 且有可靠 intrinsic landmark 的 `MIRROR / ROTATIONAL / REPEATED` 组增加 repeat-local signed semantic frame。局部帧优先于全局 Object/World，写回只做刚性旋转、不做反射；条件不足的 35 组使用全局 fallback。PCA 与轮廓 heading 仅保留为 presentation metric。
+
+### 验证
+
+- Blender `3.3.5` 与 `5.2.0 LTS` 的定向回归、完整 16 项矩阵和解压 ZIP strict smoke 均通过。
+- 拼接武器 Blender 5.2 实测：Body `680 -> 508`、Gun Head `203 -> 152`、Bullet `4 -> 4`；覆盖率分别为 `15.5157301% / 23.1494795% / 51.6135375%`。三个对象 overlap、degenerate、negative 与 planar-frame failure 均为 0，保存重开审计通过。
+- 59 个 repeat 关系组中 24 组、48 个成员满足 local eligibility；局部残差 P95 `0.0012766°`、最大 `0.0016252°`，signed checker error groups 为 0。raw global audit 的 46 个 misaligned 与 6 个 quarter-turn 是被局部语义帧覆盖的成员，不是有效错误。
+- Body 的 235 个单面 UV 岛中，110 个本身就是拓扑断开的单面 Mesh 组件，不能通过 UV 缝合伪造成连续岛。更激进的碎岛放宽候选因残留 `1` 或 `11` 个 folded/degenerate chart 被严格门禁拒绝并回退。
+
 ## 0.5.7 - 2026-09-02
 
 ### 改进

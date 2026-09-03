@@ -12,6 +12,10 @@
 
 ## 当前状态
 
+- 2026-09-03 根据用户第三轮视觉复核继续迭代：同一机械结构仍被拆成大量小岛，岛的
+  结构朝向与完整 U/V 棋盘格方向都不稳定。当前排查确认旧 v42 使用 `WORLD + YZX`
+  且在插件后又做二次宏排布，二者都会覆盖或弱化插件方向合同；新基线统一使用
+  `OBJECT + YZX`，直接调用真实 Operator，并把 frame fallback/residual 纳入阻断门禁。
 - 2026-09-01 根据用户对真实棋盘格与 UV 布局的复核重新打开任务：旧结果虽然
   通过方向数值门禁，但仍存在结构拆碎、同构件分散、排布歪斜和部分方向漂移。
 - 当前验收升级为三重合同：源结构连续分区不可被布局阶段改变；同构/重复结构
@@ -101,3 +105,26 @@
   UV 图层 `VUV_Directed_v24`；场景及 audit 不纳入本仓库待提交范围。
 - 不纳入 `.blend/.blend1`、场景 manifest、PNG/SVG、临时审计/MCP 脚本、缓存。
 - 本轮已按用户“上传到 GitLab”要求完成提交与推送；目标远程为 `origin`（`gitlab2.seasungame.com/AIGC/MB-AIGC.git`），分支为 `uv展开`。
+
+## 2026-09-03 0.5.8 阶段收尾
+
+- repeat-local signed semantic frame 已限定为 exact signature + reliable intrinsic
+  landmark 的 `MIRROR / ROTATIONAL / REPEATED`；局部语义优先于全局 Object/World，
+  只做刚性旋转、不做反射，证据不足走 global fallback。PCA/轮廓 heading 只记录为
+  presentation metric。
+- 拼接武器结果：Body `680 -> 508`、Gun Head `203 -> 152`、Bullet `4 -> 4`；
+  coverage 依次为 `15.5157301% / 23.1494795% / 51.6135375%`。
+- 59 个关系组中 24 组、48 个成员 local eligible，local residual P95
+  `0.0012766°`、max `0.0016252°`，signed checker error groups 为 0；35 组使用
+  global fallback。raw global 的 46 misaligned / 6 quarter-turn 是受审计的 local
+  override，不是有效方向错误。
+- Body 的 235 个单面 UV 岛中，110 个属于独立单面 Mesh 组件；缺少共享拓扑边，
+  不能安全缝合。碎岛参数的激进放宽候选分别因 1 或 11 个 folded/degenerate chart
+  未通过 Unique 门禁，已回退保守结果。
+- 三个对象 overlap、degenerate、negative、planar-frame failure 均为 0，保存重开
+  审计通过；Blender 3.3.5 / 5.2.0 定向回归通过。
+- 已新增 `docs/Visibility_Aware_UV_Optimizer_结构连续与方向验证_0.5.8.md`，引用
+  Blender 官方 Geometry Align、Pack Islands 与 Seams 文档，并明确当前仍是受控
+  试验版本。
+- 最终完整 16 项矩阵和解压 ZIP 的 Blender 3.3.5 / 5.2.0 strict smoke 已确认通过；
+  本轮文档按最终验收状态收口，但仍保留受控试验版的适用边界。

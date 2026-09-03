@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import bmesh
 import bpy
@@ -49,6 +50,158 @@ def _settings(space, group):
     settings.uv_direction_space = space
     settings.uv_direction_axis = "AUTO"
     return settings
+
+
+def _test_group_layout_script_settings_are_mapped():
+    settings = SimpleNamespace(
+        island_margin=0.007,
+        uv_align_geometry_frame=False,
+        uv_use_geometry_frame_rotation=True,
+        uv_cohere_geometry_angle_groups=True,
+        uv_strict_geometry_frame_quality=True,
+        uv_strict_geometry_frame_planar_only=False,
+        uv_strict_geometry_frame_planar_tolerance=math.radians(7.0),
+        uv_strict_geometry_frame_residual_tolerance=math.radians(2.0),
+        uv_preserve_source_layout=True,
+        uv_source_layout_row_quantum=0.04,
+        uv_source_layout_row_weight=0.7,
+        uv_source_layout_order="AREA",
+        uv_source_layout_affinity_weight=1.2,
+        uv_source_layout_cell_enabled=False,
+        uv_source_layout_compact_cells=False,
+        uv_source_layout_cell_max_members=7,
+        uv_source_layout_cell_diameter_ratio=0.23,
+        uv_source_layout_cell_link_radius_ratio=0.19,
+        uv_structure_group_enabled=False,
+        uv_structure_group_max_members=9,
+        uv_structure_group_max_degree=3,
+        uv_structure_group_min_contact_ratio=0.21,
+        uv_structure_group_max_diameter_ratio=0.42,
+        uv_structure_group_max_normal_angle=math.radians(72.0),
+        uv_repeat_group_max_members=18,
+        uv_repeat_group_max_diameter_ratio=0.31,
+        uv_max_repeat_group_size=14,
+        uv_max_small_members_per_group=6,
+    )
+
+    options = uv_optimize._group_layout_options(settings)
+
+    assert not options.align_geometry_frame
+    assert options.use_geometry_frame_rotation
+    assert options.cohere_geometry_angle_groups
+    assert options.strict_geometry_frame_quality
+    assert not options.strict_geometry_frame_planar_only
+    assert math.isclose(
+        options.strict_geometry_frame_planar_tolerance, math.radians(7.0))
+    assert math.isclose(
+        options.strict_geometry_frame_residual_tolerance, math.radians(2.0))
+    assert options.restore_persisted_direction_contract
+    assert not options.direction_contract_settings_explicit
+    assert options.preserve_source_layout
+    assert math.isclose(options.source_layout_row_quantum, 0.04)
+    assert math.isclose(options.source_layout_row_weight, 0.7)
+    assert options.source_layout_order == "AREA"
+    assert math.isclose(options.source_layout_affinity_weight, 1.2)
+    assert not options.source_layout_cell_enabled
+    assert not options.source_layout_compact_cells
+    assert options.source_layout_cell_max_members == 7
+    assert math.isclose(options.source_layout_cell_diameter_ratio, 0.23)
+    assert math.isclose(options.source_layout_cell_link_radius_ratio, 0.19)
+    assert not options.structure_group_enabled
+    assert options.structure_group_max_members == 9
+    assert options.structure_group_max_degree == 3
+    assert math.isclose(options.structure_group_min_contact_ratio, 0.21)
+    assert math.isclose(options.structure_group_max_diameter_ratio, 0.42)
+    assert math.isclose(
+        options.structure_group_max_normal_angle, math.radians(72.0))
+    assert options.repeat_group_max_members == 18
+    assert math.isclose(options.repeat_group_max_diameter_ratio, 0.31)
+    assert options.max_repeat_group_size == 14
+    assert options.max_small_members_per_group == 6
+    options.validated()
+
+    defaults = uv_group_layout.GroupLayoutOptions()
+    fallback = uv_optimize._group_layout_options(
+        SimpleNamespace(island_margin=0.003))
+    assert fallback.align_geometry_frame == defaults.align_geometry_frame
+    assert (
+        fallback.use_geometry_frame_rotation
+        == defaults.use_geometry_frame_rotation
+    )
+    assert fallback.preserve_source_layout == defaults.preserve_source_layout
+    assert fallback.structure_group_max_members == defaults.structure_group_max_members
+    assert fallback.repeat_group_max_members == defaults.repeat_group_max_members
+
+
+def _test_registered_group_layout_settings_match_defaults():
+    settings = bpy.context.scene.vuv_settings
+    defaults = uv_group_layout.GroupLayoutOptions()
+    expected = {
+        "uv_align_geometry_frame": defaults.align_geometry_frame,
+        "uv_use_geometry_frame_rotation": defaults.use_geometry_frame_rotation,
+        "uv_cohere_geometry_angle_groups": defaults.cohere_geometry_angle_groups,
+        "uv_strict_geometry_frame_quality": defaults.strict_geometry_frame_quality,
+        "uv_strict_geometry_frame_planar_only": (
+            defaults.strict_geometry_frame_planar_only),
+        "uv_strict_geometry_frame_planar_tolerance": (
+            defaults.strict_geometry_frame_planar_tolerance),
+        "uv_strict_geometry_frame_residual_tolerance": (
+            defaults.strict_geometry_frame_residual_tolerance),
+        "uv_preserve_source_layout": defaults.preserve_source_layout,
+        "uv_source_layout_row_quantum": defaults.source_layout_row_quantum,
+        "uv_source_layout_row_weight": defaults.source_layout_row_weight,
+        "uv_source_layout_order": defaults.source_layout_order,
+        "uv_source_layout_affinity_weight": defaults.source_layout_affinity_weight,
+        "uv_source_layout_cell_enabled": defaults.source_layout_cell_enabled,
+        "uv_source_layout_compact_cells": defaults.source_layout_compact_cells,
+        "uv_source_layout_cell_max_members": defaults.source_layout_cell_max_members,
+        "uv_source_layout_cell_diameter_ratio": (
+            defaults.source_layout_cell_diameter_ratio),
+        "uv_source_layout_cell_link_radius_ratio": (
+            defaults.source_layout_cell_link_radius_ratio),
+        "uv_structure_group_enabled": defaults.structure_group_enabled,
+        "uv_structure_group_max_members": defaults.structure_group_max_members,
+        "uv_structure_group_max_degree": defaults.structure_group_max_degree,
+        "uv_structure_group_min_contact_ratio": (
+            defaults.structure_group_min_contact_ratio),
+        "uv_structure_group_max_diameter_ratio": (
+            defaults.structure_group_max_diameter_ratio),
+        "uv_structure_group_max_normal_angle": (
+            defaults.structure_group_max_normal_angle),
+        "uv_repeat_group_max_members": defaults.repeat_group_max_members,
+        "uv_repeat_group_max_diameter_ratio": (
+            defaults.repeat_group_max_diameter_ratio),
+        "uv_max_repeat_group_size": defaults.max_repeat_group_size,
+        "uv_max_small_members_per_group": defaults.max_small_members_per_group,
+    }
+    for name, expected_value in expected.items():
+        actual = getattr(settings, name)
+        if isinstance(expected_value, float):
+            assert math.isclose(actual, expected_value, rel_tol=1.0e-6), (
+                name, actual, expected_value)
+        else:
+            assert actual == expected_value, (name, actual, expected_value)
+
+    options = uv_optimize._group_layout_options(settings)
+    assert options.restore_persisted_direction_contract
+    assert not options.direction_contract_settings_explicit
+    for name, expected_value in expected.items():
+        option_name = name[3:]
+        actual = getattr(options, option_name)
+        if isinstance(expected_value, float):
+            assert math.isclose(actual, expected_value, rel_tol=1.0e-6), (
+                option_name, actual, expected_value)
+        else:
+            assert actual == expected_value, (
+                option_name, actual, expected_value)
+
+    settings.uv_direction_space = "WORLD"
+    try:
+        explicit_options = uv_optimize._group_layout_options(settings)
+        assert explicit_options.restore_persisted_direction_contract
+        assert explicit_options.direction_contract_settings_explicit
+    finally:
+        settings.property_unset("uv_direction_space")
 
 
 def _final_hard_report(obj, *, geometry_matrix=None):
@@ -268,6 +421,8 @@ def _test_group_off_auto_axis_switch_rolls_back():
 
 addon.register()
 try:
+    _test_group_layout_script_settings_are_mapped()
+    _test_registered_group_layout_settings_match_defaults()
     _test_auto_axis_stays_stable_through_full_optimize()
     _test_world_direction_without_group_layout()
     _test_group_off_direction_failure_rolls_back()

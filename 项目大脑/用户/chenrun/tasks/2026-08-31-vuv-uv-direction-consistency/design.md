@@ -28,3 +28,12 @@
 - face-set 变化、已解析轴失效、方向超出 `3°` 或回放异常均视为事务失败并恢复源 UV。
 - 验证 180 度正反必须使用带字母、编号或箭头的方向棋盘格；纯双色棋盘格不足以
   证明方向一致。
+- 0.5.8 的 repeat-local signed semantic frame 只对 exact signature 且具有可靠
+  intrinsic landmark 的 `MIRROR / ROTATIONAL / REPEATED` 生效，并优先于全局
+  Object/World frame。写回只做整岛刚性旋转，不允许反射；条件不足时使用 global
+  fallback，不以近似轮廓强猜语义方向。
+- PCA 主轴和轮廓 heading 只属于 presentation metric；它们不提供稳定的有符号
+  landmark，不能单独参与 180 度方向门禁。报告必须区分 local effective audit 与
+  raw global metric，可靠局部覆盖下的全局 misaligned/quarter-turn 不计作有效错误。
+- 岛数优化服从 Unique 正确性：激进小岛参数如果残留 folded/degenerate chart，必须
+  回退到上一组通过门禁的保守参数；拓扑独立的单面 Mesh 组件不得用 UV 焊接伪造连续性。

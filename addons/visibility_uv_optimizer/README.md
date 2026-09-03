@@ -1,9 +1,12 @@
-# Visibility Aware UV Optimizer 0.5.7
+# Visibility Aware UV Optimizer 0.5.8
 
 Blender 3.3 through 5.2 add-on for visibility analysis and conservative UV
-generation. Version 0.5.6 adds a signed geometry-direction contract on top of
-the 0.5.5 topology-safe cleanup and structure-aware hard-surface layout while
-retaining the 0.5.3 Legacy Smart mode.
+generation. Version 0.5.8 extends the signed geometry-direction contract with
+strict planar U/V-frame repair, bounded small-island chains, and non-rotating
+variable-size source-cell packing while retaining the 0.5.3 Legacy Smart mode.
+For exact repeated hard-surface structures it can also use a repeat-local
+signed semantic frame; this is deliberately narrower than a global orientation
+rule and is not inferred from PCA alone.
 
 ## Install
 
@@ -144,16 +147,18 @@ unit. This is a rigid layout operation:
 - no repeated islands are stacked or intentionally overlapped; and
 - disconnected mesh parts are never welded into one UV island.
 
-For a hard-surface repeat, a directed landmark is used for the strict
-modulo-360 sign only when its line agrees with the island's PCA axis (or the
-longest reliable boundary edge) within `Directed Cardinal Tolerance` (3
-degrees by default). If any member of a connected repeat/owner-cohort
-component exceeds that residual, the entire component is explicitly downgraded
-to `center_symmetric_modulo_180` and aligned from geometric axes, keeping
-mirrored panels upright instead of leaving diagonal outliers. The analysis
-manifest records `orientation_policy`, `orientation_downgrades`, each affected
-member's `direction_mode`, and the measured residuals so an independent audit
-uses the same policy.
+The repeat-local signed semantic frame applies only to `MIRROR`, `ROTATIONAL`,
+or `REPEATED` relationships whose members have an exact signature and a
+reliable intrinsic landmark. When eligible, this local frame takes precedence
+over the global Object/World frame and aligns counterparts by rigid rotation
+only; it never reflects UV coordinates. If the exact-signature or landmark
+evidence is insufficient, the cohort uses the audited global fallback.
+
+PCA axes and contour headings are presentation metrics only. They can help
+describe whether a chart appears horizontal or vertical, but they do not
+define the signed semantic frame and cannot independently prove 180-degree
+texture direction. The manifest records both the local eligibility/result and
+the raw global metrics so the two contracts are not conflated.
 
 Mirror and rotational relationships are evidence for grouping and ordering,
 not permission to mirror the UV coordinates. Winding and the Unique
@@ -324,10 +329,19 @@ web dependency.
 
 ## Compatibility and validation scope
 
-Version 0.5.6 supports Blender 3.3 through 5.2. Release regression targets are
+Version 0.5.8 supports Blender 3.3 through 5.2. Release regression targets are
 Blender 3.3.5 and Blender 5.2.0 LTS. The structure-layout stage uses rigid UV
 transforms and deterministic disjoint-rectangle packing available to both
 versions; it does not rely on 5.x-only mirroring or overlap behavior.
+
+The focused direction regressions, complete 16-item release matrix, and strict
+smoke test from the unpacked ZIP pass on Blender 3.3.5 and 5.2.0 LTS. Version
+0.5.8 remains a controlled experimental release rather than a claim that every
+production asset will unwrap successfully. In the Blender 5.2 weapon scene,
+Body/Gun Head/Bullet produce
+`508 / 152 / 4` islands and `15.5157301% / 23.1494795% / 51.6135375%` polygon
+coverage, with zero overlap, degenerate, negative-winding, or planar-frame
+failures after reopening the saved file.
 
 Synthetic coverage includes marked/material/Sharp cuts, a capped cylinder, a
 long rail, hidden geometry, multiple UV layers, non-Unique preservation,

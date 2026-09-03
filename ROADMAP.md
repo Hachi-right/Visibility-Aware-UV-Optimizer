@@ -2,6 +2,13 @@
 
 路线图按“生产安全优先、质量指标可复现、失败结果可解释”的顺序排列。每项进入正式版本前，必须同时通过 Blender 3.3.5 与 5.2.0 LTS 回归，并更新安装包与 SHA-256。
 
+## P0: 完成 0.5.8 结构连续与完整方向验收（已完成）
+
+- 真实 Operator 场景已完成：Body `680 -> 508`、Gun Head `203 -> 152`、Bullet `4 -> 4`，覆盖率 `15.5157301% / 23.1494795% / 51.6135375%`；三个对象的 overlap、degenerate、negative、planar-frame failure 均为 0，保存重开审计通过。
+- repeat-local signed semantic frame 已完成对象级审计：exact signature + reliable intrinsic landmark 才启用，24/59 组、48 成员 eligible，signed checker error groups 为 0；35 组回退全局合同。
+- 输出独立场景、方向棋盘格、对象级 UV 预览和 manifest；继续确认源场景、源 UV、拓扑、Seam 与材质保持不变。
+- Blender 3.3.5 / 5.2.0 的定向回归、完整 16 项矩阵和解压 ZIP strict smoke 均已通过；发布 ZIP 与 SHA-256 随最终文档重建收口。
+
 ## P0: 完成 0.5.7 布局验收（已完成）
 
 - 重新构建安装包，使方向一致性、长矩形竖向优先和利用率排布进入 ZIP。
@@ -42,3 +49,4 @@
 2. 两个 Blender 版本的三板斧通过：`py_compile`、相关回归、导入链验证。
 3. Unique 结果满足 0-1、finite、正 winding、零退化、零正面积重叠和 face-set 分区不变。
 4. 失败对象可复现地安全回滚，并在报告中说明原因；不能以“未崩溃”代替质量验收。
+5. repeat-local 方向结果必须区分 local effective audit 与 raw global metric；后者被可靠局部语义帧覆盖时不能误报为有效方向错误。

@@ -99,6 +99,19 @@ class VUV_PT_MainPanel(bpy.types.Panel):
             direction.prop(settings, "uv_direction_auto_priority")
             direction.prop(settings, "uv_direction_auto_cardinal_bias")
             direction.prop(settings, "uv_direction_auto_cardinal_min_confidence")
+            direction.prop(settings, "uv_repeat_local_frame")
+            direction.prop(settings, "uv_align_geometry_frame")
+            frame = direction.column(align=True)
+            frame.enabled = settings.uv_align_geometry_frame
+            frame.prop(settings, "uv_use_geometry_frame_rotation")
+            frame.prop(settings, "uv_cohere_geometry_angle_groups")
+            frame.prop(settings, "uv_strict_geometry_frame_quality")
+            strict_frame = frame.column(align=True)
+            strict_frame.enabled = settings.uv_strict_geometry_frame_quality
+            strict_frame.prop(settings, "uv_strict_geometry_frame_planar_only")
+            row = strict_frame.row(align=True)
+            row.prop(settings, "uv_strict_geometry_frame_planar_tolerance")
+            row.prop(settings, "uv_strict_geometry_frame_residual_tolerance")
             box.prop(settings, "hard_surface_hidden_collapse")
         if settings.initial_uv_mode != 'PRESERVE_LAYOUT':
             box.prop(settings, "smart_angle")
@@ -129,6 +142,9 @@ class VUV_PT_MainPanel(bpy.types.Panel):
                 cleanup = box.column(align=True)
                 cleanup.enabled = settings.small_cleanup_enabled
                 row = cleanup.row(align=True)
+                row.prop(settings, "small_cleanup_tests")
+                row.prop(settings, "small_cleanup_max_merges")
+                row = cleanup.row(align=True)
                 row.prop(settings, "small_island_faces")
                 row.prop(settings, "small_boundary_ratio")
                 row = cleanup.row(align=True)
@@ -137,6 +153,18 @@ class VUV_PT_MainPanel(bpy.types.Panel):
                 row = cleanup.row(align=True)
                 row.prop(settings, "small_cleanup_p95")
                 row.prop(settings, "small_cleanup_max_stretch")
+                cleanup.prop(settings, "small_target_area_multiplier")
+                cleanup.prop(settings, "small_structural_cleanup_enabled")
+                structural = cleanup.column(align=True)
+                structural.enabled = settings.small_structural_cleanup_enabled
+                row = structural.row(align=True)
+                row.prop(settings, "small_structural_boundary_ratio")
+                row.prop(settings, "small_structural_angle")
+                structural.prop(settings, "small_structural_max_merges")
+                row = structural.row(align=True)
+                row.prop(settings, "small_chain_max_faces")
+                row.prop(settings, "small_chain_max_absorptions")
+                structural.prop(settings, "small_chain_max_diameter_ratio")
 
                 box.separator()
                 box.label(text="Structure Layout / 结构排布")
@@ -159,6 +187,17 @@ class VUV_PT_MainPanel(bpy.types.Panel):
                 domain.enabled = settings.uv_cohere_auto_geometry_axis
                 domain.prop(settings, "uv_geometry_axis_consensus_min_tangent")
                 domain.prop(settings, "uv_geometry_axis_consensus_min_confidence")
+                grouping.prop(settings, "uv_preserve_source_layout")
+                source = grouping.column(align=True)
+                source.enabled = settings.uv_preserve_source_layout
+                source.prop(settings, "uv_source_layout_cell_enabled")
+                cell = source.column(align=True)
+                cell.enabled = settings.uv_source_layout_cell_enabled
+                cell.prop(settings, "uv_source_layout_compact_cells")
+                row = cell.row(align=True)
+                row.prop(settings, "uv_source_layout_cell_max_members")
+                row.prop(settings, "uv_source_layout_cell_diameter_ratio")
+                cell.prop(settings, "uv_source_layout_cell_link_radius_ratio")
             box.prop(settings, "preserve_seams")
             box.prop(settings, "respect_materials")
             box.prop(settings, "respect_sharp")

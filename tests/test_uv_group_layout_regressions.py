@@ -872,7 +872,10 @@ def _test_directed_u_repeats_use_360_orientation():
     uv_a = _transformed_uv(shape, 0.12, (0.05, 0.05))
     uv_b = _transformed_uv(shape, 0.12, (0.55, 0.05), math.pi)
     obj, mesh = _polygon_object("VUV_Directed_U", (model_a, model_b), (uv_a, uv_b))
-    options = VUV.GroupLayoutOptions(allow_group_quarter_turn=True)
+    options = VUV.GroupLayoutOptions(
+        allow_group_quarter_turn=True,
+        align_repeat_local_frame=True,
+    )
     try:
         before = VUV.analyze_active_uv(obj, options)
         assert len(before.islands) == 2
@@ -886,7 +889,12 @@ def _test_directed_u_repeats_use_360_orientation():
         )
         assert abs(abs(before_delta) - math.pi) < 1.0e-6, before_delta
 
-        VUV.layout_active_uv(obj, options)
+        result = VUV.layout_active_uv(obj, options)
+        assert result.after_audit["valid"]
+        assert not result.after_audit["overlap"]
+        assert result.after_audit["negative"] == 0
+        assert result.analysis.face_to_island == before.face_to_island
+        assert result.quality_metrics["repeat_local_frame_valid"]
         after = VUV.analyze_active_uv(obj, options)
         assert all(
             island.direction_confidence >= options.min_direction_confidence
@@ -2606,6 +2614,180 @@ def _analysis(islands, repeat_groups=(), layout_groups=()):
     )
 
 
+def _test_source_cells_use_compact_soft_ordering():
+    islands = tuple(
+        _island(
+            island_id,
+            (float(island_id), 0.0, 0.0,
+             float(island_id) + 0.5, 0.5, 0.1),
+        )
+        for island_id in range(4)
+    )
+    groups = tuple(
+        VUV.LayoutGroup(
+            group_id=island_id,
+            member_ids=(island_id,),
+            reason="SINGLE_ANCHOR",
+            anchor_ids=(island_id,),
+        )
+        for island_id in range(4)
+    )
+    analysis = _analysis(islands, layout_groups=groups)
+    oriented = {
+        island_id: {
+            loop_index: point + Vector((float(island_id) * 5.0, 0.0))
+            for loop_index, point in _rectangle(
+                island_id * 10, 0.8, 0.5
+            ).items()
+        }
+        for island_id in range(4)
+    }
+    common = dict(
+        source_layout_cell_enabled=True,
+        source_layout_cell_max_members=2,
+        source_layout_cell_diameter_ratio=0.01,
+        source_layout_cell_link_radius_ratio=0.01,
+        square_pack_bias=0.35,
+    )
+    legacy = VUV._pack_source_cell_layout_once(
+        oriented,
+        analysis,
+        0.05,
+        VUV.GroupLayoutOptions(
+            source_layout_compact_cells=False,
+            **common
+        ),
+    )
+    compact = VUV._pack_source_cell_layout_once(
+        oriented,
+        analysis,
+        0.05,
+        VUV.GroupLayoutOptions(
+            source_layout_compact_cells=True,
+            **common
+        ),
+    )
+    assert compact.strategy == "source_cell_compact_layout", compact.strategy
+    assert max(compact.width, compact.height) < max(
+        legacy.width, legacy.height
+    ) * 0.5, (compact.width, compact.height, legacy.width, legacy.height)
+    for island_id, source in oriented.items():
+        before = source[max(source)] - source[min(source)]
+        after_values = compact.coordinates[island_id]
+        after = after_values[max(after_values)] - after_values[min(after_values)]
+        assert (before - after).length <= 1.0e-6, (island_id, before, after)
+
+
+def _test_source_cell_variable_shelf_preserves_order_and_density():
+    gap = 0.1
+    sizes = {
+        0: (1.0, 4.0),
+        1: (1.0, 4.0),
+        2: (1.0, 4.0),
+        3: (6.0, 1.0),
+        4: (6.0, 1.0),
+    }
+    members = tuple(sizes)
+    local_coordinates = {
+        island_id: _rectangle(island_id * 10, width, height)
+        for island_id, (width, height) in sizes.items()
+    }
+    source_centers = {
+        island_id: Vector((float(island_id), 0.0))
+        for island_id in members
+    }
+    edges = tuple(
+        (0, 0.0, left, left + 1)
+        for left in range(len(members) - 1)
+    )
+    rectangles = tuple(
+        VUV._Rect(
+            key=island_id,
+            width=sizes[island_id][0],
+            height=sizes[island_id][1],
+            sort_rank=island_id,
+        )
+        for island_id in members
+    )
+    _grid, grid_width, grid_height = VUV._regular_grid_rack(
+        rectangles, gap
+    )
+    rack, width, height = VUV._source_cell_rack(
+        members,
+        local_coordinates,
+        sizes,
+        source_centers,
+        edges,
+        gap,
+        0.01,
+    )
+
+    grid_longest = max(grid_width, grid_height)
+    packed_longest = max(width, height)
+    assert packed_longest < grid_longest * 0.6, (
+        width, height, grid_width, grid_height
+    )
+    assert width * height < grid_width * grid_height * 0.5, (
+        width, height, grid_width, grid_height
+    )
+    assert 1.0 / packed_longest > 1.0 / grid_longest, (
+        packed_longest, grid_longest
+    )
+    ordered_placements = tuple(sorted(
+        rack,
+        key=lambda island_id: (
+            round(float(rack[island_id].y), 9),
+            round(float(rack[island_id].x), 9),
+        ),
+    ))
+    assert ordered_placements == members, ordered_placements
+    for island_id, placement in rack.items():
+        expected_width, expected_height = sizes[island_id]
+        assert not placement.quarter_turn, (island_id, placement)
+        assert abs(placement.width - expected_width) <= 1.0e-12
+        assert abs(placement.height - expected_height) <= 1.0e-12
+    placements = tuple(rack.values())
+    for left_index, left in enumerate(placements):
+        for right in placements[left_index + 1:]:
+            assert VUV._placements_clear(left, right, gap), rack
+
+
+def _test_source_cell_variable_shelf_respects_density_floor():
+    sizes = {0: (2.0, 1.0), 1: (2.0, 1.0)}
+    members = tuple(sizes)
+    local_coordinates = {
+        island_id: _rectangle(island_id * 10, width, height)
+        for island_id, (width, height) in sizes.items()
+    }
+    source_centers = {
+        island_id: Vector((float(island_id), 0.0))
+        for island_id in members
+    }
+    original_shelf = VUV._best_shelf_pack
+
+    def expanded_shelf(*_args, **_kwargs):
+        return ({
+            0: VUV._Placement(0.0, 0.0, 2.0, 1.0, False),
+            1: VUV._Placement(0.0, 1.1, 2.0, 1.0, False),
+        }, 2.0, 20.0)
+
+    VUV._best_shelf_pack = expanded_shelf
+    try:
+        rack, width, height = VUV._source_cell_rack(
+            members,
+            local_coordinates,
+            sizes,
+            source_centers,
+            (),
+            0.1,
+            0.01,
+        )
+    finally:
+        VUV._best_shelf_pack = original_shelf
+    assert max(width, height) < 20.0, (width, height)
+    assert all(not placement.quarter_turn for placement in rack.values())
+
+
 def _test_non_repeat_cardinal_switch():
     angle_30 = math.radians(30.0)
     non_repeat = _island(
@@ -4059,6 +4241,106 @@ def _test_geometry_cohort_rejects_real_turn_or_axis_mix():
     assert not VUV._geometry_angle_cohorts(analysis, settings)
 
 
+def _repeat_local_stub(island_id, local_angle, global_rotation):
+    island = _island(
+        island_id,
+        (float(island_id) * 2.0, 0.0, 0.0,
+         float(island_id) * 2.0 + 1.0, 1.0, 0.1),
+        principal_angle=local_angle,
+        direction_angle=local_angle,
+        direction_confidence=0.95,
+    )
+    island.geometry_signature = "repeat-local-shape"
+    island.geometry_axis_name = "Y"
+    island.geometry_direction_vector = Vector((0.0, 1.0))
+    island.geometry_direction_confidence = 0.95
+    island.geometry_rotation_angle = global_rotation
+    return island
+
+
+def _assert_repeat_local_signed_frame(relation):
+    source_angles = (math.radians(25.0), math.radians(-55.0))
+    islands = tuple(
+        _repeat_local_stub(index, angle, 0.0)
+        for index, angle in enumerate(source_angles)
+    )
+    repeat = VUV.RepeatGroup(
+        0, (0, 1), relation, 0.99, "repeat-local-shape"
+    )
+    analysis = _analysis(islands, (repeat,))
+    settings = VUV.GroupLayoutOptions(
+        align_geometry_direction=True,
+        align_repeat_local_frame=True,
+    )
+    angles = VUV._orientation_angles(analysis, settings)
+    for island in islands:
+        # Intrinsic +V lands on UV +V for every repeated instance.  Its
+        # clockwise perpendicular lands on +U, so the local frame retains
+        # positive parity without a UV reflection.
+        source_angle = _direction_angle(island)
+        final_v = VUV._angle_wrap(source_angle + angles[island.island_id])
+        final_u = VUV._angle_wrap(
+            source_angle - math.pi * 0.5 + angles[island.island_id]
+        )
+        assert abs(VUV._angle_wrap(final_v - math.pi * 0.5)) < 1.0e-7
+        assert abs(final_u) < 1.0e-7
+        assert island.face_indices == (island.island_id,)
+        source = Vector((0.37, -0.22))
+        rotated = VUV._rotate_point(
+            source, Vector((0.0, 0.0)), angles[island.island_id]
+        )
+        assert abs(rotated.length - source.length) < 1.0e-7
+    report = analysis.repeat_local_frame_metrics
+    assert report["applied_groups"] == 1
+    assert report["applied_member_ids"] == [0, 1]
+
+
+def _test_mirror_repeat_uses_local_signed_frame():
+    _assert_repeat_local_signed_frame("MIRROR")
+
+
+def _test_rotational_repeat_uses_local_signed_frame():
+    _assert_repeat_local_signed_frame("ROTATIONAL")
+
+
+def _test_generic_repeat_uses_local_signed_frame():
+    _assert_repeat_local_signed_frame("REPEATED")
+
+
+def _test_repeat_local_priority_and_global_fallback_are_explicit():
+    local = _repeat_local_stub(0, math.pi * 0.5, 0.0)
+    peer = _repeat_local_stub(1, math.pi * 0.5, 0.0)
+    repeat = VUV.RepeatGroup(
+        0, (0, 1), "MIRROR", 0.99, "repeat-local-shape"
+    )
+    settings = VUV.GroupLayoutOptions(
+        align_geometry_direction=True,
+        align_repeat_local_frame=True,
+    )
+    analysis = _analysis((local, peer), (repeat,))
+    local_metrics = VUV._repeat_local_frame_metrics(analysis, settings)
+    effective = VUV._effective_direction_contract({
+        "misaligned_ids": [0, 1],
+        "required_unresolved_ids": [],
+        "unresolved_ids": [],
+    }, local_metrics)
+    assert local_metrics["valid"]
+    assert local_metrics["priority"] == (
+        "repeat_local_then_global_axis_fallback"
+    )
+    assert effective["global_axis_overridden_ids"] == [0, 1]
+    assert effective["effective_misaligned_ids"] == []
+
+    peer.direction_confidence = 0.0
+    fallback_analysis = _analysis((local, peer), (repeat,))
+    angles = VUV._orientation_angles(fallback_analysis, settings)
+    assert angles[0] == local.geometry_rotation_angle
+    assert angles[1] == peer.geometry_rotation_angle
+    assert fallback_analysis.repeat_local_frame_metrics[
+        "applied_member_ids"
+    ] == []
+
+
 def _test_common_axis_cardinal_preference_is_bounded():
     """A straighter shared long edge may win only inside explicit gates."""
 
@@ -4191,6 +4473,9 @@ _test_structure_group_splits_incompatible_auto_axes_deterministically()
 _test_geometry_direction_is_scale_invariant_for_tiny_islands()
 _test_direction_resolution_gate_distinguishes_auto_and_explicit_axis()
 _test_replay_identity_includes_unresolved_explicit_axis_islands()
+_test_source_cells_use_compact_soft_ordering()
+_test_source_cell_variable_shelf_preserves_order_and_density()
+_test_source_cell_variable_shelf_respects_density_floor()
 _test_margin_correction_with_one_iteration()
 _test_loose_vertex_does_not_change_radius()
 _test_area_aware_quality_metrics_use_polygon_area()
@@ -4199,5 +4484,9 @@ _test_area_score_falls_back_without_small_islands()
 _test_area_score_balances_aabb_fill_and_coverage()
 _test_same_axis_geometry_cohort_uses_stable_common_angle()
 _test_geometry_cohort_rejects_real_turn_or_axis_mix()
+_test_mirror_repeat_uses_local_signed_frame()
+_test_rotational_repeat_uses_local_signed_frame()
+_test_generic_repeat_uses_local_signed_frame()
+_test_repeat_local_priority_and_global_fallback_are_explicit()
 _test_common_axis_cardinal_preference_is_bounded()
 print("VUV_GROUP_LAYOUT_REGRESSION_OK")

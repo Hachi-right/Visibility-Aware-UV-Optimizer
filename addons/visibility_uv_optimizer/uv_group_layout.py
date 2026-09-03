@@ -80,6 +80,9 @@ _GEOMETRY_FRAME_MIN_PARITY_CONFIDENCE = 0.75
 # single-axis +V correction.
 _GEOMETRY_FRAME_ROBUST_TRIM_ANGLE = math.radians(35.0)
 _GEOMETRY_FRAME_MIN_INLIER_WEIGHT = 0.60
+_REPEAT_LOCAL_FRAME_RELATIONS = frozenset({
+    "MIRROR", "ROTATIONAL", "REPEATED",
+})
 _TAU = math.pi * 2.0
 _AFFINITY_SEARCH_POLICIES = (
     (4, 96, 25000),
@@ -193,12 +196,29 @@ class GroupLayoutOptions:
     # is translation/scale only.  This mirrors Blender's Geometry alignment
     # semantics without depending on the operator added after Blender 3.3.
     align_geometry_direction: bool = True
+    # Exact repeated parts may use an intrinsic landmark as their signed
+    # texture-up axis.  This contract is intentionally opt-in at the API
+    # layer: add-on settings enable it for the hard-surface workflow, while
+    # older scripted callers retain the object-axis behavior.  Eligible
+    # repeat-local frames take priority over the global object/world axis;
+    # unsupported or ambiguous groups fall back to that global contract.
+    align_repeat_local_frame: bool = False
     direction_space: str = "OBJECT"
     direction_axis: str = "AUTO"
     # AUTO is a strict signed contract.  The default preserves the historical
     # Z -> X -> Y behavior; elongated weapon bodies can opt into Y -> Z -> X
     # without changing the explicit ``direction_axis`` contract.
     direction_auto_priority: str = "ZXY"
+    # A successful AUTO layout stores its resolved axis, coordinate space,
+    # and priority on the mesh.  Reuse that snapshot after save/reopen unless
+    # the caller knows the artist explicitly changed a direction control.
+    # Blender integration maps ``is_property_set`` to this switch; direct API
+    # callers can set this false to force a fresh contract.
+    restore_persisted_direction_contract: bool = True
+    # Blender's ``is_property_set`` is persistent across save/reopen.  Track
+    # that separately: an explicit setting only overrides a saved contract
+    # when their signatures differ; an exact match remains replayable.
+    direction_contract_settings_explicit: bool = False
     # Optional hard-surface AUTO resolver bias.  A positive value lets a
     # candidate model axis win when its rigid +V correction also leaves the
     # chart's dominant long edge horizontal/vertical.  Zero preserves the
@@ -255,6 +275,14 @@ class GroupLayoutOptions:
     # older callers measured the frame only as a diagnostic and wrote the
     # single-axis correction for every chart.
     use_geometry_frame_rotation: bool = False
+    # Optional hard-surface acceptance gate for checker orientation.  The
+    # historical single-axis contract remains available when this is false.
+    # When enabled, planar charts may not silently fall back from the complete
+    # signed U/V frame or exceed the configured residual tolerance.
+    strict_geometry_frame_quality: bool = False
+    strict_geometry_frame_planar_only: bool = True
+    strict_geometry_frame_planar_tolerance: float = math.radians(5.0)
+    strict_geometry_frame_residual_tolerance: float = math.radians(3.0)
     # Sharing one correction across a near-aligned topology/repeat cohort can
     # leave every member a few degrees away from its signed Geometry contract.
     # Keep exact per-island direction by default; legacy callers may opt in to
@@ -287,6 +315,11 @@ class GroupLayoutOptions:
     # in source-UV space so a semantic chain cannot pull distant regions into
     # one giant block (the failure mode of the old macro packer).
     source_layout_cell_enabled: bool = True
+    # Treat source rows as a soft ordering cue after local cells are built.
+    # Compact packing removes atlas-wide whitespace while each cell remains a
+    # translation-only block, so checker direction and local structure stay
+    # intact.  Disable this to retain the older source-position repair path.
+    source_layout_compact_cells: bool = True
     source_layout_cell_max_members: int = 12
     source_layout_cell_diameter_ratio: float = 0.16
     source_layout_cell_link_radius_ratio: float = 0.12
@@ -448,6 +481,26 @@ class GroupLayoutOptions:
         ):
             raise ValueError(
                 "direction_residual_tolerance must be finite and in [0, pi]"
+            )
+        if (
+            not math.isfinite(float(self.strict_geometry_frame_planar_tolerance))
+            or not 0.0
+            <= float(self.strict_geometry_frame_planar_tolerance)
+            <= math.pi * 0.5
+        ):
+            raise ValueError(
+                "strict_geometry_frame_planar_tolerance must be finite and "
+                "in [0, pi/2]"
+            )
+        if (
+            not math.isfinite(float(self.strict_geometry_frame_residual_tolerance))
+            or not 0.0
+            <= float(self.strict_geometry_frame_residual_tolerance)
+            <= math.pi
+        ):
+            raise ValueError(
+                "strict_geometry_frame_residual_tolerance must be finite and "
+                "in [0, pi]"
             )
         if (
             not math.isfinite(float(self.source_layout_row_quantum))
@@ -870,6 +923,9 @@ class UVLayoutAnalysis:
     geometry_long_edge_metrics: Mapping[str, Any] = field(
         default_factory=dict
     )
+    repeat_local_frame_metrics: Mapping[str, Any] = field(
+        default_factory=dict
+    )
 
     def to_dict(self, include_islands: bool = True) -> Dict[str, Any]:
         payload = {
@@ -894,6 +950,9 @@ class UVLayoutAnalysis:
             ],
             "geometry_long_edge_metrics": dict(
                 self.geometry_long_edge_metrics
+            ),
+            "repeat_local_frame_metrics": dict(
+                self.repeat_local_frame_metrics
             ),
             "orientation_downgrades": [
                 dict(item) for item in self.orientation_downgrades
@@ -1411,6 +1470,52 @@ def _face_set_contract_key(face_indices: Sequence[int]) -> str:
     return ",".join(str(int(index)) for index in sorted(face_indices))
 
 
+def _validated_geometry_axis_contract_payload(
+    mesh: Any,
+    uv_layer: Any,
+) -> Optional[Mapping[str, Any]]:
+    """Read contract metadata that is valid for this mesh and UV layer."""
+
+    layer_name = getattr(uv_layer, "name", None)
+    if not layer_name:
+        return None
+    try:
+        raw = mesh.get(_geometry_axis_contract_key(str(layer_name)))
+    except (AttributeError, KeyError, RuntimeError, TypeError):
+        return None
+    if raw in (None, ""):
+        return None
+    try:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        payload = json.loads(str(raw))
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    try:
+        payload_version = int(payload.get("version", -1))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if payload_version != _GEOMETRY_AXIS_CONTRACT_VERSION:
+        return None
+    if str(payload.get("layer", "")) != str(layer_name):
+        return None
+    if str(payload.get("topology", "")) != _mesh_topology_contract(mesh):
+        return None
+    try:
+        _normalize_direction_auto_priority(
+            payload.get("auto_priority", "".join(_DEFAULT_DIRECTION_AUTO_PRIORITY))
+        )
+    except (TypeError, ValueError):
+        return None
+    if str(payload.get("space", "")).upper() not in {"OBJECT", "WORLD"}:
+        return None
+    if not isinstance(payload.get("faces"), Mapping):
+        return None
+    return payload
+
+
 def _load_geometry_axis_contract(
     mesh: Any,
     uv_layer: Any,
@@ -1426,61 +1531,35 @@ def _load_geometry_axis_contract(
     if (
         not settings.align_geometry_direction
         or str(settings.direction_axis).upper() != "AUTO"
+        or not bool(settings.restore_persisted_direction_contract)
     ):
         return {}
-    layer_name = getattr(uv_layer, "name", None)
-    if not layer_name:
+    payload = _validated_geometry_axis_contract_payload(mesh, uv_layer)
+    if payload is None:
         return {}
-    try:
-        raw = mesh.get(_geometry_axis_contract_key(str(layer_name)))
-    except (AttributeError, KeyError, RuntimeError, TypeError):
-        return {}
-    if raw in (None, ""):
-        return {}
-    try:
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8")
-        payload = json.loads(str(raw))
-    except (TypeError, ValueError, UnicodeError):
-        return {}
-    if not isinstance(payload, Mapping):
-        return {}
-    try:
-        payload_version = int(payload.get("version", -1))
-    except (TypeError, ValueError, OverflowError):
-        # A user-edited or legacy ID property must never make UV analysis
-        # fail.  Treat malformed metadata as an absent contract.
-        return {}
-    if payload_version != _GEOMETRY_AXIS_CONTRACT_VERSION:
-        return {}
-    if str(payload.get("layer", "")) != str(layer_name):
-        return {}
-    if str(payload.get("topology", "")) != _mesh_topology_contract(mesh):
-        return {}
-    # Contracts capture the resolver order as well as the selected axis.  A
-    # contract written with a different AUTO priority is not safe to replay:
-    # the selected fallback may have been intentional for that layout.
-    try:
-        requested_priority = _normalize_direction_auto_priority(
-            getattr(settings, "direction_auto_priority", None)
-        )
-        payload_priority = _normalize_direction_auto_priority(
-            payload.get("auto_priority", "".join(_DEFAULT_DIRECTION_AUTO_PRIORITY))
-        )
-    except (TypeError, ValueError):
-        return {}
-    if payload_priority != requested_priority:
-        return {}
+    # ``is_property_set`` is persistent RNA state rather than a one-shot
+    # change event.  An explicit PropertyGroup must therefore still reuse a
+    # contract whose signature exactly matches after save/reopen.  A mismatch
+    # blocks replay only when the caller marked the settings as explicit;
+    # unset/default UI properties retain generated-file auto restoration.
     contract_space = str(payload.get("space", "")).upper()
+    payload_priority = _normalize_direction_auto_priority(
+        payload.get("auto_priority", "".join(_DEFAULT_DIRECTION_AUTO_PRIORITY))
+    )
     requested_space = str(settings.direction_space).upper()
+    requested_priority = _normalize_direction_auto_priority(
+        getattr(settings, "direction_auto_priority", None)
+    )
+    signature_matches = bool(
+        contract_space == requested_space
+        and payload_priority == requested_priority
+    )
     if (
-        contract_space not in {"OBJECT", "WORLD"}
-        or contract_space != requested_space
+        bool(settings.direction_contract_settings_explicit)
+        and not signature_matches
     ):
         return {}
     entries = payload.get("faces")
-    if not isinstance(entries, Mapping):
-        return {}
     result: Dict[Tuple[int, ...], Tuple[Optional[str], str]] = {}
     for raw_faces, raw_axis in entries.items():
         try:
@@ -1532,13 +1611,42 @@ def _persist_geometry_axis_contract(
         for island in analysis.islands
         if island.face_indices
     }
+    contract_space = str(settings.direction_space).upper()
+    contract_priority = _normalize_direction_auto_priority(
+        getattr(settings, "direction_auto_priority", None)
+    )
+    # When a saved contract was automatically restored under untouched UI
+    # defaults, keep its metadata as well as its per-island axes.  Otherwise a
+    # successful replay would immediately overwrite WORLD/YZX with the scene's
+    # OBJECT/ZXY defaults and the next run would lose the intended heading.
+    previous_payload = None
+    previous_contract: Mapping[Tuple[int, ...], Tuple[Optional[str], str]] = {}
+    if bool(settings.restore_persisted_direction_contract):
+        previous_payload = _validated_geometry_axis_contract_payload(
+            mesh, uv_layer
+        )
+        previous_contract = _load_geometry_axis_contract(
+            mesh, uv_layer, settings
+        )
+    current_face_sets = {
+        tuple(sorted(int(index) for index in island.face_indices))
+        for island in analysis.islands
+        if island.face_indices
+    }
+    if (
+        previous_payload is not None
+        and previous_contract
+        and set(previous_contract) == current_face_sets
+    ):
+        contract_space = str(previous_payload.get("space", contract_space)).upper()
+        contract_priority = _normalize_direction_auto_priority(
+            previous_payload.get("auto_priority", contract_priority)
+        )
     payload = {
         "version": _GEOMETRY_AXIS_CONTRACT_VERSION,
         "layer": str(layer_name),
-        "space": str(settings.direction_space).upper(),
-        "auto_priority": "".join(_normalize_direction_auto_priority(
-            getattr(settings, "direction_auto_priority", None)
-        )),
+        "space": contract_space,
+        "auto_priority": "".join(contract_priority),
         "topology": topology,
         "faces": entries,
     }
@@ -7436,6 +7544,272 @@ def _geometry_frame_is_reliable(
     )
 
 
+def _eligible_repeat_local_frame_groups(
+    analysis: UVLayoutAnalysis,
+    settings: GroupLayoutOptions,
+) -> Tuple[Tuple[RepeatGroup, Tuple[IslandRecord, ...]], ...]:
+    """Return exact repeats with one stable intrinsic signed landmark each.
+
+    ``geometry_signature`` and landmark salience are invariant to rigid model
+    transforms and reflection.  Mapping each member's landmark to UV ``+V``
+    therefore gives repeated mechanical parts a common local checker frame.
+    The perpendicular local ``+U`` is defined clockwise from ``+V``; a rigid
+    UV rotation preserves that positive parity and never mirrors a chart.
+    """
+
+    if not (
+        settings.align_geometry_direction
+        and settings.align_repeat_local_frame
+    ):
+        return ()
+    by_id = {int(island.island_id): island for island in analysis.islands}
+    result = []
+    claimed = set()
+    for group in sorted(
+        analysis.repeat_groups,
+        key=lambda item: (int(item.group_id), tuple(item.member_ids)),
+    ):
+        if str(group.relation).upper() not in _REPEAT_LOCAL_FRAME_RELATIONS:
+            continue
+        members = tuple(
+            by_id.get(int(island_id)) for island_id in group.member_ids
+        )
+        if (
+            len(members) < 2
+            or any(island is None for island in members)
+            or any(int(island.island_id) in claimed for island in members)
+            or any(
+                str(island.geometry_signature) != str(group.signature)
+                for island in members
+            )
+            or not all(_direction_is_reliable(island, settings) for island in members)
+        ):
+            continue
+        typed_members = tuple(members)
+        result.append((group, typed_members))
+        claimed.update(int(island.island_id) for island in typed_members)
+    return tuple(result)
+
+
+def _repeat_local_frame_metrics(
+    analysis: UVLayoutAnalysis,
+    settings: GroupLayoutOptions,
+    mesh: Any = None,
+    uv_layer: Any = None,
+) -> Mapping[str, Any]:
+    """Audit the intrinsic signed checker frame without using PCA heading."""
+
+    enabled = bool(
+        settings.align_geometry_direction
+        and settings.align_repeat_local_frame
+    )
+    tolerance = abs(float(settings.direction_residual_tolerance))
+    eligible = _eligible_repeat_local_frame_groups(analysis, settings)
+    eligible_group_ids = []
+    eligible_member_ids = []
+    invalid_ids = []
+    global_conflict_ids = []
+    residuals = []
+    details = []
+    for group, members in eligible:
+        group_residuals = {}
+        group_conflicts = []
+        for island in members:
+            island_id = int(island.island_id)
+            direction = island.direction_vector
+            confidence = float(island.direction_confidence)
+            if mesh is not None and uv_layer is not None:
+                local_weighted = Vector((0.0, 0.0, 0.0))
+                for face_index in island.face_indices:
+                    polygon = mesh.polygons[int(face_index)]
+                    local_weighted += polygon.center * max(
+                        float(polygon.area), _EPSILON
+                    )
+                local_centroid = local_weighted / max(
+                    float(island.area_3d), _EPSILON
+                )
+                uv_points = [
+                    uv_layer.data[int(loop_index)].uv.copy()
+                    for loop_index in island.loop_indices
+                ]
+                uv_centroid = sum(
+                    uv_points, Vector((0.0, 0.0))
+                ) / max(len(uv_points), 1)
+                uv_bounds = _uv_bounds(uv_points)
+                uv_extent = max(
+                    uv_bounds[2] - uv_bounds[0],
+                    uv_bounds[3] - uv_bounds[1],
+                    _EPSILON,
+                )
+                direction, confidence, _landmark = _landmark_direction(
+                    mesh,
+                    uv_layer,
+                    island.loop_indices,
+                    island.vertex_indices,
+                    island.edge_indices,
+                    local_centroid,
+                    uv_centroid,
+                    island.area_3d,
+                    uv_extent,
+                )
+            if (
+                confidence + _EPSILON < settings.min_direction_confidence
+                or direction.length_squared <= _EPSILON
+            ):
+                invalid_ids.append(island_id)
+                group_residuals[str(island_id)] = None
+                continue
+            direction_angle = math.atan2(
+                float(direction.y),
+                float(direction.x),
+            )
+            residual = abs(_angle_wrap(math.pi * 0.5 - direction_angle))
+            residuals.append(residual)
+            group_residuals[str(island_id)] = round(
+                math.degrees(residual), 6
+            )
+            if residual > tolerance + _EPSILON:
+                invalid_ids.append(island_id)
+            if (
+                _geometry_direction_is_reliable(island, settings)
+                and abs(float(island.geometry_rotation_angle))
+                > tolerance + _EPSILON
+            ):
+                global_conflict_ids.append(island_id)
+                group_conflicts.append(island_id)
+        eligible_group_ids.append(int(group.group_id))
+        eligible_member_ids.extend(int(item.island_id) for item in members)
+        details.append({
+            "group_id": int(group.group_id),
+            "relation": str(group.relation).upper(),
+            "signature": str(group.signature),
+            "members": [int(item.island_id) for item in members],
+            "residual_degrees": group_residuals,
+            "global_axis_conflict_ids": sorted(set(group_conflicts)),
+        })
+    supported_groups = [
+        group for group in analysis.repeat_groups
+        if str(group.relation).upper() in _REPEAT_LOCAL_FRAME_RELATIONS
+    ]
+    return {
+        "enabled": enabled,
+        "priority": "repeat_local_then_global_axis_fallback",
+        "semantic_v": "intrinsic_landmark_to_uv_positive_v",
+        "semantic_u": "clockwise_perpendicular_positive_parity",
+        "rigid_rotation_only": True,
+        "supported_relations": sorted(_REPEAT_LOCAL_FRAME_RELATIONS),
+        "supported_groups": len(supported_groups),
+        "eligible_groups": len(eligible_group_ids),
+        "fallback_groups": max(len(supported_groups) - len(eligible_group_ids), 0),
+        "eligible_group_ids": eligible_group_ids,
+        "eligible_member_ids": sorted(set(eligible_member_ids)),
+        "invalid_member_ids": sorted(set(invalid_ids)),
+        "global_axis_conflict_ids": sorted(set(global_conflict_ids)),
+        "residual_p95_degrees": math.degrees(_quantile(residuals, 0.95)),
+        "residual_max_degrees": math.degrees(max(residuals, default=0.0)),
+        "valid": bool(not enabled or not invalid_ids),
+        "groups": details,
+    }
+
+
+def _effective_direction_contract(
+    direction_metrics: Mapping[str, Any],
+    repeat_local_metrics: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Resolve local-vs-global precedence into one auditable error set."""
+
+    local_ids = {
+        int(value)
+        for value in repeat_local_metrics.get("eligible_member_ids", ())
+    }
+    local_invalid = {
+        int(value)
+        for value in repeat_local_metrics.get("invalid_member_ids", ())
+    }
+    global_misaligned = {
+        int(value) for value in direction_metrics.get("misaligned_ids", ())
+    }
+    global_required_unresolved = {
+        int(value)
+        for value in direction_metrics.get("required_unresolved_ids", ())
+    }
+    global_unresolved = {
+        int(value) for value in direction_metrics.get("unresolved_ids", ())
+    }
+    return {
+        "repeat_local_member_ids": sorted(local_ids),
+        "global_axis_overridden_ids": sorted(
+            local_ids & (
+                global_misaligned
+                | global_required_unresolved
+                | global_unresolved
+            )
+        ),
+        "effective_misaligned_ids": sorted(
+            (global_misaligned - local_ids) | local_invalid
+        ),
+        "effective_required_unresolved_ids": sorted(
+            global_required_unresolved - local_ids
+        ),
+        "effective_unresolved_ids": sorted(global_unresolved - local_ids),
+    }
+
+
+def _repeat_local_orientation_overrides(
+    analysis: UVLayoutAnalysis,
+    settings: GroupLayoutOptions,
+    angles: Mapping[int, float],
+) -> Tuple[Dict[int, float], Set[int]]:
+    """Apply the repeat-local frame after global-axis orientation choices."""
+
+    result = {
+        int(island_id): _angle_wrap(float(angle))
+        for island_id, angle in angles.items()
+    }
+    overridden = set()
+    applied = []
+    tolerance = abs(float(settings.direction_residual_tolerance))
+    for group, members in _eligible_repeat_local_frame_groups(
+        analysis, settings
+    ):
+        conflicts = []
+        rotations = {}
+        for island in members:
+            island_id = int(island.island_id)
+            direction_angle = math.atan2(
+                float(island.direction_vector.y),
+                float(island.direction_vector.x),
+            )
+            rotation = _angle_wrap(math.pi * 0.5 - direction_angle)
+            base = result.get(island_id, 0.0)
+            if abs(_angle_wrap(rotation - base)) > tolerance + _EPSILON:
+                conflicts.append(island_id)
+            result[island_id] = rotation
+            overridden.add(island_id)
+            rotations[str(island_id)] = round(math.degrees(rotation), 6)
+            island.direction_mode = "repeat_local"
+        applied.append({
+            "group_id": int(group.group_id),
+            "relation": str(group.relation).upper(),
+            "signature": str(group.signature),
+            "members": [int(item.island_id) for item in members],
+            "rotations_degrees": rotations,
+            "global_axis_conflict_ids": sorted(set(conflicts)),
+        })
+    analysis.repeat_local_frame_metrics = {
+        "enabled": bool(
+            settings.align_geometry_direction
+            and settings.align_repeat_local_frame
+        ),
+        "priority": "repeat_local_then_global_axis_fallback",
+        "rigid_rotation_only": True,
+        "applied_groups": len(applied),
+        "applied_member_ids": sorted(overridden),
+        "groups": applied,
+    }
+    return result, overridden
+
+
 def _direction_reference_residual(
     island: IslandRecord,
     settings: GroupLayoutOptions,
@@ -7512,16 +7886,36 @@ def _apply_orientation_policy(
     """
 
     by_id = {island.island_id: island for island in analysis.islands}
+    repeat_local_groups = _eligible_repeat_local_frame_groups(
+        analysis, settings
+    )
+    repeat_local_ids = {
+        int(island.island_id)
+        for _group, members in repeat_local_groups
+        for island in members
+    }
     for island in analysis.islands:
         island.direction_mode = (
-            "directed"
+            "repeat_local"
+            if int(island.island_id) in repeat_local_ids
+            else "directed"
             if _direction_is_reliable(island, settings)
             else "center_symmetric"
         )
         island.direction_downgrade_reason = None
 
     downgrades: List[Mapping[str, Any]] = []
-    for member_ids in _orientation_components(analysis):
+    for component_ids in _orientation_components(analysis):
+        # An exact repeat-local landmark is the primary signed checker
+        # contract.  Do not erase it merely because it conflicts with an
+        # object/world cardinal axis; any remaining non-local members retain
+        # the historical global-axis policy.
+        member_ids = tuple(
+            island_id for island_id in component_ids
+            if int(island_id) not in repeat_local_ids
+        )
+        if len(member_ids) < 2:
+            continue
         policy, residuals = _component_direction_policy(
             member_ids,
             by_id,
@@ -7575,6 +7969,11 @@ def _apply_orientation_policy(
             else "disabled"
         ),
         "geometry_direction_axis": str(settings.direction_axis).upper(),
+        "repeat_local_frame": bool(settings.align_repeat_local_frame),
+        "repeat_local_priority": "repeat_local_then_global_axis_fallback",
+        "repeat_local_relations": sorted(_REPEAT_LOCAL_FRAME_RELATIONS),
+        "repeat_local_eligible_groups": len(repeat_local_groups),
+        "repeat_local_eligible_members": len(repeat_local_ids),
         "geometry_axis_auto_priority": list(_direction_axis_order(
             "AUTO", settings.direction_auto_priority
         )),
@@ -7733,6 +8132,16 @@ def _orientation_angles(
         settings,
         angles,
     )
+    # Exact repeated mechanical parts use their intrinsic landmark frame in
+    # preference to the object/world axis.  This runs after the global and
+    # long-edge passes so the declared priority cannot be reversed by a
+    # presentation-only correction.
+    angles, repeat_local_ids = _repeat_local_orientation_overrides(
+        analysis,
+        settings,
+        angles,
+    )
+    constrained.update(repeat_local_ids)
     # Keep the policy and the detailed per-cohort report together in the
     # analysis snapshot consumed by manifests and adaptive candidate scoring.
     analysis.orientation_policy = dict(analysis.orientation_policy)
@@ -7756,6 +8165,9 @@ def _orientation_angles(
         "geometry_long_edge_downgraded_islands": int(
             long_edge_metrics.get("downgraded_islands", 0)
         ),
+        "repeat_local_frame": bool(settings.align_repeat_local_frame),
+        "repeat_local_priority": "repeat_local_then_global_axis_fallback",
+        "repeat_local_applied_islands": len(repeat_local_ids),
     })
     for member_ids in _orientation_components(analysis):
         target = _member_target_angle(
@@ -11478,7 +11890,15 @@ def _source_cell_rack(
     gap: float,
     row_quantum: float,
 ) -> Tuple[Dict[int, _Placement], float, float]:
-    """Pack one bounded cell as a source-ordered, non-rotating rack."""
+    """Pack one bounded cell as a source-ordered, non-rotating rack.
+
+    A regular grid remains the density baseline because its aligned rows are
+    useful for repeated mechanical parts.  Size-mixed cells also evaluate a
+    variable shelf: unlike the grid, it does not reserve every column and row
+    at their largest member size.  The shelf may compete only when its longest
+    edge is no larger than the best grid, so local compaction cannot reduce the
+    uniform scale available to the atlas-level pack.
+    """
 
     ordered = tuple(sorted(
         (int(member) for member in member_ids),
@@ -11504,8 +11924,9 @@ def _source_cell_rack(
             item.key: _Placement(0.0, 0.0, item.width, item.height, False)
         }, item.width, item.height
 
-    # Evaluate every bounded column count.  The compactness term is primary;
-    # sparse structural links break ties in favour of neighbouring cells.
+    # Evaluate every bounded column count.  Reachable uniform scale (the
+    # inverse longest edge) is the primary contract; footprint and structural
+    # edge distance are deterministic tie-breakers after density.
     by_id = {int(item.key): item for item in rectangles}
     edges = [
         (int(item[2]), int(item[3]))
@@ -11514,35 +11935,56 @@ def _source_cell_rack(
         and int(item[2]) in by_id
         and int(item[3]) in by_id
     ]
-    candidates = []
+    grid_candidates = []
+
+    def candidate_record(
+        placement: Mapping[int, _Placement],
+        width: float,
+        height: float,
+        kind_rank: int,
+        variant_rank: int,
+    ):
+        longest = max(float(width), float(height))
+        shortest = max(min(float(width), float(height)), _EPSILON)
+        edge_distance = sum(
+            _placement_distance(placement[left], placement[right])
+            for left, right in edges
+        )
+        return (
+            longest,
+            float(width) * float(height),
+            edge_distance,
+            longest / shortest,
+            kind_rank,
+            variant_rank,
+            placement,
+            float(width),
+            float(height),
+        )
+
     for columns in range(1, len(rectangles) + 1):
         placement, width, height = _regular_grid_rack(
             rectangles, gap, columns=columns
         )
-        longest = max(float(width), float(height))
-        shortest = max(min(float(width), float(height)), _EPSILON)
-        aspect = longest / shortest
-        edge_distance = 0.0
-        for left, right in edges:
-            first = placement[left]
-            second = placement[right]
-            edge_distance += _placement_distance(first, second)
-        # Prefer a square-ish local block only after its longest edge is
-        # comparable.  This avoids turning a coherent row into a tall strip.
-        score = longest * (
-            1.0 + 0.06 * min(max(aspect - 1.0, 0.0), 3.0)
-        ) + 0.04 * edge_distance
-        candidates.append((
-            score,
-            longest,
-            float(width) * float(height),
-            aspect,
-            edge_distance,
-            columns,
-            placement,
-            float(width),
-            float(height),
+        grid_candidates.append(candidate_record(
+            placement, width, height, 0, columns
         ))
+
+    grid_baseline = min(grid_candidates, key=lambda item: item[:6])
+    candidates = list(grid_candidates)
+    shelf, shelf_width, shelf_height = _best_shelf_pack(
+        rectangles,
+        gap,
+        allow_rotate=False,
+        preserve_order=True,
+    )
+    shelf_candidate = candidate_record(
+        shelf, shelf_width, shelf_height, 1, 0
+    )
+    density_tolerance = max(float(grid_baseline[0]), 1.0) * 1.0e-9
+    if shelf_candidate[0] <= grid_baseline[0] + density_tolerance:
+        candidates.append(shelf_candidate)
+
     chosen = min(candidates, key=lambda item: item[:6])
     return chosen[6], chosen[7], chosen[8]
 
@@ -11680,29 +12122,52 @@ def _pack_source_cell_layout_once(
             min(cell_data[cell_index]["members"]),
         ),
     ))
-    desired = {}
-    for cell_index in cell_order:
-        item = cell_data[cell_index]
-        center = item["center"]
-        desired[cell_index] = _Placement(
-            float(center.x) - item["width"] * 0.5,
-            float(center.y) - item["height"] * 0.5,
-            item["width"],
-            item["height"],
-            False,
+    if bool(settings.source_layout_compact_cells):
+        rectangles = tuple(
+            _Rect(
+                key=int(cell_index),
+                width=float(cell_data[cell_index]["width"]),
+                height=float(cell_data[cell_index]["height"]),
+                sort_rank=rank,
+            )
+            for rank, cell_index in enumerate(cell_order)
         )
-
-    placements: Dict[int, _Placement] = {}
-    placed: List[_Placement] = []
-    for cell_index in cell_order:
-        placement = _resolve_source_layout_placement(
-            desired[cell_index],
-            placed,
+        placements, _packed_width, _packed_height = _best_shelf_pack(
+            rectangles,
             float(gap),
-            float(settings.source_layout_row_weight),
+            allow_rotate=False,
+            preserve_order=True,
+            square_pack_bias=float(settings.square_pack_bias),
+            square_pack_max_edge_relaxation=float(
+                settings.square_pack_max_edge_relaxation
+            ),
         )
-        placements[cell_index] = placement
-        placed.append(placement)
+        strategy = "source_cell_compact_layout"
+    else:
+        desired = {}
+        for cell_index in cell_order:
+            item = cell_data[cell_index]
+            center = item["center"]
+            desired[cell_index] = _Placement(
+                float(center.x) - item["width"] * 0.5,
+                float(center.y) - item["height"] * 0.5,
+                item["width"],
+                item["height"],
+                False,
+            )
+
+        placements = {}
+        placed: List[_Placement] = []
+        for cell_index in cell_order:
+            placement = _resolve_source_layout_placement(
+                desired[cell_index],
+                placed,
+                float(gap),
+                float(settings.source_layout_row_weight),
+            )
+            placements[cell_index] = placement
+            placed.append(placement)
+        strategy = "source_cell_layout"
 
     # Materialize each rack at its resolved cell placement.  A cell remains a
     # rigid translation-only block after this point.
@@ -11773,7 +12238,7 @@ def _pack_source_cell_layout_once(
         height=height,
         source_gap=float(gap),
         group_placements=group_placements,
-        strategy="source_cell_layout",
+        strategy=strategy,
         moved_islands=moved_islands,
         total_translation=total_translation,
         max_translation=max_translation,
@@ -12314,6 +12779,58 @@ def rebind_geometry_axis_contract(
     )
 
 
+def _is_planar_geometry_frame_chart(
+    mesh: Any,
+    island: IslandRecord,
+    tolerance: float,
+) -> bool:
+    """Return whether one chart belongs to a single geometric normal domain.
+
+    Complete-frame fallback is expected on curved shells and developable
+    bands, where one rigid UV rotation cannot align every local tangent.  A
+    planar hard-surface chart has no such ambiguity: all non-degenerate face
+    normals should agree within the configured angular tolerance, so a frame
+    residual there indicates checker skew or a lost orientation contract.
+    """
+
+    weighted_normal = Vector((0.0, 0.0, 0.0))
+    normals: List[Vector] = []
+    try:
+        face_indices = tuple(int(index) for index in island.face_indices)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    for face_index in face_indices:
+        try:
+            polygon = mesh.polygons[face_index]
+            normal = polygon.normal.copy()
+            area = max(float(polygon.area), 0.0)
+        except (AttributeError, IndexError, TypeError, ValueError):
+            continue
+        if (
+            normal.length_squared <= _EPSILON
+            or not all(math.isfinite(float(value)) for value in normal)
+        ):
+            continue
+        normal.normalize()
+        normals.append(normal)
+        weighted_normal += normal * max(area, _EPSILON)
+    if not normals:
+        return False
+    if len(normals) == 1:
+        return True
+    if weighted_normal.length_squared <= _EPSILON:
+        return False
+    weighted_normal.normalize()
+    try:
+        cosine_limit = math.cos(_clamp(float(tolerance), 0.0, math.pi * 0.5))
+    except (TypeError, ValueError):
+        return False
+    return all(
+        float(normal.dot(weighted_normal)) + _EPSILON >= cosine_limit
+        for normal in normals
+    )
+
+
 def _directed_geometry_metrics(
     obj: Any,
     mesh: Any,
@@ -12338,10 +12855,34 @@ def _directed_geometry_metrics(
     frame_fallback_ids = []
     frame_negative_parity_ids = []
     frame_unresolved_ids = []
+    strict_frame_required_ids = []
+    strict_frame_violation_ids = []
+    strict_frame_unresolved_ids = []
     records = {}
     tolerance = float(settings.direction_residual_tolerance)
+    strict_frame_enabled = bool(
+        settings.align_geometry_direction
+        and settings.align_geometry_frame
+        and settings.strict_geometry_frame_quality
+    )
+    strict_frame_tolerance = float(
+        settings.strict_geometry_frame_residual_tolerance
+    )
     for island in analysis.islands:
         island_id = int(island.island_id)
+        strict_frame_required = bool(
+            strict_frame_enabled
+            and (
+                not settings.strict_geometry_frame_planar_only
+                or _is_planar_geometry_frame_chart(
+                    mesh,
+                    island,
+                    settings.strict_geometry_frame_planar_tolerance,
+                )
+            )
+        )
+        if strict_frame_required:
+            strict_frame_required_ids.append(island_id)
         persisted_reason = island.geometry_frame_downgrade_reason
         # A persisted AUTO contract can explicitly record that no axis was
         # available (or that the previously selected axis became unusable).
@@ -12358,6 +12899,8 @@ def _directed_geometry_metrics(
             if persisted_reason == "persisted_axis_unavailable":
                 required_unresolved_ids.append(island_id)
             frame_unresolved_ids.append(island_id)
+            if strict_frame_required:
+                strict_frame_unresolved_ids.append(island_id)
             island.geometry_final_residual = None
             records[str(island_id)] = {
                 "axis": None,
@@ -12374,6 +12917,8 @@ def _directed_geometry_metrics(
                 "frame_reason": persisted_reason,
                 "frame_selected": False,
                 "frame_fallback": False,
+                "strict_frame_required": strict_frame_required,
+                "strict_frame_violation": strict_frame_required,
             }
             continue
         required_axis_name = (
@@ -12405,6 +12950,8 @@ def _directed_geometry_metrics(
             if required_axis_name is not None:
                 required_unresolved_ids.append(island_id)
             frame_unresolved_ids.append(island_id)
+            if strict_frame_required:
+                strict_frame_unresolved_ids.append(island_id)
             continue
         residual = abs(_angle_wrap(float(rotation)))
         island.geometry_final_residual = residual
@@ -12455,6 +13002,7 @@ def _directed_geometry_metrics(
         frame_residual = frame.get("residual")
         frame_axis_residual = _geometry_frame_axis_residual(island)
         frame_fallback = False
+        strict_frame_violation = False
         # Keep the historical distinction between an unresolved frame (no
         # usable signal) and a usable frame that must fall back to the strict
         # single-axis rotation.  The latter now includes a complete-frame
@@ -12473,8 +13021,12 @@ def _directed_geometry_metrics(
         )
         if not settings.align_geometry_frame:
             frame_unresolved_ids.append(island_id)
+            if strict_frame_required:
+                strict_frame_unresolved_ids.append(island_id)
         elif not frame_signal_ready:
             frame_unresolved_ids.append(island_id)
+            if strict_frame_required:
+                strict_frame_unresolved_ids.append(island_id)
         else:
             frame_residual = abs(float(frame_residual))
             frame_residuals.append(frame_residual)
@@ -12506,6 +13058,17 @@ def _directed_geometry_metrics(
                 if frame_parity == 1:
                     frame_fallback_ids.append(island_id)
                     frame_fallback = True
+            if strict_frame_required:
+                strict_frame_violation = bool(
+                    frame_parity != 1
+                    or frame_fallback
+                    or frame_residual > strict_frame_tolerance + _EPSILON
+                    or frame_axis_residual is None
+                    or frame_axis_residual
+                    > strict_frame_tolerance + _EPSILON
+                )
+                if strict_frame_violation:
+                    strict_frame_violation_ids.append(island_id)
         records[str(island.island_id)] = {
             "axis": axis_name,
             "space": str(island.geometry_direction_space),
@@ -12531,6 +13094,8 @@ def _directed_geometry_metrics(
                 _geometry_frame_is_reliable(island, settings)
             ),
             "frame_fallback": frame_fallback,
+            "strict_frame_required": strict_frame_required,
+            "strict_frame_violation": strict_frame_violation,
         }
 
     return {
@@ -12543,6 +13108,16 @@ def _directed_geometry_metrics(
         "frame_misaligned_islands": len(frame_misaligned_ids),
         "frame_fallback_islands": len(frame_fallback_ids),
         "frame_negative_parity_islands": len(frame_negative_parity_ids),
+        "strict_frame_enabled": strict_frame_enabled,
+        "strict_frame_planar_only": bool(
+            settings.strict_geometry_frame_planar_only
+        ),
+        "strict_frame_required_islands": len(strict_frame_required_ids),
+        "strict_frame_violation_islands": len(strict_frame_violation_ids),
+        "strict_frame_unresolved_islands": len(strict_frame_unresolved_ids),
+        "strict_frame_residual_tolerance_degrees": math.degrees(
+            strict_frame_tolerance
+        ),
         "frame_residual_p95_degrees": math.degrees(
             _quantile(frame_residuals, 0.95)
         ),
@@ -12552,6 +13127,9 @@ def _directed_geometry_metrics(
         "frame_misaligned_ids": frame_misaligned_ids,
         "frame_fallback_ids": frame_fallback_ids,
         "frame_negative_parity_ids": frame_negative_parity_ids,
+        "strict_frame_required_ids": strict_frame_required_ids,
+        "strict_frame_violation_ids": strict_frame_violation_ids,
+        "strict_frame_unresolved_ids": strict_frame_unresolved_ids,
         "frame_unresolved_ids": frame_unresolved_ids,
         "misaligned_islands": len(misaligned_ids),
         "opposite_islands": len(opposite_ids),
@@ -12717,6 +13295,24 @@ def evaluate_layout_quality(
     direction_metrics = _directed_geometry_metrics(
         obj, mesh, uv_layer, analysis, settings
     )
+    repeat_local_metrics = _repeat_local_frame_metrics(
+        analysis, settings, mesh=mesh, uv_layer=uv_layer
+    )
+    analysis.repeat_local_frame_metrics = repeat_local_metrics
+    effective_direction = _effective_direction_contract(
+        direction_metrics, repeat_local_metrics
+    )
+    repeat_local_ids = set(
+        effective_direction["repeat_local_member_ids"]
+    )
+    effective_strict_frame_violation_ids = sorted(
+        set(direction_metrics.get("strict_frame_violation_ids", ()))
+        - repeat_local_ids
+    )
+    effective_strict_frame_unresolved_ids = sorted(
+        set(direction_metrics.get("strict_frame_unresolved_ids", ()))
+        - repeat_local_ids
+    )
     require_all_directions = bool(
         settings.align_geometry_direction
         and str(settings.direction_axis).upper() == "AUTO"
@@ -12724,33 +13320,67 @@ def evaluate_layout_quality(
     frame_contract_enabled = bool(
         settings.align_geometry_direction and settings.align_geometry_frame
     )
+    strict_frame_contract_enabled = bool(
+        frame_contract_enabled and settings.strict_geometry_frame_quality
+    )
     # A frame cannot be repaired by a rotation when its parity is negative.
-    # Keep that case visible to callers.  Residual U-axis skew is diagnostic
-    # for curved/sheared charts and is downgraded rather than making an entire
-    # asset un-packable; the existing strict +V contract remains the commit
-    # gate.
+    # Curved/sheared charts may still use the historical +V fallback, but an
+    # opted-in hard-surface gate requires every planar chart to retain a
+    # complete signed frame within tolerance.
     frame_contract_valid = bool(
         not frame_contract_enabled
         or (
             int(
                 direction_metrics.get("frame_negative_parity_islands", 0)
             ) == 0
+            and (
+                not strict_frame_contract_enabled
+                or (
+                    not effective_strict_frame_violation_ids
+                    and not effective_strict_frame_unresolved_ids
+                )
+            )
         )
     )
     direction_valid = bool(
         not settings.align_geometry_direction
         or (
-            int(direction_metrics["misaligned_islands"]) == 0
-            and int(direction_metrics["required_unresolved_islands"]) == 0
+            not effective_direction["effective_misaligned_ids"]
+            and not effective_direction[
+                "effective_required_unresolved_ids"
+            ]
             and frame_contract_valid
             and (
                 not require_all_directions
-                or int(direction_metrics["unresolved_islands"]) == 0
+                or not effective_direction["effective_unresolved_ids"]
             )
         )
     )
+    direction_metrics.update(effective_direction)
+    direction_metrics.update({
+        "contract_priority": "repeat_local_then_global_axis_fallback",
+        "effective_misaligned_islands": len(
+            effective_direction["effective_misaligned_ids"]
+        ),
+        "effective_required_unresolved_islands": len(
+            effective_direction["effective_required_unresolved_ids"]
+        ),
+        "effective_unresolved_islands": len(
+            effective_direction["effective_unresolved_ids"]
+        ),
+        "effective_strict_frame_violation_ids": (
+            effective_strict_frame_violation_ids
+        ),
+        "effective_strict_frame_unresolved_ids": (
+            effective_strict_frame_unresolved_ids
+        ),
+        "repeat_local_frame": repeat_local_metrics,
+    })
     direction_metrics["require_all_resolved"] = require_all_directions
     direction_metrics["frame_contract_enabled"] = frame_contract_enabled
+    direction_metrics["strict_frame_contract_enabled"] = (
+        strict_frame_contract_enabled
+    )
     direction_metrics["frame_contract_valid"] = frame_contract_valid
     long_edge_metrics = dict(
         getattr(analysis, "geometry_long_edge_metrics", {}) or {}
@@ -12809,6 +13439,22 @@ def evaluate_layout_quality(
             long_edge_metrics.get("downgraded_ids", ())
         ),
         "geometry_long_edge": long_edge_metrics,
+        "repeat_local_frame_enabled": bool(
+            repeat_local_metrics.get("enabled", False)
+        ),
+        "repeat_local_frame_eligible_groups": int(
+            repeat_local_metrics.get("eligible_groups", 0)
+        ),
+        "repeat_local_frame_eligible_islands": len(
+            repeat_local_metrics.get("eligible_member_ids", ())
+        ),
+        "repeat_local_frame_invalid_islands": len(
+            repeat_local_metrics.get("invalid_member_ids", ())
+        ),
+        "repeat_local_frame_valid": bool(
+            repeat_local_metrics.get("valid", True)
+        ),
+        "repeat_local_frame": repeat_local_metrics,
         "directed_geometry_residual_p95_degrees": float(
             direction_metrics["residual_p95_degrees"]
         ),
@@ -12850,6 +13496,24 @@ def evaluate_layout_quality(
         ),
         "directed_geometry_frame_negative_parity_islands": int(
             direction_metrics.get("frame_negative_parity_islands", 0)
+        ),
+        "directed_geometry_strict_frame_enabled": bool(
+            direction_metrics.get("strict_frame_contract_enabled", False)
+        ),
+        "directed_geometry_strict_frame_required_islands": int(
+            direction_metrics.get("strict_frame_required_islands", 0)
+        ),
+        "directed_geometry_strict_frame_violation_islands": int(
+            direction_metrics.get("strict_frame_violation_islands", 0)
+        ),
+        "directed_geometry_strict_frame_unresolved_islands": int(
+            direction_metrics.get("strict_frame_unresolved_islands", 0)
+        ),
+        "directed_geometry_strict_frame_violation_ids": list(
+            direction_metrics.get("strict_frame_violation_ids", ())
+        ),
+        "directed_geometry_strict_frame_unresolved_ids": list(
+            direction_metrics.get("strict_frame_unresolved_ids", ())
         ),
         "directed_geometry_frame_residual_p95_degrees": float(
             direction_metrics.get("frame_residual_p95_degrees", 0.0)
@@ -13777,6 +14441,9 @@ def _minimum_aabb_gap(
 def layout_active_uv(
     obj: Any,
     options: Optional[GroupLayoutOptions] = None,
+    direction_contract: Optional[
+        Mapping[Tuple[int, ...], Tuple[Optional[str], str]]
+    ] = None,
 ) -> GroupLayoutResult:
     """Analyze, semantically group, rigidly pack, audit, and commit active UVs.
 
@@ -13788,6 +14455,13 @@ def layout_active_uv(
     mesh, uv_layer = _require_object_mode_mesh(obj)
     snapshot = [item.uv.copy() for item in uv_layer.data]
     analysis = analyze_active_uv(obj, settings)
+    if direction_contract is not None:
+        analysis = rebind_geometry_axis_contract(
+            obj,
+            analysis,
+            direction_contract,
+            settings,
+        )
     before_audit = audit_active_uv(
         obj, analysis.face_to_island, epsilon=settings.uv_epsilon
     )
@@ -13829,13 +14503,19 @@ def layout_active_uv(
         metrics = _directed_geometry_metrics(
             obj, mesh, uv_layer, replay_analysis, settings
         )
+        repeat_metrics = _repeat_local_frame_metrics(
+            replay_analysis, settings, mesh=mesh, uv_layer=uv_layer
+        )
+        effective = _effective_direction_contract(
+            metrics, repeat_metrics
+        )
         require_all_resolved = str(settings.direction_axis).upper() == "AUTO"
         return bool(
-            int(metrics["misaligned_islands"]) == 0
-            and int(metrics["required_unresolved_islands"]) == 0
+            not effective["effective_misaligned_ids"]
+            and not effective["effective_required_unresolved_ids"]
             and (
                 not require_all_resolved
-                or int(metrics["unresolved_islands"]) == 0
+                or not effective["effective_unresolved_ids"]
             )
         )
 
@@ -13960,12 +14640,19 @@ def layout_active_uv(
             settings,
         ),
         candidate_valid=candidate_valid,
+        layout_strategy=str(plan.strategy),
+        source_moved_islands=int(plan.moved_islands),
+        source_total_translation=float(plan.total_translation),
+        source_max_translation=float(plan.max_translation),
     )
 
 
 def layout_active_uv_adaptive(
     obj: Any,
     options: Optional[GroupLayoutOptions] = None,
+    direction_contract: Optional[
+        Mapping[Tuple[int, ...], Tuple[Optional[str], str]]
+    ] = None,
 ) -> GroupLayoutResult:
     """Try safe layout variants and commit the best valid result.
 
@@ -14029,7 +14716,11 @@ def layout_active_uv_adaptive(
         # restoring here also isolates successful candidates from one another.
         restore_source()
         try:
-            result = layout_active_uv(obj, settings)
+            result = layout_active_uv(
+                obj,
+                settings,
+                direction_contract=direction_contract,
+            )
             # Re-run the read-only quality gate explicitly at the adaptive
             # boundary.  This protects selection from a future layout backend
             # that returns a result without propagating its audit fields.

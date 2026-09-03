@@ -330,6 +330,15 @@ class VUVSettings(bpy.types.PropertyGroup):
         ),
         default=True,
     )
+    uv_repeat_local_frame: BoolProperty(
+        name="Repeat Local Frame / 重复件局部帧",
+        description=(
+            "Orient exact mirrored, rotational, and repeated mechanical parts "
+            "from an intrinsic landmark before falling back to the object axis; "
+            "优先按重复机械件的固有特征统一棋盘格方向，无可靠局部帧时回退到对象轴"
+        ),
+        default=True,
+    )
     uv_direction_space: EnumProperty(
         name="Direction Space / 方向空间",
         description="Choose whether the texture-up rule follows object-local or world axes",
@@ -565,6 +574,221 @@ class VUVSettings(bpy.types.PropertyGroup):
         precision=2,
         subtype='FACTOR',
     )
+    uv_align_geometry_frame: BoolProperty(
+        name="Validate Full Geometry Frame / 校验完整几何帧",
+        description=(
+            "Validate both signed tangent axes instead of only texture-up; "
+            "同时校验纹理向上轴及其横向轴，不允许用镜像修复负帧"
+        ),
+        default=True,
+    )
+    uv_use_geometry_frame_rotation: BoolProperty(
+        name="Use Full Frame Rotation / 使用完整帧旋转",
+        description=(
+            "Use the complete positive geometry frame when it satisfies the "
+            "direction contract; 仅在完整正向几何帧通过方向契约时用于旋转 UV"
+        ),
+        default=False,
+    )
+    uv_cohere_geometry_angle_groups: BoolProperty(
+        name="Share Group Heading / 共享组朝向",
+        description=(
+            "Let compatible structure members share a visual heading; disabled "
+            "by default to preserve exact per-island direction"
+        ),
+        default=False,
+    )
+    uv_strict_geometry_frame_quality: BoolProperty(
+        name="Require Planar Frame Quality / 要求平面帧质量",
+        description=(
+            "Reject planar hard-surface UV results that lose the complete "
+            "positive tangent frame or exceed the checker-direction tolerance"
+        ),
+        default=False,
+    )
+    uv_strict_geometry_frame_planar_only: BoolProperty(
+        name="Planar Charts Only / 仅平面 UV 岛",
+        description=(
+            "Apply strict complete-frame acceptance only to planar charts; "
+            "curved shells may retain the signed texture-up fallback"
+        ),
+        default=True,
+    )
+    uv_strict_geometry_frame_planar_tolerance: FloatProperty(
+        name="Planar Normal Tolerance / 平面法线容差",
+        description="Maximum normal spread for strict planar-frame validation",
+        default=math.radians(5.0),
+        min=0.0,
+        max=math.radians(90.0),
+        precision=1,
+        subtype='ANGLE',
+    )
+    uv_strict_geometry_frame_residual_tolerance: FloatProperty(
+        name="Frame Residual Tolerance / 几何帧残差容差",
+        description="Maximum complete-frame residual accepted by the quality gate",
+        default=math.radians(3.0),
+        min=0.0,
+        max=math.radians(180.0),
+        precision=1,
+        subtype='ANGLE',
+    )
+    uv_preserve_source_layout: BoolProperty(
+        name="Preserve Source Layout / 保留原始排布",
+        description=(
+            "Use the existing UV atlas as the structural scaffold and repair "
+            "local collisions without rebuilding broad semantic groups"
+        ),
+        default=False,
+    )
+    uv_source_layout_row_quantum: FloatProperty(
+        name="Source Row Quantum / 原始行量化",
+        description="UV-space row quantization used by source-layout packing",
+        default=0.025,
+        min=0.000001,
+        max=1.0,
+        precision=4,
+    )
+    uv_source_layout_row_weight: FloatProperty(
+        name="Source Row Weight / 原始行权重",
+        description="Preference for retaining source UV rows",
+        default=0.15,
+        min=0.0,
+        max=10.0,
+        precision=3,
+    )
+    uv_source_layout_order: EnumProperty(
+        name="Source Layout Order / 原始排布顺序",
+        description="Choose the primary placement order for source-atlas repair",
+        items=(
+            ('ROW_MAJOR', "Row Major / 按行", "Preserve source UV rows and columns"),
+            ('AREA', "Area / 按面积", "Place larger charts first"),
+        ),
+        default='ROW_MAJOR',
+    )
+    uv_source_layout_affinity_weight: FloatProperty(
+        name="Source Link Weight / 原始关联权重",
+        description="Preference for applying one translation to linked charts",
+        default=0.0,
+        min=0.0,
+        max=10.0,
+        precision=3,
+    )
+    uv_source_layout_cell_enabled: BoolProperty(
+        name="Local Source Cells / 原始局部单元",
+        description=(
+            "Pack nearby compatible structural charts into bounded local cells "
+            "before resolving atlas-level collisions"
+        ),
+        default=True,
+    )
+    uv_source_layout_compact_cells: BoolProperty(
+        name="Compact Local Cells / 紧凑排布局部单元",
+        description=(
+            "Pack local structure cells tightly while preserving their source "
+            "row order and locked checker direction"
+        ),
+        default=True,
+    )
+    uv_source_layout_cell_max_members: IntProperty(
+        name="Cell Member Limit / 单元成员上限",
+        description="Maximum UV islands retained in one local source cell",
+        default=12,
+        min=2,
+        max=256,
+    )
+    uv_source_layout_cell_diameter_ratio: FloatProperty(
+        name="Cell Diameter / 单元直径",
+        description="Maximum source-UV diameter relative to the source atlas",
+        default=0.16,
+        min=0.000001,
+        max=1.0,
+        precision=3,
+        subtype='FACTOR',
+    )
+    uv_source_layout_cell_link_radius_ratio: FloatProperty(
+        name="Cell Link Radius / 单元连接半径",
+        description="Maximum source-UV distance for local-cell proximity links",
+        default=0.12,
+        min=0.000001,
+        max=1.0,
+        precision=3,
+        subtype='FACTOR',
+    )
+    uv_structure_group_enabled: BoolProperty(
+        name="Structure Groups / 结构分组",
+        description="Keep bounded topology-adjacent mechanical charts together",
+        default=True,
+    )
+    uv_structure_group_max_members: IntProperty(
+        name="Structure Member Limit / 结构成员上限",
+        description="Maximum UV islands in one structure group",
+        default=12,
+        min=2,
+        max=256,
+    )
+    uv_structure_group_max_degree: IntProperty(
+        name="Structure Link Degree / 结构连接度",
+        description="Maximum accepted structural links at one group endpoint",
+        default=2,
+        min=1,
+        max=32,
+    )
+    uv_structure_group_min_contact_ratio: FloatProperty(
+        name="Structure Contact / 结构接触比",
+        description="Minimum mesh contact ratio for a structural link",
+        default=0.12,
+        min=0.0,
+        max=10.0,
+        precision=3,
+    )
+    uv_structure_group_max_diameter_ratio: FloatProperty(
+        name="Structure Diameter / 结构直径",
+        description="Maximum model-space diameter relative to the object",
+        default=0.20,
+        min=0.000001,
+        max=1.0,
+        precision=3,
+        subtype='FACTOR',
+    )
+    uv_structure_group_max_normal_angle: FloatProperty(
+        name="Structure Normal Angle / 结构法线角",
+        description="Maximum normal difference allowed in one structure group",
+        default=math.radians(100.0),
+        min=0.0,
+        max=math.pi,
+        precision=1,
+        subtype='ANGLE',
+    )
+    uv_repeat_group_max_members: IntProperty(
+        name="Repeat Member Limit / 重复件成员上限",
+        description="Maximum UV islands in one bounded repeat layout group",
+        default=48,
+        min=2,
+        max=512,
+    )
+    uv_repeat_group_max_diameter_ratio: FloatProperty(
+        name="Repeat Diameter / 重复件直径",
+        description="Maximum model-space diameter for one repeat layout group",
+        default=0.20,
+        min=0.000001,
+        max=1.0,
+        precision=3,
+        subtype='FACTOR',
+    )
+    uv_max_repeat_group_size: IntProperty(
+        name="Repeat Detection Limit / 重复检测上限",
+        description="Legacy cap for repeat candidates retained for compatibility",
+        default=24,
+        min=2,
+        max=512,
+    )
+    uv_max_small_members_per_group: IntProperty(
+        name="Small Member Limit / 小岛成员上限",
+        description="Maximum attached small islands in one layout group",
+        default=16,
+        min=1,
+        max=512,
+    )
     uv_directed_cardinal_tolerance: FloatProperty(
         name="Directed Cardinal Tolerance / 有向直角容差",
         description=(
@@ -669,6 +893,33 @@ class VUVSettings(bpy.types.PropertyGroup):
         min=0,
         max=10000,
     )
+    small_cleanup_tests: IntProperty(
+        name="Cleanup Tests / 清理测试数",
+        description=(
+            "Maximum topology-adjacent stitch candidates tested per object"
+        ),
+        default=400,
+        min=0,
+        max=10000,
+    )
+    small_cleanup_max_merges: IntProperty(
+        name="Cleanup Merge Limit / 清理合并上限",
+        description="Maximum accepted small-island stitches per object",
+        default=200,
+        min=0,
+        max=1000,
+    )
+    small_target_area_multiplier: FloatProperty(
+        name="Target Area Multiplier / 目标面积倍率",
+        description=(
+            "Require the receiving chart to be at least this many times the "
+            "candidate chart area"
+        ),
+        default=1.0,
+        min=1.0,
+        max=100.0,
+        precision=2,
+    )
     small_island_faces: IntProperty(
         name="Face Limit / 小岛面数",
         description=(
@@ -758,6 +1009,38 @@ class VUVSettings(bpy.types.PropertyGroup):
         default=160,
         min=0,
         max=1000,
+    )
+    small_chain_max_faces: IntProperty(
+        name="Chain Face Limit / 连续链面数上限",
+        description=(
+            "Maximum total faces in one iteratively stitched local chart; "
+            "zero disables this limit"
+        ),
+        default=96,
+        min=0,
+        max=10000,
+    )
+    small_chain_max_absorptions: IntProperty(
+        name="Chain Absorption Limit / 连续链吸收上限",
+        description=(
+            "Maximum cumulative fragment stitches in one local chart; zero "
+            "disables this limit"
+        ),
+        default=8,
+        min=0,
+        max=1000,
+    )
+    small_chain_max_diameter_ratio: FloatProperty(
+        name="Chain Diameter / 连续链直径",
+        description=(
+            "Maximum stitched-chart model diameter relative to the object; "
+            "zero disables this limit"
+        ),
+        default=0.35,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        subtype='FACTOR',
     )
     small_cleanup_p95: FloatProperty(
         name="Cleanup P95 / 清理 P95",

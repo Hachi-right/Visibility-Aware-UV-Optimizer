@@ -34,6 +34,50 @@ def _perimeter_length(chart):
     return perimeter
 
 
+def _face_key(chart):
+    return frozenset(face.index for face in chart)
+
+
+def _chart_bounds(chart):
+    vertices = {vertex.index: vertex for face in chart for vertex in face.verts}
+    if not vertices:
+        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    coordinates = [vertex.co for vertex in vertices.values()]
+    return tuple(
+        [min(coordinate[axis] for coordinate in coordinates) for axis in range(3)]
+        + [max(coordinate[axis] for coordinate in coordinates) for axis in range(3)]
+    )
+
+
+def _union_bounds(*bounds):
+    valid = [value for value in bounds if value is not None]
+    if not valid:
+        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    return tuple(
+        [min(float(value[axis]) for value in valid) for axis in range(3)]
+        + [max(float(value[axis + 3]) for value in valid) for axis in range(3)]
+    )
+
+
+def _bounds_diameter(bounds):
+    spans = [
+        max(float(bounds[axis + 3]) - float(bounds[axis]), 0.0)
+        for axis in range(3)
+    ]
+    return math.sqrt(sum(span * span for span in spans))
+
+
+def _mesh_diameter(bm):
+    if not bm.verts:
+        return 0.0
+    spans = [
+        max(vertex.co[axis] for vertex in bm.verts)
+        - min(vertex.co[axis] for vertex in bm.verts)
+        for axis in range(3)
+    ]
+    return math.sqrt(sum(span * span for span in spans))
+
+
 def _uv_polygon_area(points):
     if len(points) < 3:
         return 0.0
@@ -191,6 +235,8 @@ def _candidate_records(
     settings,
     helpers,
     funnel,
+    chain_states,
+    mesh_diameter,
     allow_structural=True,
 ):
     boundaries = defaultdict(list)
@@ -219,6 +265,15 @@ def _candidate_records(
             settings, "small_structural_boundary_ratio", 0.08
         )), 0.0),
     )
+    chain_max_faces = max(int(_setting(
+        settings, "small_chain_max_faces", 96
+    )), 0)
+    chain_max_absorptions = max(int(_setting(
+        settings, "small_chain_max_absorptions", 8
+    )), 0)
+    chain_max_diameter_ratio = max(float(_setting(
+        settings, "small_chain_max_diameter_ratio", 0.35
+    )), 0.0)
     strict_candidates = []
     structural_candidates = []
     for (left_id, right_id), boundary in boundaries.items():
@@ -307,6 +362,63 @@ def _candidate_records(
             funnel["topology"] += 1
             continue
 
+        small_key = _face_key(small_chart)
+        target_key = _face_key(target_chart)
+        small_state = chain_states.get(small_key, {})
+        target_state = chain_states.get(target_key, {})
+        small_bounds = _chart_bounds(small_chart)
+        target_bounds = _chart_bounds(target_chart)
+        combined_bounds = _union_bounds(small_bounds, target_bounds)
+        previous_absorbed_bounds = target_state.get("absorbed_bounds")
+        # The receiving chart is the mechanical base and is deliberately not
+        # charged to the chain budget. If an existing chain becomes the small
+        # side, its entire chart is now part of the new base's absorbed set.
+        absorbed_face_ids = frozenset(
+            int(value) for value in target_state.get("absorbed_faces", ())
+        ) | small_key
+        absorbed_bounds = _union_bounds(
+            previous_absorbed_bounds,
+            small_bounds,
+        )
+        next_absorptions = (
+            int(small_state.get("absorptions", 0))
+            + int(target_state.get("absorptions", 0))
+            + 1
+        )
+        if chain_max_faces and len(absorbed_face_ids) > chain_max_faces:
+            funnel["chain_face_limit"] += 1
+            continue
+        if (
+            chain_max_absorptions
+            and next_absorptions > chain_max_absorptions
+        ):
+            funnel["chain_absorption_limit"] += 1
+            continue
+        chain_is_extension = bool(small_state or target_state)
+        diameter_denominator = max(mesh_diameter, 1.0e-12)
+        absorbed_diameter = _bounds_diameter(absorbed_bounds)
+        diameter_ratio = absorbed_diameter / diameter_denominator
+        if (
+            chain_is_extension
+            and chain_max_diameter_ratio
+            and diameter_ratio > chain_max_diameter_ratio
+        ):
+            funnel["chain_diameter_limit"] += 1
+            continue
+        previous_absorbed_diameter = (
+            _bounds_diameter(previous_absorbed_bounds)
+            if previous_absorbed_bounds is not None
+            else 0.0
+        )
+        absorbed_growth_ratio = max(
+            absorbed_diameter - previous_absorbed_diameter,
+            0.0,
+        ) / diameter_denominator
+        target_growth_ratio = max(
+            _bounds_diameter(combined_bounds) - _bounds_diameter(target_bounds),
+            0.0,
+        ) / diameter_denominator
+
         strict_rejection = None
         if family is None:
             strict_rejection = "class_mismatch"
@@ -324,9 +436,27 @@ def _candidate_records(
             "shared_ratio": shared_ratio,
             "angle": weighted_angle,
             "target_area": target_area,
+            "target_is_small": is_small_chart(
+                target_chart,
+                uv_layer,
+                total_area,
+                total_uv_area,
+                settings,
+            ),
             "small_mesh_area_ratio": small_area / max(total_area, 1.0e-12),
             "small_uv_area_ratio": small_uv_area / max(total_uv_area, 1.0e-12),
             "family": family,
+            "small_key": small_key,
+            "target_key": target_key,
+            "combined_key": _face_key(combined),
+            "chain_absorptions": next_absorptions,
+            "chain_is_extension": chain_is_extension,
+            "chain_absorbed_face_ids": absorbed_face_ids,
+            "chain_absorbed_bounds": absorbed_bounds,
+            "chain_face_count": len(absorbed_face_ids),
+            "chain_diameter_ratio": diameter_ratio,
+            "chain_absorbed_growth_ratio": absorbed_growth_ratio,
+            "target_diameter_growth_ratio": target_growth_ratio,
         }
         if strict_rejection is None:
             record["lane"] = "STRICT"
@@ -358,6 +488,10 @@ def _candidate_records(
         structural_candidates.append(record)
 
     sort_key = lambda item: (
+        not item["chain_is_extension"],
+        item["target_is_small"],
+        item["chain_absorbed_growth_ratio"],
+        item["target_diameter_growth_ratio"],
         -item["shared_ratio"],
         item["angle"],
         -item["target_area"],
@@ -365,6 +499,15 @@ def _candidate_records(
     )
     strict_candidates.sort(key=sort_key)
     structural_candidates.sort(key=sort_key)
+    chain_extensions = [
+        item for item in strict_candidates + structural_candidates
+        if item["chain_is_extension"]
+    ]
+    if chain_extensions:
+        chain_extensions.sort(key=lambda item: (
+            str(item.get("lane", "STRICT")).upper() != "STRICT",
+        ) + sort_key(item))
+        return chain_extensions
     if strict_candidates:
         funnel["structural_deferred_for_strict"] += len(
             structural_candidates
@@ -418,6 +561,7 @@ def stitch_small_islands(
     forced_cuts = set(getattr(constraints, "forced_cuts", set()))
     face_classes = dict(getattr(constraints, "face_classes", {}))
     total_area = sum(face.calc_area() for face in bm.faces)
+    mesh_diameter = _mesh_diameter(bm)
     _, initial_charts = helpers._uv_charts(bm, uv_layer)
     result = {
         "enabled": True,
@@ -435,6 +579,10 @@ def stitch_small_islands(
         "max_density_ratio_after_normalize": 1.0,
         "locked_cuts": len(locked_cuts),
         "forced_cuts": len(forced_cuts),
+        "accepted_chain_extensions": 0,
+        "max_chain_absorptions": 0,
+        "max_chain_faces": 0,
+        "max_chain_diameter_ratio": 0.0,
     }
     max_tests = max(int(_setting(settings, "small_cleanup_tests", 300)), 0)
     max_accepted = max(int(_setting(settings, "small_cleanup_max_merges", 120)), 0)
@@ -442,6 +590,7 @@ def stitch_small_islands(
         settings, "small_structural_max_merges", 160
     )), 0)
     blocked = set()
+    chain_states = {}
     funnel = defaultdict(int)
 
     old_p95 = settings.max_p95_stretch
@@ -477,6 +626,8 @@ def stitch_small_islands(
                 settings,
                 helpers,
                 funnel,
+                chain_states,
+                mesh_diameter,
                 result["accepted_structural"] < max_structural,
             )
             if not candidates:
@@ -566,6 +717,27 @@ def stitch_small_islands(
                 blocked.add(candidate["signature"])
                 continue
             result["accepted"] += 1
+            chain_states.pop(candidate["small_key"], None)
+            chain_states.pop(candidate["target_key"], None)
+            chain_states[candidate["combined_key"]] = {
+                "absorptions": candidate["chain_absorptions"],
+                "absorbed_faces": candidate["chain_absorbed_face_ids"],
+                "absorbed_bounds": candidate["chain_absorbed_bounds"],
+            }
+            if candidate["chain_is_extension"]:
+                result["accepted_chain_extensions"] += 1
+            result["max_chain_absorptions"] = max(
+                result["max_chain_absorptions"],
+                candidate["chain_absorptions"],
+            )
+            result["max_chain_faces"] = max(
+                result["max_chain_faces"],
+                candidate["chain_face_count"],
+            )
+            result["max_chain_diameter_ratio"] = max(
+                result["max_chain_diameter_ratio"],
+                candidate["chain_diameter_ratio"],
+            )
             if str(candidate.get("lane", "STRICT")).upper() == "STRUCTURAL":
                 result["accepted_structural"] += 1
             else:
