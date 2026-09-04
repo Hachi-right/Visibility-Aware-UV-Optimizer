@@ -173,6 +173,32 @@ def _make_connected_quad_strip(name, face_count):
     return obj
 
 
+def _make_two_disconnected_quads(name):
+    mesh = bpy.data.meshes.new(name + "Mesh")
+    mesh.from_pydata(
+        (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (2.0, 0.0, 0.0),
+            (3.0, 0.0, 0.0),
+            (3.0, 1.0, 0.0),
+            (2.0, 1.0, 0.0),
+        ),
+        [],
+        ((0, 1, 2, 3), (4, 5, 6, 7)),
+    )
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    for item in uv_layer.data:
+        item.uv = Vector((0.0, 0.0))
+    mesh.update()
+    return obj
+
+
 def _make_small_fragment_pair(name, artist_seam):
     """Create two valid UV charts separated only at one shared planar edge."""
 
@@ -660,6 +686,63 @@ def _test_single_concave_face_does_not_use_convex_fallback():
         uv_optimize._project_face_planar_positive = original_projection
     assert not valid and mirrored_count == 0
     assert not forced_cuts
+    bmesh.update_edit_mesh(
+        obj.data, loop_triangles=True, destructive=False)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    assert _topology_signature(obj.data) == before_topology
+
+
+def _test_bounded_repair_isolates_smart_projection_per_chart():
+    _clear_scene()
+    obj = _make_two_disconnected_quads("VUV_BoundedSmartIsolation")
+    before_topology = _topology_signature(obj.data)
+    bm, uv_layer = _enter_edit(obj)
+    _, charts = uv_optimize._uv_charts(bm, uv_layer)
+    problem, _mirrored = uv_optimize._classify_problem_charts(
+        charts, uv_layer, bm=bm)
+    assert len(problem) == 2
+
+    settings = SimpleNamespace(
+        smart_angle=math.radians(70.0),
+        island_margin=0.002,
+    )
+    original_call = uv_optimize._call_uv_operator
+    smart_selection_sizes = []
+
+    def keep_tree_invalid(operator, _operator_name=None, **kwargs):
+        if _operator_name == 'unwrap':
+            return {'FINISHED'}
+        if _operator_name == 'smart_project':
+            current_bm, _current_uv = uv_optimize._refresh_edit_bmesh(
+                obj.data)
+            smart_selection_sizes.append(sum(
+                bool(face.select) for face in current_bm.faces))
+        return original_call(
+            operator, _operator_name=_operator_name, **kwargs)
+
+    uv_optimize._call_uv_operator = keep_tree_invalid
+    try:
+        bm, uv_layer, mirrored_count, output_charts = (
+            uv_optimize._bounded_problem_chart_repairs(
+                obj.data,
+                bm,
+                uv_layer,
+                problem,
+                settings,
+                set(),
+                chart_budget=34,
+            )
+        )
+    finally:
+        uv_optimize._call_uv_operator = original_call
+    assert mirrored_count == 0
+    assert output_charts == 2
+    assert smart_selection_sizes
+    assert set(smart_selection_sizes) == {1}, smart_selection_sizes
+    _, final_charts = uv_optimize._uv_charts(bm, uv_layer)
+    final_problem, final_mirrored = uv_optimize._classify_problem_charts(
+        final_charts, uv_layer, bm=bm)
+    assert not final_problem and not final_mirrored
     bmesh.update_edit_mesh(
         obj.data, loop_triangles=True, destructive=False)
     bpy.ops.object.mode_set(mode='OBJECT')
@@ -1419,7 +1502,7 @@ def _test_hard_surface_repair_reapplies_direction():
     settings.uv_direction_axis = 'AUTO'
 
     original_call = uv_optimize._call_uv_operator
-    original_fallback = uv_optimize._repair_remaining_problem_charts
+    original_fallback = uv_optimize._bounded_problem_chart_repairs
     original_align = uv_optimize.hard_surface.align_island_geometry
     pack_calls = {'count': 0}
     fallback_calls = {'count': 0}
@@ -1431,7 +1514,7 @@ def _test_hard_surface_repair_reapplies_direction():
             operator, _operator_name=_operator_name, **kwargs)
         if _operator_name == 'pack_islands':
             pack_calls['count'] += 1
-            if pack_calls['count'] == 1 and 'FINISHED' in result:
+            if pack_calls['count'] <= 3 and 'FINISHED' in result:
                 bm, uv_layer = uv_optimize._refresh_edit_bmesh(obj.data)
                 point = bm.faces[0].loops[0][uv_layer].uv.copy()
                 for loop in bm.faces[0].loops:
@@ -1463,17 +1546,18 @@ def _test_hard_surface_repair_reapplies_direction():
         return result
 
     uv_optimize._call_uv_operator = inject_after_first_pack
-    uv_optimize._repair_remaining_problem_charts = track_fallback
+    uv_optimize._bounded_problem_chart_repairs = track_fallback
     uv_optimize.hard_surface.align_island_geometry = track_alignment
     try:
         result = uv_optimize.optimize_active_object(
             bpy.context, obj, settings)
     finally:
         uv_optimize._call_uv_operator = original_call
-        uv_optimize._repair_remaining_problem_charts = original_fallback
+        uv_optimize._bounded_problem_chart_repairs = original_fallback
         uv_optimize.hard_surface.align_island_geometry = original_align
 
     assert fallback_calls['count'] >= 1, fallback_calls
+    assert pack_calls['count'] >= 4, pack_calls
     assert post_repair_reports, post_repair_reports
     assert all(
         report.selected_axis is not None
@@ -1540,6 +1624,7 @@ try:
     _test_single_convex_face_projection_fallback()
     _test_multi_face_chart_is_not_fragmented_by_projection_fallback()
     _test_single_concave_face_does_not_use_convex_fallback()
+    _test_bounded_repair_isolates_smart_projection_per_chart()
     _test_best_effort_local_repair_accepts_connected_chart()
     _test_best_effort_local_repair_restores_rejection()
     _test_near_planar_ngon_strict_rejection()

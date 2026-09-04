@@ -91,6 +91,9 @@ class VUV_PT_MainPanel(bpy.types.Panel):
             box.prop(settings, "hard_surface_respect_sharp")
             box.prop(settings, "hard_surface_align_cardinal")
             box.prop(settings, "hard_surface_direction_lock")
+            box.prop(settings, "reference_uv_layers")
+            box.prop(settings, "reference_uv_boundary_mode")
+            box.prop(settings, "reference_uv_boundary_bias")
             direction = box.column(align=True)
             direction.enabled = settings.hard_surface_direction_lock
             row = direction.row(align=True)

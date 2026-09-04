@@ -12,6 +12,12 @@
 
 ## 当前状态
 
+- 2026-09-03 用 `SK_CommonWeapon_Rig_1_49785.blend` 的唯一活动对象
+  `SM_CDO_L1A_ChargeCannon_L_1_LOD1` 做新增真实资产回归。默认
+  `Auto + Preserve Seams` 因 32 个坏图表被 Smart repair 扩成 382 个而回滚；显式
+  `Hard Surface + Unique` 且不保留 Seam 时，原生 Unwrap 先失败 27/195 个岛，随后
+  48 个坏图表被扩成 734 个而回滚。两次事务回滚、源文件哈希与保存重开均通过，
+  当前 WIP 是定位局部修复失败后整批 Smart repair 的碎片膨胀根因，不放宽增长预算。
 - 2026-09-03 根据用户第三轮视觉复核继续迭代：同一机械结构仍被拆成大量小岛，岛的
   结构朝向与完整 U/V 棋盘格方向都不稳定。当前排查确认旧 v42 使用 `WORLD + YZX`
   且在插件后又做二次宏排布，二者都会覆盖或弱化插件方向合同；新基线统一使用
@@ -44,6 +50,11 @@
 
 ## 查询规划卡
 
+- 49785 兼容性增量：候选入口为 `uv_optimize.py` 的 Unique 坏图表筛选、局部修复、
+  Smart repair 与碎片预算，`hard_surface.py` 的 Unwrap 失败路径，以及
+  `test_unique_uv_repair_fallback.py` 的回退回归。用错误原文、
+  `smart_repair_input_charts/output_charts`、`local_repair` 反向追踪；排除方向和结构
+  排布模块，除非修复后的最终门禁证明其直接相关。
 - 候选入口：`uv_group_layout.py` 的岛分析、方向策略、刚性布局与打包；`uv_optimize.py` 的 Unique 原生 Pack 调用。
 - 关键词/别名：`orientation`、`principal_axis`、`direction_vector`、`quarter_turn`、`pack_islands`、`rotate_method`。
 - 反向追踪：从最终 UV 写入与审计向前追踪所有允许 90/180 度旋转的阶段。

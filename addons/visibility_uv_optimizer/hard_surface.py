@@ -752,6 +752,8 @@ def classify_edge_constraints(
     settings: Any = None,
     mode: str = "HARD_SURFACE",
     original_seams: Optional[Iterable[int]] = None,
+    preferred_cut_edges: Optional[Iterable[int]] = None,
+    preferred_cut_penalty: float = 0.35,
     **overrides: Any,
 ) -> EdgeConstraints:
     """Return hard-surface edge policies without mutating the BMesh.
@@ -800,6 +802,10 @@ def classify_edge_constraints(
         seam_set = {
             int(getattr(value, "index", value))
             for value in (original_seams or ())
+        }
+        reference_set = {
+            int(getattr(value, "index", value))
+            for value in (preferred_cut_edges or ())
         }
         cylinder_opening_edges = {
             int(component["opening_edge"])
@@ -853,6 +859,13 @@ def classify_edge_constraints(
             if options.preserve_sharp and _is_sharp(edge):
                 reasons.append("sharp")
                 forced = True
+            if index in reference_set:
+                reasons.append("reference_uv")
+                # Reference boundaries are deliberately soft.  They seed the
+                # unwrap and bias later merge ordering, but can be stitched
+                # back when strict Unique validation requires it.
+                preferred = True
+                penalty = max(penalty, float(preferred_cut_penalty))
             if index in cylinder_opening_edges:
                 reasons.append("cylinder_opening")
                 forced = True

@@ -1078,6 +1078,33 @@ class VUVSettings(bpy.types.PropertyGroup):
         name="Preserve Existing Seams",
         default=True,
     )
+    reference_uv_layers: StringProperty(
+        name="Reference UV Layers",
+        description=(
+            "Comma-separated UV maps whose discontinuities seed a soft split; "
+            "参考 UV 层名称，用逗号分隔，边界可在严格修复时合并"
+        ),
+        default="",
+    )
+    reference_uv_boundary_bias: FloatProperty(
+        name="Reference Boundary Bias",
+        description=(
+            "How strongly reference UV boundaries are retained during chart merging"
+        ),
+        default=0.35,
+        min=0.0,
+        max=2.0,
+        precision=3,
+    )
+    reference_uv_boundary_mode: EnumProperty(
+        name="Reference Boundary Mode",
+        description="Combine boundaries from multiple reference UV layers",
+        items=(
+            ('UNION', "Union", "Keep a boundary found in any reference layer"),
+            ('INTERSECTION', "Intersection", "Keep only boundaries shared by all reference layers"),
+        ),
+        default='UNION',
+    )
     respect_materials: BoolProperty(
         name="Respect Material Borders",
         default=True,
