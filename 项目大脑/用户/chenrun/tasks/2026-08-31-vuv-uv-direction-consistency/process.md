@@ -139,3 +139,46 @@
   试验版本。
 - 最终完整 16 项矩阵和解压 ZIP 的 Blender 3.3.5 / 5.2.0 strict smoke 已确认通过；
   本轮文档按最终验收状态收口，但仍保留受控试验版的适用边界。
+
+## 2026-09-04 项目交接整理
+
+- 新增 `docs/Visibility_Aware_UV_Optimizer_项目交接.md`，集中说明项目定位、版本口径、
+  代码架构、Unique 质量合同、UVMap2/UVMap3 软参考设计、安装、验证和发布流程。
+- 新增本任务 `交接说明.md`，记录 `fed877f / 0.5.9` 提交基线与本地未提交
+  `0.5.10` 的区别，并保存 49785 源模型、目标对象、复现命令、历史实验和验收标准。
+- 当前真实阻断仍为 `Unique UV bounded repair could not repair chart with 17 faces`。
+  `result_refine_autorebuild` 和 `result_0510_default` 都是失败诊断产物，不能作为成功 UV 交付。
+- README 增加交接入口。本轮只整理文档，不回退既有 dirty worktree，不执行 commit 或 push。
+- 文档验收：`git diff --check` 通过；新增文件以 UTF-8 回读未发现替换字符；README、
+  项目总览与任务交接的本地相对路径存在。项目大脑 healthcheck 仍为既有
+  `errors=12 warnings=0`，错误项与 0.5.8 收尾记录相同，本次没有新增工件错误。
+- 本轮未重跑 Blender，因为只修改交接文档；运行时状态引用下方已落盘的 0.5.10
+  双版本回归、ZIP smoke 和 49785 真实失败记录。
+
+## 2026-09-04 0.5.10 `repair_faces` 异常修复
+
+- 根因是硬表面 bounded repair 超出碎片预算后继续进入通用 Smart Project 恢复块，
+  读取了只在通用分支创建的局部状态。现在仅 `not hard_surface_mode` 才进入该恢复块；
+  硬表面结果继续接受后续 Unique 严格门禁。
+- 回归测试注入第一次 bounded repair 超预算结果；Blender 3.3.5/5.2.0 均输出
+  `VUV_UNIQUE_LOCAL_REPAIR_OK`。修改的 Python 文件通过 `py_compile`；解压 ZIP 的
+  双版本 strict smoke 通过，版本为 `[0, 5, 10]`。
+- 两个安装包各 15 个白名单文件、240418 字节，SHA-256 均为
+  `6C89B2FF1194335DD9C4DDD45F040B4B363136674C96103315EE309D5D155E16`。
+- 真实 49785 默认 Auto/Unique 已不再出现 `repair_faces` 异常；51.83 秒后被独立的
+  `Unique UV bounded repair could not repair chart with 17 faces` 门禁拒绝。源 UV、
+  几何、连接、Seam 与源文件哈希均未变。资产整体成功仍属于 WIP，不能靠吞错绕过。
+
+## 2026-09-04 GitLab / GitHub 上传前复核
+
+- 用户要求上传到 GitLab 和 GitHub；目标均为独立任务分支 `uv展开`，不更新两个远端的 `main`。
+- `git fetch --all` 后，本地 HEAD、`origin/uv展开`、`github/uv展开` 均为 `fed877f`，
+  没有远端独有提交，允许普通快进推送。
+- 推送前重新验证：Blender 3.3.5/5.2.0 Unique 修复回归均输出
+  `VUV_UNIQUE_LOCAL_REPAIR_OK`；两版源码 strict smoke 均输出 `VUV_055_SMOKE_OK`，
+  插件版本为 `[0, 5, 10]`；修改的 Python 文件通过 `py_compile`。
+- `0.5.10` ZIP 为单一 `visibility_uv_optimizer/` 顶层、15 个文件，逐文件与当前源码一致；
+  两个包 SHA-256 均与 `release/SHA256SUMS.txt` 的
+  `6C89B2FF1194335DD9C4DDD45F040B4B363136674C96103315EE309D5D155E16` 一致。
+- `git diff --check` 通过。49785 的 17 面 bounded repair 仍是已知未完成项，不把本次
+  `repair_faces` 异常修复描述为资产整体已经成功。

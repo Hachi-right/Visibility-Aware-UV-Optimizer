@@ -1,14 +1,14 @@
 # Visibility Aware UV Optimizer 代码地图
 
 > author: `chenrun`
-> 最后更新时间：2026-08-31
-> 最后验证版本：VUV 0.5.6，Blender 3.3.5 / 5.2.0 LTS
+> 最后更新时间：2026-09-04
+> 最后验证版本：VUV 0.5.10，Blender 3.3.5 / 5.2.0 LTS
 > 相关任务：`2026-08-31-vuv-uv-direction-consistency`
 
 ## 目录入口
 
 - 可编辑源码：`addons/visibility_uv_optimizer/`
-- Blender 安装包：`release/Visibility_Aware_UV_Optimizer_0.5.6_HardSurface.zip`
+- Blender 安装包：`release/Visibility_Aware_UV_Optimizer_0.5.10_HardSurface.zip`
 - 中文说明：`docs/Visibility_Aware_UV_Optimizer_硬表面使用说明_0.5.4.md`
 - 方向说明：`docs/Visibility_Aware_UV_Optimizer_方向一致性_0.5.6.md`
 - 跨版本 smoke：`release/validation/`

@@ -1527,6 +1527,10 @@ def _test_hard_surface_repair_reapplies_direction():
         fallback_calls['count'] += 1
         result = original_fallback(*args, **kwargs)
         repair_returned['value'] = True
+        if fallback_calls['count'] == 1:
+            chart_budget = kwargs.get(
+                'chart_budget', args[6] if len(args) > 6 else 0)
+            return result[:3] + (int(chart_budget) + 1,)
         return result
 
     def track_alignment(faces, uv_layer, **kwargs):

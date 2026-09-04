@@ -3,6 +3,19 @@
 本项目遵循语义化版本号。Blender 插件的 `bl_info.version` 与发布包版本保持一致；
 实验性验证结果不会单独伪装成稳定版本。
 
+## 0.5.10 - 2026-09-04
+
+### 修复
+
+- 修复硬表面 bounded repair 超出碎片预算后误入通用 Smart Project 回退路径，
+  导致读取未初始化 `repair_faces` 并中止优化的问题。
+- 硬表面结果继续交给最终 Unique overlap、winding、退化和 0-1 门禁判定；通用
+  Smart Project 的超预算恢复与 bounded fallback 行为保持不变。
+
+### 验证
+
+- Unique 修复回归新增硬表面超预算注入，确保该路径不再依赖通用修复的局部状态。
+
 ## 0.5.8 - 2026-09-03
 
 ### 改进

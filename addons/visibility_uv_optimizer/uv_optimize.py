@@ -3821,13 +3821,9 @@ def optimize_active_object(context, obj, settings):
                         ]
                         smart_repair_output_charts = len(
                             _uv_charts_for_faces(repaired_faces, uv_layer))
-                    if smart_repair_output_charts > smart_chart_budget:
-                        if hard_surface_mode:
-                            # Keep the valid bounded result and let the final
-                            # Unique audit decide.  The budget is a warning
-                            # against pathological fragmentation, not a reason
-                            # to discard an otherwise usable UV layout.
-                            pass
+                    if (
+                            not hard_surface_mode
+                            and smart_repair_output_charts > smart_chart_budget):
                         # A generic Smart Project can over-split a selected
                         # region. Restore the pre-repair state and ask the
                         # bounded solver for one candidate per original chart.

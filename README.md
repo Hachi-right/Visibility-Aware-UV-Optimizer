@@ -2,16 +2,21 @@
 
 面向 Blender 硬表面游戏资产的可见性分析与保守自动 UV 插件。
 
-当前试验版本：`0.5.8`
+当前试验版本：`0.5.10`
 
 版本记录与后续计划：
 
 - [CHANGELOG.md](CHANGELOG.md)：版本更新日志与已知限制
 - [ROADMAP.md](ROADMAP.md)：改进方向、验收门槛和发布计划
+- [项目交接](docs/Visibility_Aware_UV_Optimizer_项目交接.md)：架构、开发验证、发布流程与当前 49785 状态
 
 ## 下载与安装
 
-- [Visibility_Aware_UV_Optimizer_0.5.8_HardSurface.zip](release/Visibility_Aware_UV_Optimizer_0.5.8_HardSurface.zip)
+- [Visibility_Aware_UV_Optimizer_0.5.10_HardSurface.zip](release/Visibility_Aware_UV_Optimizer_0.5.10_HardSurface.zip)
+
+`0.5.10` 修复了硬表面 bounded repair 超出碎片预算后误入通用 Smart Project
+回退路径、进而访问未初始化 `repair_faces` 的问题。该结果仍会继续接受最终 Unique
+质量门禁检查。
 
 ## 0.5.8 结构连续与完整方向
 
