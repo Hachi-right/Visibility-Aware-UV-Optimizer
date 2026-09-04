@@ -3386,6 +3386,32 @@ def optimize_active_object(context, obj, settings):
     )
     uv_usage = _resolve_uv_usage(obj, settings)
     initial_uv_mode = _resolve_initial_uv_mode(settings, original_seams, uv_usage)
+    # Refine Layout is intentionally conservative and normally requires a
+    # valid Unique source.  Reference maps such as UVMap2/UVMap3 often contain
+    # overlap or degenerate triangles, so automatically rebuild those inputs
+    # through the hard-surface path instead of failing before any UV is made.
+    refine_source_rebuild = False
+    if initial_uv_mode == 'REFINE_LAYOUT' and uv_usage == 'UNIQUE':
+        active_layer = mesh.uv_layers.active
+        if active_layer is not None:
+            probe_bm = bmesh.new()
+            try:
+                probe_bm.from_mesh(mesh)
+                probe_bm.faces.ensure_lookup_table()
+                probe_uv = probe_bm.loops.layers.uv.get(active_layer.name)
+                if probe_uv is not None:
+                    probe_audit = _audit_unique_layout(probe_bm, probe_uv)
+                    refine_source_rebuild = bool(
+                        not probe_audit.get('finite', False)
+                        or not probe_audit.get('inside_tile', False)
+                        or probe_audit.get('overlap', False)
+                        or probe_audit.get('negative', 0)
+                        or probe_audit.get('degenerate', 0)
+                    )
+            finally:
+                probe_bm.free()
+        if refine_source_rebuild:
+            initial_uv_mode = 'HARD_SURFACE'
     refine_layout_mode = initial_uv_mode == 'REFINE_LAYOUT'
     hard_surface_mode = initial_uv_mode in {
         'HARD_SURFACE', 'MARKED_SEAMS', 'REFINE_LAYOUT'
