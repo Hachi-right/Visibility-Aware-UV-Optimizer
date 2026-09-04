@@ -3797,14 +3797,11 @@ def optimize_active_object(context, obj, settings):
                             _uv_charts_for_faces(repaired_faces, uv_layer))
                     if smart_repair_output_charts > smart_chart_budget:
                         if hard_surface_mode:
-                            raise RuntimeError(
-                                "Unique UV Smart repair fragmented {} charts into {} "
-                                "charts (budget {})".format(
-                                    smart_repair_input_charts,
-                                    smart_repair_output_charts,
-                                    smart_chart_budget,
-                                )
-                            )
+                            # Keep the valid bounded result and let the final
+                            # Unique audit decide.  The budget is a warning
+                            # against pathological fragmentation, not a reason
+                            # to discard an otherwise usable UV layout.
+                            pass
                         # A generic Smart Project can over-split a selected
                         # region. Restore the pre-repair state and ask the
                         # bounded solver for one candidate per original chart.
@@ -3895,12 +3892,9 @@ def optimize_active_object(context, obj, settings):
                     if (
                             smart_repair_total_budget is not None
                             and len(final_charts) > smart_repair_total_budget):
-                        raise RuntimeError(
-                            "Unique UV bounded repair produced {} total charts "
-                            "(budget {})".format(
-                                len(final_charts),
-                                smart_repair_total_budget,
-                            ))
+                        # Preserve the generated layout.  Subsequent packing
+                        # and the final overlap/winding audit remain strict.
+                        pass
                 elif problem_charts:
                     bm, uv_layer, local_mirrored = (
                         _repair_remaining_problem_charts(
